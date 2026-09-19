@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
-from typing import Any, Protocol
+import time
+from typing import Any, Protocol, runtime_checkable
 
 import httpx
+from google import genai
+from google.genai import types
 
 from app.config import Settings
 from app.errors import EmbeddingError, GeminiError
@@ -13,196 +15,297 @@ from app.errors import EmbeddingError, GeminiError
 log = logging.getLogger(__name__)
 
 
+@runtime_checkable
 class GeminiService(Protocol):
-    def embed_texts(self, texts: list[str]) -> list[list[float]]: ...
+    """
+    Minimal interface consumed by the application.
 
-    def generate_json(self, system: str, user: str) -> dict[str, Any]: ...
+    Keeping the rest of the backend dependent on this protocol rather than
+    the Google SDK makes the Gemini integration easier to test and replace.
+    """
 
-    def generate_text(self, system: str, user: str) -> str: ...
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        task_type: str = "RETRIEVAL_DOCUMENT",
+    ) -> list[list[float]]:
+        ...
+
+    def generate_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        ...
+
+    def generate_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        ...
 
 
 class GeminiClient:
+    """
+    Gemini client used by the application.
+
+    The same client is used for:
+      - document embeddings
+      - planner JSON generation
+      - DuckDB SQL generation
+      - final answer generation
+    """
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._client: Any = None
 
-    def _ensure_client(self) -> Any:
-        if not self.settings.gemini_api_key:
-            raise GeminiError("Gemini API key is missing. Set GEMINI_API_KEY in the environment.")
+        if not settings.gemini_api_key:
+            raise GeminiError(
+                "GEMINI_API_KEY is not configured."
+            )
 
-        if self._client is None:
-            try:
-                from google import genai
-                from google.genai import types
+        timeout_seconds = max(
+            settings.gemini_timeout_ms / 1000,
+            1,
+        )
 
-                self._client = genai.Client(
-                    api_key=self.settings.gemini_api_key,
-                    http_options=types.HttpOptions(
-                        timeout=self.settings.gemini_timeout_ms,
-                        # Avoid serial timeouts on unreachable IPv6 addresses.
-                        client_args={
-                            "transport": httpx.HTTPTransport(
-                                local_address="0.0.0.0"
-                            )
-                        },
-                    ),
-                )
-            except GeminiError:
-                raise
-            except Exception as exc:
-                log.exception("gemini_client_init_failed")
-                raise GeminiError("Gemini client could not be initialized.") from exc
+        self._http_client = httpx.Client(
+            timeout=timeout_seconds,
+            transport=httpx.HTTPTransport(
+                local_address="0.0.0.0",
+            ),
+        )
 
-        return self._client
+        try:
+            self.client = genai.Client(
+                api_key=settings.gemini_api_key,
+                http_options=types.HttpOptions(
+                    timeout=settings.gemini_timeout_ms,
+                ),
+            )
+        except Exception as exc:
+            log.exception("Failed to initialize Gemini client")
+            raise GeminiError(
+                f"Failed to initialize Gemini client: {exc}"
+            ) from exc
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(
+        self,
+        texts: list[str],
+        *,
+        task_type: str = "RETRIEVAL_DOCUMENT",
+    ) -> list[list[float]]:
         if not texts:
             return []
 
-        client = self._ensure_client()
-        vectors: list[list[float]] = []
-        batch = self.settings.embed_batch_size
+        embeddings: list[list[float]] = []
 
-        try:
-            for i in range(0, len(texts), batch):
-                chunk = texts[i : i + batch]
+        batch_size = max(
+            1,
+            self.settings.embed_batch_size,
+        )
 
-                log.info(
-                    "embedding_generation count=%s model=%s",
-                    len(chunk),
-                    self.settings.embedding_model,
-                )
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
 
-                response = client.models.embed_content(
+            try:
+                response = self.client.models.embed_content(
                     model=self.settings.embedding_model,
-                    contents=chunk,
+                    contents=batch,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=(
+                            self.settings.embedding_dimensions
+                        ),
+                    ),
                 )
 
-                embeddings = getattr(response, "embeddings", None) or []
+                values = getattr(response, "embeddings", None)
 
-                if len(embeddings) != len(chunk):
+                if values is None:
                     raise EmbeddingError(
-                        "Embedding service returned an unexpected result."
+                        "Gemini returned no embeddings."
                     )
 
-                for item in embeddings:
-                    values = list(getattr(item, "values", None) or [])
+                for embedding in values:
+                    vector = getattr(
+                        embedding,
+                        "values",
+                        None,
+                    )
 
-                    if not values:
+                    if not vector:
                         raise EmbeddingError(
-                            "Embedding service returned an empty vector."
+                            "Gemini returned an empty embedding."
                         )
 
-                    vectors.append(values)
+                    embeddings.append(
+                        [float(value) for value in vector]
+                    )
 
-        except EmbeddingError:
-            raise
-        except GeminiError:
-            raise
-        except Exception as exc:
-            log.exception("embedding_failed")
-            raise EmbeddingError("Failed to generate embeddings.") from exc
+            except EmbeddingError:
+                raise
+            except Exception as exc:
+                log.exception(
+                    "Gemini embedding request failed"
+                )
+                raise EmbeddingError(
+                    f"Gemini embedding failed: {exc}"
+                ) from exc
 
-        return vectors
+        if len(embeddings) != len(texts):
+            raise EmbeddingError(
+                "Gemini returned an unexpected number of embeddings."
+            )
 
-    def generate_json(self, system: str, user: str) -> dict[str, Any]:
-        from google.genai import types
+        return embeddings
 
-        client = self._ensure_client()
+    def generate_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        """
+        Generate a JSON object from Gemini.
+
+        This is also used by the DuckDB analysis layer. The SQL generator
+        therefore does not need its own LLM client.
+        """
+        response = self._generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_mime_type="application/json",
+        )
+
+        text = self._response_text(response)
+
+        if not text:
+            raise GeminiError(
+                "Gemini returned an empty JSON response."
+            )
 
         try:
-            response = client.models.generate_content(
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            log.error(
+                "Invalid JSON returned by Gemini: %s",
+                text[:1000],
+            )
+            raise GeminiError(
+                "Gemini returned invalid JSON."
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise GeminiError(
+                "Gemini JSON response must be an object."
+            )
+
+        return data
+
+    def generate_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        response = self._generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_mime_type="text/plain",
+        )
+
+        text = self._response_text(response)
+
+        if not text:
+            raise GeminiError(
+                "Gemini returned an empty response."
+            )
+
+        return text.strip()
+
+    def _generate(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_mime_type: str,
+    ) -> Any:
+        started = time.perf_counter()
+
+        try:
+            response = self.client.models.generate_content(
                 model=self.settings.gemini_model,
-                contents=user,
+                contents=user_prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    response_mime_type="application/json",
-                    temperature=0.1,
+                    system_instruction=system_prompt,
+                    response_mime_type=response_mime_type,
+                    temperature=0,
                 ),
             )
 
-            text = (getattr(response, "text", None) or "").strip()
+            elapsed = time.perf_counter() - started
 
-            if not text:
-                raise GeminiError("Gemini returned an empty response.")
-
-            return _parse_json_object(text)
-
-        except GeminiError:
-            raise
-        except Exception as exc:
-            message = str(exc).lower()
-
-            if (
-                "api key" in message
-                or "permission" in message
-                or "401" in message
-                or "403" in message
-            ):
-                log.error("gemini_auth_failed")
-                raise GeminiError(
-                    "Gemini rejected the API key or is unavailable."
-                ) from exc
-
-            log.exception("gemini_generate_failed")
-            raise GeminiError("Gemini is currently unavailable.") from exc
-
-    def generate_text(self, system: str, user: str) -> str:
-        from google.genai import types
-
-        client = self._ensure_client()
-
-        try:
-            response = client.models.generate_content(
-                model=self.settings.gemini_model,
-                contents=user,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0.1,
-                ),
+            log.debug(
+                "Gemini generation completed in %.2fs",
+                elapsed,
             )
 
-            text = (getattr(response, "text", None) or "").strip()
+            return response
 
-            if not text:
-                raise GeminiError("Gemini returned an empty response.")
-
-            return text
-
-        except GeminiError:
-            raise
         except Exception as exc:
-            message = str(exc).lower()
+            elapsed = time.perf_counter() - started
 
-            if (
-                "api key" in message
-                or "permission" in message
-                or "401" in message
-                or "403" in message
-            ):
-                log.error("gemini_auth_failed")
-                raise GeminiError(
-                    "Gemini rejected the API key or is unavailable."
-                ) from exc
+            log.exception(
+                "Gemini generation failed after %.2fs",
+                elapsed,
+            )
 
-            log.exception("gemini_generate_text_failed")
-            raise GeminiError("Gemini is currently unavailable.") from exc
+            raise GeminiError(
+                f"Gemini generation failed: {exc}"
+            ) from exc
 
+    @staticmethod
+    def _response_text(response: Any) -> str:
+        """
+        Extract text from the Google GenAI response while tolerating
+        SDK response-shape differences.
+        """
+        text = getattr(response, "text", None)
 
-def _parse_json_object(text: str) -> dict[str, Any]:
-    try:
-        data = json.loads(text)
+        if isinstance(text, str):
+            return text.strip()
 
-        if isinstance(data, dict):
-            return data
+        candidates = getattr(response, "candidates", None)
 
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not candidates:
+            return ""
 
-        if match:
-            data = json.loads(match.group(0))
+        parts: list[str] = []
 
-            if isinstance(data, dict):
-                return data
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
 
-    raise GeminiError("Gemini returned invalid structured output.")
+            if content is None:
+                continue
+
+            response_parts = getattr(
+                content,
+                "parts",
+                None,
+            )
+
+            if not response_parts:
+                continue
+
+            for part in response_parts:
+                part_text = getattr(
+                    part,
+                    "text",
+                    None,
+                )
+
+                if isinstance(part_text, str):
+                    parts.append(part_text)
+
+        return "".join(parts).strip()
