@@ -1,341 +1,370 @@
 from __future__ import annotations
 
-from enum import StrEnum
-from typing import Any, Literal
+from datetime import datetime
+from enum import Enum
+from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
+# ============================================================
 
-class Intent(StrEnum):
-    FACTUAL_LOOKUP = "factual_lookup"
-    NUMERICAL_LOOKUP = "numerical_lookup"
-    CSV_AGGREGATION = "csv_aggregation"
-    SUM = "sum"
-    AVERAGE = "average"
-    MINIMUM = "minimum"
-    MAXIMUM = "maximum"
-    RANKING = "ranking"
-    SORTING = "sorting"
-    FILTERING = "filtering"
-    PERCENTAGE_CHANGE = "percentage_change"
-    YEAR_OVER_YEAR_COMPARISON = "year_over_year_comparison"
-    ENTITY_COMPARISON = "entity_comparison"
-    DOCUMENT_COMPARISON = "document_comparison"
-    MULTI_DOCUMENT_QUESTION = "multi_document_question"
-    FOLLOW_UP_QUESTION = "follow_up_question"
-    MISSING_INFORMATION = "missing_information"
-    CONFLICTING_INFORMATION = "conflicting_information"
-    OUT_OF_SCOPE = "out_of_scope"
-    AMBIGUOUS = "ambiguous"
+# Enums
 
+# ============================================================
 
-class ChatStatus(StrEnum):
-    ANSWERED = "answered"
-    MISSING_INFORMATION = "missing_information"
-    CONFLICTING_INFORMATION = "conflicting_information"
-    OUT_OF_SCOPE = "out_of_scope"
-    AMBIGUOUS = "ambiguous"
+class Intent(str, Enum):
+FACTUAL_LOOKUP = "FACTUAL_LOOKUP"
+NUMERICAL_LOOKUP = "NUMERICAL_LOOKUP"
+CSV_AGGREGATION = "CSV_AGGREGATION"
+SUM = "SUM"
+AVERAGE = "AVERAGE"
+MINIMUM = "MINIMUM"
+MAXIMUM = "MAXIMUM"
+RANKING = "RANKING"
+SORTING = "SORTING"
+FILTERING = "FILTERING"
+PERCENTAGE_CHANGE = "PERCENTAGE_CHANGE"
+YEAR_OVER_YEAR_COMPARISON = "YEAR_OVER_YEAR_COMPARISON"
+ENTITY_COMPARISON = "ENTITY_COMPARISON"
+DOCUMENT_COMPARISON = "DOCUMENT_COMPARISON"
+MULTI_DOCUMENT_QUESTION = "MULTI_DOCUMENT_QUESTION"
+FOLLOW_UP_QUESTION = "FOLLOW_UP_QUESTION"
+MISSING_INFORMATION = "MISSING_INFORMATION"
+CONFLICTING_INFORMATION = "CONFLICTING_INFORMATION"
+OUT_OF_SCOPE = "OUT_OF_SCOPE"
+AMBIGUOUS = "AMBIGUOUS"
 
+class ChatStatus(str, Enum):
+ANSWERED = "answered"
+MISSING_INFORMATION = "missing_information"
+CONFLICTING_INFORMATION = "conflicting_information"
+OUT_OF_SCOPE = "out_of_scope"
+AMBIGUOUS = "ambiguous"
 
-ALLOWED_OPS = (
-    "retrieve",
-    "load_csv",
-    "sum",
-    "average",
-    "min",
-    "max",
-    "count",
-    "sort",
-    "rank",
-    "filter",
-    "groupby",
-    "percentage_change",
-    "yoy",
-    "compare",
-)
+# ============================================================
 
+# Planning models
+
+# ============================================================
 
 class PlanOp(BaseModel):
-    op: Literal[
-        "retrieve",
-        "load_csv",
-        "sum",
-        "average",
-        "min",
-        "max",
-        "count",
-        "sort",
-        "rank",
-        "filter",
-        "groupby",
-        "percentage_change",
-        "yoy",
-        "compare",
-    ]
+"""
+One executable operation produced by the planner.
+"""
 
-    target: str | None = None
-    filename_hint: str | None = None
-    column: str | None = None
-    value: Any = None
-    value_column: str | None = None
-    year_column: str | None = None
 
-    from_year: int | None = Field(
-        default=None,
-        alias="from",
-    )
+model_config = ConfigDict(populate_by_name=True)
 
-    to_year: int | None = Field(
-        default=None,
-        alias="to",
-    )
+op: str
+target: str | None = None
+filename_hint: str | None = None
 
-    ascending: bool = False
-    n: int | None = None
-    agg: str | None = None
+column: str | None = None
+value: Any | None = None
+value_column: str | None = None
 
-    model_config = {
-        "populate_by_name": True,
-        "extra": "ignore",
-    }
+year_column: str | None = None
+
+from_year: int | None = Field(
+    default=None,
+    alias="from",
+)
+to_year: int | None = Field(
+    default=None,
+    alias="to",
+)
+
+ascending: bool | None = None
+n: int | None = None
+agg: str | None = None
 
 
 class QueryPlan(BaseModel):
-    intent: Intent = Intent.FACTUAL_LOOKUP
+"""
+Normalized execution plan created from the user's question.
 
-    # Normal / follow-up / history / repeat conversation handling
-    is_follow_up: bool = False
-    conversation_intent: str = "normal"
-    resolved_question: str | None = None
-    history_target: str = "none"
 
-    out_of_scope: bool = False
+The plan is deliberately independent of any particular execution
+engine. CSV/Excel operations can later be executed by the analysis
+layer, while PDF/TXT retrieval is handled by the retrieval layer.
+"""
 
-    entities: list[str] = Field(default_factory=list)
-    metrics: list[str] = Field(default_factory=list)
-    years: list[int] = Field(default_factory=list)
+model_config = ConfigDict(populate_by_name=True)
 
-    filters: dict[str, Any] = Field(default_factory=dict)
+intent: Intent = Intent.FACTUAL_LOOKUP
 
-    document_ids: list[str] = Field(default_factory=list)
-    document_hints: list[str] = Field(default_factory=list)
+is_follow_up: bool = False
+conversation_intent: str | None = None
 
-    operations: list[PlanOp] = Field(default_factory=list)
+resolved_question: str = ""
+history_target: str | None = None
 
-    ambiguous: bool = False
-    ambiguity_reason: str | None = None
+out_of_scope: bool = False
 
-    retrieval_query: str | None = None
+entities: list[str] = Field(default_factory=list)
+metrics: list[str] = Field(default_factory=list)
+years: list[int] = Field(default_factory=list)
 
-    model_config = {
-        "extra": "ignore",
-    }
+filters: list[PlanOp] = Field(default_factory=list)
 
-    @field_validator("operations", mode="before")
-    @classmethod
-    def _coerce_ops(cls, value: Any) -> Any:
-        if not isinstance(value, list):
-            return []
+document_ids: list[str] = Field(default_factory=list)
+document_hints: list[str] = Field(default_factory=list)
 
-        coerced = []
+operations: list[PlanOp] = Field(default_factory=list)
 
-        for item in value:
-            if isinstance(item, PlanOp):
-                coerced.append(item)
+ambiguous: bool = False
+ambiguity_reason: str | None = None
 
-            elif isinstance(item, str):
-                op = item.strip().lower()
+retrieval_query: str = ""
 
-                if op in ALLOWED_OPS:
-                    coerced.append({"op": op})
 
-            elif isinstance(item, dict):
-                if item.get("op") in ALLOWED_OPS:
-                    coerced.append(item)
+# ============================================================
 
-        return coerced
+# Retrieval / evidence models
 
+# ============================================================
 
 class Evidence(BaseModel):
-    document_id: str
-    filename: str
-    document_type: str
-    chunk_id: str
-    text: str
-    similarity: float
+"""
+A grounded piece of evidence retrieved from a PDF or TXT document.
+"""
 
-    page_number: int = 0
-    section: str = ""
-    source_reference: str = ""
 
-    start_line: int = 0
-    end_line: int = 0
+document_id: str
+filename: str
+document_type: str
 
-    row_start: int = 0
-    row_end: int = 0
+chunk_id: str | None = None
+text: str
 
-    columns: str = ""
-    entities: str = ""
-    year: int = 0
+similarity: float | None = None
+
+page_number: int | None = None
+section: str | None = None
+source_reference: str | None = None
+
+start_line: int | None = None
+end_line: int | None = None
+
+row_start: int | None = None
+row_end: int | None = None
+
+columns: list[str] = Field(default_factory=list)
+entities: list[str] = Field(default_factory=list)
+
+year: int | None = None
 
 
 class Source(BaseModel):
-    filename: str
-    document_type: str
-    source_reference: str
-    excerpt: str
+"""
+User-facing citation information returned with an answer.
+"""
 
-    page_number: int | None = None
-    section: str | None = None
-    columns: str | None = None
-    rows: str | None = None
 
+filename: str
+document_type: str
+
+source_reference: str | None = None
+excerpt: str | None = None
+
+page_number: int | None = None
+section: str | None = None
+
+columns: list[str] = Field(default_factory=list)
+rows: list[str] = Field(default_factory=list)
+
+
+# ============================================================
+
+# Structured analysis models
+
+# ============================================================
 
 class AnalysisResult(BaseModel):
-    operation: str
-
-    value: Any = None
-    table: list[dict[str, Any]] | None = None
-
-    inputs: dict[str, Any] = Field(
-        default_factory=dict
-    )
-
-    formula: str | None = None
-
-    source_file: str | None = None
-
-    rows_used: int = 0
-
-    columns_used: list[str] = Field(
-        default_factory=list
-    )
+"""
+Result of a structured CSV/Excel analysis operation.
+"""
 
 
-class NumericClaim(BaseModel):
-    metric: str
-    entity: str | None = None
-    year: int | None = None
-    value: float
-    unit: str | None = None
+operation: str
 
-    source_filename: str
-    source_reference: str
-    excerpt: str
+value: Any | None = None
+table: list[dict[str, Any]] = Field(default_factory=list)
+
+inputs: dict[str, Any] = Field(default_factory=dict)
+formula: str | None = None
+
+source_file: str | None = None
+
+rows_used: int | None = None
+columns_used: list[str] = Field(default_factory=list)
 
 
-class ConflictReport(BaseModel):
-    genuine: bool = False
+# ============================================================
 
-    explanation: str = ""
+# Conversation models
 
-    claims: list[NumericClaim] = Field(
-        default_factory=list
-    )
-
+# ============================================================
 
 class ConversationContext(BaseModel):
-    last_intent: str | None = None
-    last_question: str | None = None
-    last_answer: str | None = None
+"""
+Persistent context used to resolve follow-up questions.
+"""
 
-    entities: list[str] = Field(
-        default_factory=list
-    )
 
-    metrics: list[str] = Field(
-        default_factory=list
-    )
+last_question: str | None = None
+last_answer: str | None = None
 
-    years: list[int] = Field(
-        default_factory=list
-    )
+last_intent: str | None = None
+last_resolved_question: str | None = None
 
-    document_ids: list[str] = Field(
-        default_factory=list
-    )
+entities: list[str] = Field(default_factory=list)
+metrics: list[str] = Field(default_factory=list)
+years: list[int] = Field(default_factory=list)
 
-    last_plan_summary: str | None = None
+filters: list[PlanOp] = Field(default_factory=list)
 
-    last_numeric_results: list[dict[str, Any]] = Field(
-        default_factory=list
-    )
+document_ids: list[str] = Field(default_factory=list)
+document_hints: list[str] = Field(default_factory=list)
 
+operations: list[PlanOp] = Field(default_factory=list)
+
+last_analysis: list[AnalysisResult] = Field(
+    default_factory=list,
+)
+
+
+# ============================================================
+
+# Document API models
+
+# ============================================================
 
 class DocumentOut(BaseModel):
-    document_id: str
-    filename: str
-    file_type: str
-    file_hash: str
-    status: str
-    chunk_count: int
-    page_count: int | None = None
-    csv_profile: dict[str, Any] | None = None
-
-    created_at: str
-    updated_at: str
+"""
+Public representation of an uploaded document.
+"""
 
 
-class UploadResponse(DocumentOut):
-    pass
+document_id: str = Field(alias="id")
+filename: str
+stored_name: str | None = None
+file_type: str
+file_hash: str | None = None
 
+status: str
+
+chunk_count: int = 0
+page_count: int = 0
+
+csv_profile: dict[str, Any] | None = None
+error_message: str | None = None
+
+created_at: str | datetime | None = None
+updated_at: str | datetime | None = None
+
+model_config = ConfigDict(
+    populate_by_name=True,
+)
+
+
+class UploadResponse(BaseModel):
+"""
+Response returned after document ingestion.
+"""
+
+
+document: DocumentOut
+
+
+# ============================================================
+
+# Chat API models
+
+# ============================================================
 
 class ChatRequest(BaseModel):
-    question: str = Field(
-        min_length=1,
-        max_length=8000,
-    )
+"""
+Request accepted by POST /chat.
+"""
 
-    conversation_id: str | None = None
+
+question: str = Field(
+    min_length=1,
+    max_length=20_000,
+)
+
+conversation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
-    conversation_id: str
+"""
+Complete response returned by the chat endpoint.
+"""
 
-    answer: str
 
-    status: ChatStatus
+conversation_id: str
+answer: str
+status: ChatStatus
 
-    sources: list[Source] = Field(
-        default_factory=list
-    )
+sources: list[Source] = Field(default_factory=list)
 
-    execution_flow: list[str] = Field(
-        default_factory=list
-    )
+execution_flow: list[str] = Field(default_factory=list)
 
-    query_plan: dict[str, Any] = Field(
-        default_factory=dict
-    )
+query_plan: dict[str, Any] | None = None
 
+
+# ============================================================
+
+# Message / conversation API models
+
+# ============================================================
 
 class MessageOut(BaseModel):
-    id: str
-    role: str
-    content: str
+"""
+Public representation of one stored conversation message.
+"""
 
-    status: str | None = None
 
-    sources: list[Source] | None = None
+message_id: str
 
-    execution_flow: list[str] | None = None
+role: str
+content: str
+status: str | None = None
 
-    created_at: str
+sources: list[Source] = Field(default_factory=list)
+execution_flow: list[str] = Field(default_factory=list)
+
+query_plan: dict[str, Any] | None = None
+
+created_at: str | datetime | None = None
 
 
 class ConversationOut(BaseModel):
-    conversation_id: str
+"""
+Complete conversation returned by the conversation endpoint.
+"""
 
-    context: ConversationContext
 
-    messages: list[MessageOut]
+conversation_id: str
 
-    created_at: str
-    updated_at: str
+context: ConversationContext
 
+messages: list[MessageOut] = Field(
+    default_factory=list,
+)
+
+created_at: str | datetime | None = None
+updated_at: str | datetime | None = None
+
+
+# ============================================================
+
+# Health API model
+
+# ============================================================
 
 class HealthResponse(BaseModel):
-    status: str
-    sqlite: str
-    chroma: str
-    gemini_configured: bool
+status: str
+service: str
+model: str
