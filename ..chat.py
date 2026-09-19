@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 
 import json
@@ -507,5 +506,20 @@ def _parse_execution_flow(
     except Exception:
         return []
 
-    return value if isinstance(value
-```
+    return value if isinstance(value, list) else []
+
+
+def _new_id() -> str:
+    import uuid
+
+    return str(uuid.uuid4())
+
+
+def _utcnow() -> str:
+    from datetime import datetime, timezone
+
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+    )
