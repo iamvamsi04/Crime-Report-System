@@ -6,261 +6,166 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
-# ---------------------------------------------------------------------------
-# Query planning
-# ---------------------------------------------------------------------------
+class Intent(StrEnum):
+    FACTUAL_LOOKUP = "factual_lookup"
+    NUMERICAL_LOOKUP = "numerical_lookup"
+    CSV_AGGREGATION = "csv_aggregation"
+    SUM = "sum"
+    AVERAGE = "average"
+    MINIMUM = "minimum"
+    MAXIMUM = "maximum"
+    RANKING = "ranking"
+    SORTING = "sorting"
+    FILTERING = "filtering"
+    PERCENTAGE_CHANGE = "percentage_change"
+    YEAR_OVER_YEAR_COMPARISON = "year_over_year_comparison"
+    ENTITY_COMPARISON = "entity_comparison"
+    DOCUMENT_COMPARISON = "document_comparison"
+    MULTI_DOCUMENT_QUESTION = "multi_document_question"
+    FOLLOW_UP_QUESTION = "follow_up_question"
+    MISSING_INFORMATION = "missing_information"
+    CONFLICTING_INFORMATION = "conflicting_information"
+    OUT_OF_SCOPE = "out_of_scope"
+    AMBIGUOUS = "ambiguous"
 
 
-class ExecutionMode(StrEnum):
-    """
-    Determines which evidence path is required to answer a question.
+class ChatStatus(StrEnum):
+    ANSWERED = "answered"
+    MISSING_INFORMATION = "missing_information"
+    CONFLICTING_INFORMATION = "conflicting_information"
+    OUT_OF_SCOPE = "out_of_scope"
+    AMBIGUOUS = "ambiguous"
 
-    RETRIEVAL:
-        PDF/TXT/document-text semantic retrieval.
 
-    STRUCTURED:
-        CSV/Excel analysis against the complete dataset.
+ALLOWED_OPS = (
+    "retrieve",
+    "load_csv",
+    "sum",
+    "average",
+    "min",
+    "max",
+    "count",
+    "sort",
+    "rank",
+    "filter",
+    "groupby",
+    "percentage_change",
+    "yoy",
+    "compare",
+)
 
-    HYBRID:
-        Both textual retrieval and structured-data analysis are required.
-    """
 
-    RETRIEVAL = "retrieval"
-    STRUCTURED = "structured"
-    HYBRID = "hybrid"
+class PlanOp(BaseModel):
+    op: Literal[
+        "retrieve",
+        "load_csv",
+        "sum",
+        "average",
+        "min",
+        "max",
+        "count",
+        "sort",
+        "rank",
+        "filter",
+        "groupby",
+        "percentage_change",
+        "yoy",
+        "compare",
+    ]
+
+    target: str | None = None
+    filename_hint: str | None = None
+    column: str | None = None
+    value: Any = None
+    value_column: str | None = None
+    year_column: str | None = None
+
+    from_year: int | None = Field(
+        default=None,
+        alias="from",
+    )
+
+    to_year: int | None = Field(
+        default=None,
+        alias="to",
+    )
+
+    ascending: bool = False
+    n: int | None = None
+    agg: str | None = None
+
+    model_config = {
+        "populate_by_name": True,
+        "extra": "ignore",
+    }
 
 
 class QueryPlan(BaseModel):
-    """
-    High-level query plan.
+    intent: Intent = Intent.FACTUAL_LOOKUP
 
-    IMPORTANT:
-    This model intentionally does NOT contain operations such as:
-        sum, average, groupby, rank, yoy, percentage_change, etc.
-
-    The planner decides what evidence is needed. The structured-analysis
-    engine decides how to compute the requested answer dynamically.
-    """
-
-    mode: ExecutionMode = ExecutionMode.RETRIEVAL
-
+    # Normal / follow-up / history / repeat conversation handling
     is_follow_up: bool = False
+    conversation_intent: str = "normal"
+    resolved_question: str | None = None
+    history_target: str = "none"
+
     out_of_scope: bool = False
-    ambiguous: bool = False
-    ambiguity_reason: str | None = None
 
-    # Documents selected by the planner.
-    document_ids: list[str] = Field(default_factory=list)
-    document_hints: list[str] = Field(default_factory=list)
-
-    # Query used for semantic retrieval from PDF/TXT/document chunks.
-    retrieval_query: str | None = None
-
-    # Natural-language analytical task sent to the structured engine.
-    structured_question: str | None = None
-
-    # Context extracted by the planner. These are useful for conversation
-    # continuity and final answer generation, but they do NOT constrain
-    # what analysis the system is capable of performing.
     entities: list[str] = Field(default_factory=list)
     metrics: list[str] = Field(default_factory=list)
     years: list[int] = Field(default_factory=list)
+
     filters: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("document_ids", "document_hints", "entities", "metrics")
+    document_ids: list[str] = Field(default_factory=list)
+    document_hints: list[str] = Field(default_factory=list)
+
+    operations: list[PlanOp] = Field(default_factory=list)
+
+    ambiguous: bool = False
+    ambiguity_reason: str | None = None
+
+    retrieval_query: str | None = None
+
+    model_config = {
+        "extra": "ignore",
+    }
+
+    @field_validator("operations", mode="before")
     @classmethod
-    def clean_string_lists(cls, values: list[str]) -> list[str]:
-        result: list[str] = []
-        seen: set[str] = set()
+    def _coerce_ops(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return []
 
-        for value in values:
-            value = str(value).strip()
-            if not value:
-                continue
+        coerced = []
 
-            key = value.casefold()
-            if key in seen:
-                continue
+        for item in value:
+            if isinstance(item, PlanOp):
+                coerced.append(item)
 
-            seen.add(key)
-            result.append(value)
+            elif isinstance(item, str):
+                op = item.strip().lower()
 
-        return result
+                if op in ALLOWED_OPS:
+                    coerced.append({"op": op})
 
-    @field_validator("years")
-    @classmethod
-    def clean_years(cls, values: list[int]) -> list[int]:
-        result: list[int] = []
+            elif isinstance(item, dict):
+                if item.get("op") in ALLOWED_OPS:
+                    coerced.append(item)
 
-        for value in values:
-            try:
-                year = int(value)
-            except (TypeError, ValueError):
-                continue
-
-            if 1000 <= year <= 9999 and year not in result:
-                result.append(year)
-
-        return result
-
-
-# ---------------------------------------------------------------------------
-# Dataset schema models
-# ---------------------------------------------------------------------------
-
-
-class ColumnSchema(BaseModel):
-    """
-    Schema information exposed to the LLM for structured-data reasoning.
-    """
-
-    name: str
-    dtype: str
-
-    nullable: bool = False
-    null_count: int = 0
-    unique_count: int | None = None
-
-    sample_values: list[Any] = Field(default_factory=list)
-
-    minimum: Any | None = None
-    maximum: Any | None = None
-
-
-class DatasetSchema(BaseModel):
-    """
-    Description of one registered CSV/Excel dataset.
-    """
-
-    document_id: str
-    filename: str
-
-    # Safe internal DuckDB table name such as dataset_1.
-    table_name: str
-
-    row_count: int
-    column_count: int
-
-    columns: list[ColumnSchema] = Field(default_factory=list)
-
-
-class DatasetInfo(BaseModel):
-    """
-    Lightweight dataset metadata used by the structured executor.
-    """
-
-    document_id: str
-    filename: str
-    table_name: str
-    row_count: int
-    column_count: int
-
-
-# ---------------------------------------------------------------------------
-# Generated structured analysis
-# ---------------------------------------------------------------------------
-
-
-class GeneratedQuery(BaseModel):
-    """
-    SQL generated by Gemini for structured-data analysis.
-
-    SQL is never trusted directly. sql_executor.py validates it before
-    DuckDB is allowed to execute it.
-    """
-
-    sql: str
-
-    explanation: str = ""
-
-    tables_used: list[str] = Field(default_factory=list)
-    columns_used: list[str] = Field(default_factory=list)
-
-    @field_validator("sql")
-    @classmethod
-    def sql_must_not_be_empty(cls, value: str) -> str:
-        value = value.strip()
-
-        if not value:
-            raise ValueError("Generated SQL cannot be empty.")
-
-        return value
-
-
-class StructuredResult(BaseModel):
-    """
-    Verified result returned by DuckDB.
-
-    This becomes grounded evidence for the final answer model.
-    """
-
-    sql: str
-
-    columns: list[str] = Field(default_factory=list)
-    rows: list[dict[str, Any]] = Field(default_factory=list)
-
-    row_count: int = 0
-    truncated: bool = False
-
-    source_document_ids: list[str] = Field(default_factory=list)
-    source_filenames: list[str] = Field(default_factory=list)
-
-    explanation: str = ""
-
-    # Human-readable representation passed to the final answering model.
-    result_text: str = ""
-
-
-class AnalysisResult(BaseModel):
-    """
-    Generic analysis evidence.
-
-    This replaces the old operation-specific AnalysisResult design.
-
-    There is deliberately no assumption that the result came from a
-    predefined operation such as SUM, AVG, GROUP BY, YOY, etc.
-    """
-
-    operation: str = "dynamic_sql"
-
-    value: Any | None = None
-
-    table: list[dict[str, Any]] = Field(default_factory=list)
-    columns: list[str] = Field(default_factory=list)
-
-    formula: str | None = None
-    query: str | None = None
-
-    filename: str = ""
-    document_id: str = ""
-
-    source_filenames: list[str] = Field(default_factory=list)
-    source_document_ids: list[str] = Field(default_factory=list)
-
-    rows_used: int | None = None
-    truncated: bool = False
-
-    explanation: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Retrieved document evidence
-# ---------------------------------------------------------------------------
+        return coerced
 
 
 class Evidence(BaseModel):
     document_id: str
     filename: str
     document_type: str
-
     chunk_id: str
     text: str
-
-    similarity: float = 0.0
+    similarity: float
 
     page_number: int = 0
     section: str = ""
-
     source_reference: str = ""
 
     start_line: int = 0
@@ -274,114 +179,114 @@ class Evidence(BaseModel):
     year: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Sources returned to frontend
-# ---------------------------------------------------------------------------
-
-
 class Source(BaseModel):
-    document_id: str = ""
-    filename: str = ""
+    filename: str
+    document_type: str
+    source_reference: str
+    excerpt: str
 
-    source_reference: str = ""
-    excerpt: str = ""
+    page_number: int | None = None
+    section: str | None = None
+    columns: str | None = None
+    rows: str | None = None
 
-    document_type: str = ""
 
-    page_number: int = 0
-    section: str = ""
+class AnalysisResult(BaseModel):
+    operation: str
 
-    row_start: int = 0
-    row_end: int = 0
+    value: Any = None
+    table: list[dict[str, Any]] | None = None
 
-    # Structured analysis provenance.
-    operation: str | None = None
+    inputs: dict[str, Any] = Field(
+        default_factory=dict
+    )
+
     formula: str | None = None
-    value: Any | None = None
 
+    source_file: str | None = None
 
-# ---------------------------------------------------------------------------
-# Conflict detection
-# ---------------------------------------------------------------------------
+    rows_used: int = 0
+
+    columns_used: list[str] = Field(
+        default_factory=list
+    )
 
 
 class NumericClaim(BaseModel):
     metric: str
-
+    entity: str | None = None
+    year: int | None = None
     value: float
+    unit: str | None = None
 
-    entity: str = ""
-    year: int = 0
-    unit: str = ""
-
-    filename: str = ""
-    document_id: str = ""
-
-    source_reference: str = ""
-
-
-class ConflictItem(BaseModel):
-    metric: str
-
-    entity: str = ""
-    year: int = 0
-    unit: str = ""
-
-    claims: list[NumericClaim] = Field(default_factory=list)
+    source_filename: str
+    source_reference: str
+    excerpt: str
 
 
 class ConflictReport(BaseModel):
-    has_conflicts: bool = False
-    conflicts: list[ConflictItem] = Field(default_factory=list)
+    genuine: bool = False
 
+    explanation: str = ""
 
-# ---------------------------------------------------------------------------
-# Conversation state
-# ---------------------------------------------------------------------------
+    claims: list[NumericClaim] = Field(
+        default_factory=list
+    )
 
 
 class ConversationContext(BaseModel):
-    """
-    Lightweight context used for follow-up questions.
-
-    It stores useful references from previous turns without locking the
-    next question into a predefined analytical operation.
-    """
-
-    entities: list[str] = Field(default_factory=list)
-    metrics: list[str] = Field(default_factory=list)
-    years: list[int] = Field(default_factory=list)
-
-    document_ids: list[str] = Field(default_factory=list)
-    document_hints: list[str] = Field(default_factory=list)
-
+    last_intent: str | None = None
     last_question: str | None = None
     last_answer: str | None = None
 
-    last_execution_mode: ExecutionMode | None = None
+    entities: list[str] = Field(
+        default_factory=list
+    )
 
-    # Useful structured values from the previous turn.
-    numeric_results: dict[str, float] = Field(default_factory=dict)
+    metrics: list[str] = Field(
+        default_factory=list
+    )
+
+    years: list[int] = Field(
+        default_factory=list
+    )
+
+    document_ids: list[str] = Field(
+        default_factory=list
+    )
+
+    last_plan_summary: str | None = None
+
+    last_numeric_results: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
 
 
-# ---------------------------------------------------------------------------
-# API models
-# ---------------------------------------------------------------------------
+class DocumentOut(BaseModel):
+    document_id: str
+    filename: str
+    file_type: str
+    file_hash: str
+    status: str
+    chunk_count: int
+    page_count: int | None = None
+    csv_profile: dict[str, Any] | None = None
+
+    created_at: str
+    updated_at: str
+
+
+class UploadResponse(DocumentOut):
+    pass
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(min_length=1)
+    question: str = Field(
+        min_length=1,
+        max_length=8000,
+    )
+
     conversation_id: str | None = None
-
-    @field_validator("question")
-    @classmethod
-    def clean_question(cls, value: str) -> str:
-        value = value.strip()
-
-        if not value:
-            raise ValueError("Question cannot be empty.")
-
-        return value
 
 
 class ChatResponse(BaseModel):
@@ -389,68 +294,48 @@ class ChatResponse(BaseModel):
 
     answer: str
 
-    status: Literal[
-        "answered",
-        "missing",
-        "out_of_scope",
-        "ambiguous",
-        "conflict",
-        "error",
-    ] = "answered"
+    status: ChatStatus
 
-    sources: list[Source] = Field(default_factory=list)
+    sources: list[Source] = Field(
+        default_factory=list
+    )
 
-    execution_flow: list[str] = Field(default_factory=list)
+    execution_flow: list[str] = Field(
+        default_factory=list
+    )
 
-    query_plan: QueryPlan | None = None
-
-
-class DocumentResponse(BaseModel):
-    document_id: str
-    filename: str
-    file_type: str
-    status: str
-
-    chunk_count: int = 0
-    page_count: int | None = None
-
-    created_at: str | None = None
+    query_plan: dict[str, Any] = Field(
+        default_factory=dict
+    )
 
 
-class UploadResponse(BaseModel):
-    document_id: str
-    filename: str
-    file_type: str
-    status: str
-
-    chunk_count: int = 0
-    page_count: int | None = None
-
-
-class DeleteResponse(BaseModel):
-    document_id: str
-    deleted: bool = True
-
-
-class ConversationMessage(BaseModel):
+class MessageOut(BaseModel):
     id: str
-    conversation_id: str
-
-    role: Literal["user", "assistant"]
+    role: str
     content: str
 
     status: str | None = None
 
-    sources: list[Source] = Field(default_factory=list)
-    execution_flow: list[str] = Field(default_factory=list)
+    sources: list[Source] | None = None
 
-    query_plan: QueryPlan | None = None
+    execution_flow: list[str] | None = None
 
     created_at: str
 
 
-class ConversationResponse(BaseModel):
+class ConversationOut(BaseModel):
     conversation_id: str
+
     context: ConversationContext
 
-    messages: list[ConversationMessage] = Field(default_factory=list)
+    messages: list[MessageOut]
+
+    created_at: str
+    updated_at: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    sqlite: str
+    chroma: str
+    gemini_configured: bool
