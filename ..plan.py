@@ -3,961 +3,1160 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
 from typing import Any
 
+from app.errors import GeminiError
+from app.evidence import MISSING_ANSWER
 from app.gemini import GeminiService
-from app.models import (
-    ConversationContext,
-    ExecutionMode,
-    QueryPlan,
-)
-from app.storage import Storage
+from app.models import ConversationContext, Intent, PlanOp, QueryPlan
 
 log = logging.getLogger(__name__)
 
 
-STRUCTURED_TYPES = {"csv", "xlsx", "xls"}
-TEXT_TYPES = {"pdf", "txt"}
+PLAN_SYSTEM = """You convert a user question about uploaded documents into JSON only.
 
-
-PLAN_SYSTEM = """
-You are the query-routing and evidence-planning component of a document
-question-answering system.
-
-The user asks questions about documents that have already been uploaded.
-
-Your job is NOT to answer the question.
-
-Your job is NOT to decide whether the computation is SUM, AVG, GROUP BY,
-RANK, YOY, percentage change, correlation, median, or any other predefined
-operation.
-
-Your job is to determine what evidence paths are required.
-
-There are exactly three execution modes:
-
-1. "retrieval"
-   Use this when the answer should be obtained from document text/evidence,
-   especially PDF or TXT documents.
-
-2. "structured"
-   Use this when answering requires querying, calculating, filtering,
-   comparing, aggregating, inspecting, summarizing, or otherwise analyzing
-   CSV/Excel table data.
-
-3. "hybrid"
-   Use this when the question requires BOTH:
-   - textual evidence from PDF/TXT/document chunks, and
-   - structured analysis from CSV/Excel data.
-
-Return JSON only.
-
-Use this schema:
+Use exactly this schema:
 
 {
-  "mode": "retrieval | structured | hybrid",
-
+  "intent": "<one Intent enum value>",
   "is_follow_up": false,
   "out_of_scope": false,
-  "ambiguous": false,
-  "ambiguity_reason": null,
-
-  "document_ids": [],
-  "document_hints": [],
-
-  "retrieval_query": null,
-  "structured_question": null,
-
   "entities": [],
   "metrics": [],
   "years": [],
-  "filters": {}
+  "filters": {},
+  "document_ids": [],
+  "document_hints": [],
+  "operations": [],
+  "ambiguous": false,
+  "ambiguity_reason": null,
+  "retrieval_query": null
 }
 
-DOCUMENT SELECTION
-
-You will receive a DOCUMENT CATALOG containing:
-- document ID
-- filename
-- document type
-- structured schema information when available
-
-Use document IDs from that catalog only.
-
-If the user explicitly names a file, select the corresponding document.
-
-If the question clearly refers to one document based on its filename or
-context, select it.
-
-If multiple documents are required, include all relevant document IDs.
-
-If the question can reasonably apply across multiple uploaded documents,
-select the documents needed to answer it.
-
-Do not invent document IDs or filenames.
-
-RETRIEVAL MODE
-
-Use "retrieval" for questions whose answer should come from textual document
-content.
-
-Examples:
-- What does the policy say about remote work?
-- Summarize the CEO's discussion of risk.
-- What reason does the report give for the delay?
-- Compare the strategy described in these two reports.
-- What are the main conclusions in the PDF?
-
-For retrieval mode:
-- set retrieval_query to a concise semantic search query
-- structured_question should normally be null
-
-STRUCTURED MODE
-
-Use "structured" whenever the question requires examining CSV/Excel data.
-
-This includes BOTH calculations and direct table lookups.
-
-Examples:
-- What is total revenue?
-- What department is Alice in?
-- Show John's salary.
-- How many rows are there?
-- Which product appears most often?
-- Average salary by department.
-- Find duplicate customer IDs.
-- Which column has the most missing values?
-- What percentage of sales came from the top 10 customers?
-- Which region grew the fastest?
-- Calculate CAGR.
-- Find correlations.
-- Summarize this dataset.
-- Are there any unusual patterns?
-- Compare 2024 and 2025.
-- Which records satisfy these conditions?
-- Give me the third-highest value.
-- Calculate the median.
-- Show monthly trends.
-- Compare two spreadsheets.
-
-Do NOT attempt to decompose these into predefined operations.
-
-Instead, put the complete analytical request into "structured_question".
-
-The downstream structured-analysis engine receives the real dataset schemas
-and dynamically determines the required SQL.
-
-For structured mode:
-- structured_question should contain a complete standalone analytical task
-- retrieval_query should normally be null
-
-HYBRID MODE
-
-Use "hybrid" when both document text and structured data are required.
-
-Examples:
-- The annual report says revenue should grow 15%. Did the CSV achieve that?
-- Compare the targets in the PDF with actual results in the spreadsheet.
-- Does the employee data support the staffing claim made in the report?
-- According to the policy document, which spreadsheet records violate the
-  stated threshold?
-
-For hybrid mode:
-- retrieval_query should describe the textual evidence to retrieve
-- structured_question should describe the calculation/query needed from the
-  table data
-
-FOLLOW-UP QUESTIONS
-
-The conversation context may contain:
-- previous entities
-- previous metrics
-- previous years
-- previous document IDs
-- previous document hints
-- previous execution mode
-- previous question
-- previous answer
-
-Resolve references such as:
-- it
-- that
-- those
-- them
-- the same department
-- that year
-- what about 2025?
-- and Marketing?
-- which one was highest?
-- compare that with 2024
-
-Use previous context only when the current question genuinely depends on it.
-
-A follow-up's structured_question must still be rewritten as a standalone
-analytical task whenever possible.
-
-Example:
-
-Previous question:
-"What was Engineering revenue in 2024?"
-
-Current:
-"What about 2025?"
-
-structured_question:
-"What was Engineering revenue in 2025?"
-
-Do not blindly copy previous entities/years when the new question replaces
-them.
-
-OUT OF SCOPE
-
-Set out_of_scope=true only when the user's request is clearly unrelated to
-the available documents or asks for external information that cannot be
-derived from them.
-
-Do NOT mark a question out of scope merely because you do not immediately
-know how to calculate it. The structured analysis engine can perform complex,
-multi-step SQL.
-
-AMBIGUITY
-
-Set ambiguous=true only when a missing distinction materially prevents
-choosing the evidence/documents needed to answer correctly.
-
-Do not mark a question ambiguous merely because it is complex.
-
-If there is one structured document and the user asks "what is the average?",
-the downstream analysis may still need a specific column; that can be
+Valid intents:
+factual_lookup,
+numerical_lookup,
+csv_aggregation,
+sum,
+average,
+minimum,
+maximum,
+ranking,
+sorting,
+filtering,
+percentage_change,
+year_over_year_comparison,
+entity_comparison,
+document_comparison,
+multi_document_question,
+follow_up_question,
+missing_information,
+conflicting_information,
+out_of_scope,
 ambiguous.
 
-If the user asks "summarize this spreadsheet" and there is one spreadsheet,
-that is NOT ambiguous.
+Valid operation values:
+retrieve,
+load_csv,
+sum,
+average,
+min,
+max,
+count,
+sort,
+rank,
+filter,
+groupby,
+percentage_change,
+yoy,
+compare.
 
-ENTITIES / METRICS / YEARS / FILTERS
+IMPORTANT CSV RULES:
 
-These fields are lightweight conversational context only.
+1. CSV and Excel files are structured tabular data.
+   Use Pandas analysis operations for questions that ask for values from CSV/Excel.
 
-They do not control analytical capabilities.
+2. Do NOT use retrieve-only for a CSV/Excel numerical question.
 
-Extract them when clearly useful, but do not invent them and do not force
-every question into these fields.
+3. For an exact numeric lookup in a CSV/Excel file, use:
+   load_csv
+   + filter operation(s)
+   + an aggregation/value operation on the requested numeric column.
 
-CRITICAL PRINCIPLE
+4. When the user asks for the value of a numeric column for specific rows,
+   use "sum" as the final operation if the filters identify the intended row(s).
+   For a single matching row, sum returns that row's numeric value.
 
-Your responsibility is routing and evidence selection.
+5. Examples:
 
-Never reduce an arbitrary analytical question to a fixed operation vocabulary.
+   Question:
+   "How many units were sold on 1/10/2014 for the product Carretera?"
+
+   If the catalog contains Product, Date, and Units Sold columns, plan:
+   load_csv
+   filter Product = Carretera
+   filter Date = 1/10/2014
+   sum Units Sold
+
+   Question:
+   "What was the total revenue in 2013?"
+
+   If the catalog contains Year and Revenue columns, plan:
+   load_csv
+   filter Year = 2013
+   sum Revenue
+
+6. The requested metric must NEVER be used as the filter value.
+
+   For example:
+   "units sold for Carretera"
+   means:
+   metric = Units Sold
+   entity/filter value = Carretera
+
+   It does NOT mean:
+   filter Units Sold = Carretera.
+
+7. Use column names from the supplied document catalog whenever possible.
+
+8. For dates, preserve the user's date value in the filter.
+   The analysis layer will normalize date formats.
+
+9. For a question asking "how many units", "number of units", or "units sold",
+   identify the actual numeric Units Sold column if it exists.
+   Do NOT use count unless the user is asking how many rows/records exist.
+
+10. "total revenue", "total sales", etc. mean sum of the corresponding numeric column.
+
+11. "average revenue" means average of the Revenue column.
+
+12. "minimum revenue" means min of the Revenue column.
+
+13. "maximum revenue" means max of the Revenue column.
+
+14. If the question contains a year and the dataset has a Year column,
+   create a filter operation for that Year.
+
+15. If the question contains a product/entity and the dataset has a matching
+   product/entity column, create a filter operation for that value.
+
+16. If the question contains a date and the dataset has a Date column,
+   create a filter operation for that date.
+
+17. Never invent documents, columns, years, entities, or values.
+
+18. For non-CSV document questions, retrieve relevant evidence normally.
+
+19. If it is a follow-up, set is_follow_up true and resolve missing information
+   using the conversation context.
+
+20. If a question requires both CSV calculation and document evidence,
+   include both the appropriate CSV operations and retrieve.
+
+21. Never perform arithmetic yourself. Pandas analysis operations must calculate
+   numerical results.
+
+22. document_hints must contain filenames from the supplied catalog when relevant.
 """
 
 
 def build_plan(
+    *,
     question: str,
-    store: Storage,
+    context: ConversationContext,
+    documents: list[dict[str, Any]],
     gemini: GeminiService,
-    context: ConversationContext | None = None,
 ) -> QueryPlan:
-    """
-    Build a high-level evidence plan.
+    catalog: list[dict[str, Any]] = []
 
-    Unlike the old planner, this does not emit executable Pandas operations.
-    """
+    for doc in documents:
+        item: dict[str, Any] = {
+            "document_id": doc["id"],
+            "filename": doc["filename"],
+            "file_type": doc["file_type"],
+        }
 
-    question = question.strip()
+        if doc.get("csv_profile"):
+            try:
+                profile = (
+                    json.loads(doc["csv_profile"])
+                    if isinstance(doc["csv_profile"], str)
+                    else doc["csv_profile"]
+                )
 
-    if not question:
-        return QueryPlan(
-            ambiguous=True,
-            ambiguity_reason="The question was empty.",
-        )
+                item["columns"] = profile.get("columns") or []
+                item["year_columns"] = profile.get("year_columns") or []
+                item["entity_columns"] = profile.get("entity_columns") or []
+                item["numeric_columns"] = profile.get("numeric_columns") or []
+                item["date_columns"] = profile.get("date_columns") or []
 
-    documents = store.list_documents(ready_only=True)
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-    if not documents:
-        return QueryPlan(
-            out_of_scope=True,
-            ambiguity_reason="No ready documents are available.",
-        )
+        catalog.append(item)
 
-    catalog = _document_catalog(documents)
-
-    user_prompt = _planner_prompt(
-        question=question,
-        catalog=catalog,
-        context=context,
-    )
-
-    try:
-        payload = gemini.generate_json(
-            system=PLAN_SYSTEM,
-            user=user_prompt,
-        )
-
-        plan = QueryPlan.model_validate(payload)
-
-    except Exception:
-        log.exception("query_plan_generation_failed")
-
-        # The fallback intentionally performs only routing/document selection.
-        # It does NOT attempt to infer SUM/GROUPBY/etc.
-        plan = _fallback_plan(
-            question=question,
-            documents=documents,
-            context=context,
-        )
-
-    plan = _normalize_plan(
-        plan=plan,
-        question=question,
-        documents=documents,
-        context=context,
+    user = json.dumps(
+        {
+            "question": question,
+            "conversation_context": context.model_dump(),
+            "documents": catalog,
+        },
+        default=str,
     )
 
     log.info(
-        "query_plan mode=%s follow_up=%s docs=%s ambiguous=%s out_of_scope=%s",
-        plan.mode,
-        plan.is_follow_up,
-        plan.document_ids,
-        plan.ambiguous,
-        plan.out_of_scope,
+        "question_classification documents=%s follow_up_context=%s",
+        len(catalog),
+        bool(context.last_question),
+    )
+
+    raw = gemini.generate_json(PLAN_SYSTEM, user)
+
+    try:
+        plan = QueryPlan.model_validate(raw)
+    except Exception as exc:
+        raise GeminiError(
+            "Question understanding returned an invalid plan."
+        ) from exc
+
+    plan = _merge_follow_up(plan, context, question)
+
+    new_entities = {
+        e.casefold()
+        for e in plan.entities
+    } - {
+        e.casefold()
+        for e in context.entities
+    }
+
+    if (context.entities and new_entities) or context.last_answer == MISSING_ANSWER:
+        previous_docs = [
+            d for d in documents
+            if d["id"] in context.document_ids
+        ]
+
+        previous_names = {
+            d["filename"].casefold()
+            for d in previous_docs
+        }
+
+        if not any(
+            name in question.casefold()
+            for name in previous_names
+        ):
+            if set(plan.document_ids).issubset(context.document_ids):
+                plan.document_ids = []
+
+            plan.document_hints = [
+                h
+                for h in plan.document_hints
+                if h.casefold() not in previous_names
+            ]
+
+    plan = _apply_csv_normalization(
+        plan=plan,
+        question=question,
+        documents=documents,
+    )
+
+    plan = _apply_heuristics(
+        plan,
+        question,
+        documents,
+    )
+
+    known_ids = {
+        d["id"]
+        for d in documents
+    }
+
+    plan.document_ids = [
+        i for i in plan.document_ids
+        if i in known_ids
+    ]
+
+    log.info(
+        "query_planning intent=%s ops=%s",
+        plan.intent,
+        [op.op for op in plan.operations],
     )
 
     return plan
 
 
-def _planner_prompt(
-    *,
+def _merge_follow_up(
+    plan: QueryPlan,
+    context: ConversationContext,
     question: str,
-    catalog: list[dict[str, Any]],
-    context: ConversationContext | None,
-) -> str:
-    parts = [
-        "CURRENT QUESTION:",
-        question,
-        "",
-        "DOCUMENT CATALOG:",
-        json.dumps(
-            catalog,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        ),
-    ]
+) -> QueryPlan:
+    follow_up = plan.is_follow_up or _looks_like_follow_up(question)
 
-    if context is not None:
-        parts.extend(
-            [
-                "",
-                "CONVERSATION CONTEXT:",
-                json.dumps(
-                    context.model_dump(mode="json"),
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                ),
-            ]
-        )
+    if not follow_up:
+        mentioned = _entities_in_text(question)
 
-    parts.extend(
-        [
-            "",
-            (
-                "Create the evidence-routing plan. Do not answer the "
-                "question and do not generate analytical SQL."
-            ),
-        ]
-    )
+        if mentioned:
+            plan.entities = mentioned
 
-    return "\n".join(parts)
+        return plan
 
+    plan.is_follow_up = True
 
-def _document_catalog(
-    documents: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Build the planner's view of uploaded documents.
+    mentioned = _entities_in_text(question)
+    q = question.lower()
 
-    For structured files we expose enough schema information to help the
-    planner understand which file is relevant.
-
-    Detailed runtime schemas are still rebuilt from the actual dataframe by
-    dataset.py before SQL generation.
-    """
-
-    catalog: list[dict[str, Any]] = []
-
-    for document in documents:
-        document_id = str(document["id"])
-        filename = str(document["filename"])
-        file_type = _document_type(document)
-
-        entry: dict[str, Any] = {
-            "document_id": document_id,
-            "filename": filename,
-            "file_type": file_type,
-        }
-
-        if file_type in STRUCTURED_TYPES:
-            profile = _parse_profile(
-                document.get("csv_profile")
+    if "compare" in q or "difference" in q:
+        plan.entities = list(
+            dict.fromkeys(
+                [
+                    *mentioned,
+                    *plan.entities,
+                    *context.entities,
+                ]
             )
+        )
+    elif mentioned:
+        plan.entities = mentioned
+    elif not plan.entities:
+        plan.entities = list(context.entities)
 
-            if profile:
-                entry["structured_profile"] = _compact_profile(
-                    profile
-                )
+    if not plan.metrics:
+        plan.metrics = list(context.metrics)
 
-        catalog.append(entry)
+    if any(
+        token in q
+        for token in (
+            "previous year",
+            "last year",
+            "prior year",
+        )
+    ) and context.years:
+        plan.years = [context.years[-1] - 1]
 
-    return catalog
+    elif not plan.years:
+        years = _years_in_text(question)
+        plan.years = years or list(context.years)
 
+    if not plan.document_ids:
+        plan.document_ids = list(context.document_ids)
 
-def _compact_profile(
-    profile: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Keep the planning prompt useful without injecting the entire ingestion
-    profile.
+    if plan.intent in {
+        Intent.FOLLOW_UP_QUESTION,
+        Intent.AMBIGUOUS,
+    } and context.last_intent:
+        try:
+            plan.intent = Intent(context.last_intent)
+        except ValueError:
+            plan.intent = Intent.NUMERICAL_LOOKUP
 
-    This function accepts both the old profile format and the richer profile
-    that ingest.py will provide later.
-    """
-
-    compact: dict[str, Any] = {}
-
-    for key in (
-        "row_count",
-        "column_count",
-        "columns",
-        "dtypes",
-        "numeric_columns",
-        "date_columns",
-        "categorical_columns",
-        "sample_values",
-    ):
-        if key in profile:
-            compact[key] = profile[key]
-
-    # Future/richer ingestion profiles may already contain a structured
-    # columns array.
-    if isinstance(profile.get("column_profiles"), list):
-        compact["column_profiles"] = profile[
-            "column_profiles"
-        ]
-
-    return compact
+    return plan
 
 
-def _normalize_plan(
+def _apply_csv_normalization(
     *,
     plan: QueryPlan,
     question: str,
     documents: list[dict[str, Any]],
-    context: ConversationContext | None,
 ) -> QueryPlan:
     """
-    Normalize model output against the real document catalog.
+    Normalize Gemini's plan using the actual CSV/Excel schema.
 
-    Gemini cannot introduce arbitrary document IDs.
+    This does not contain product names, dates, or dataset-specific values.
+    It only uses the schema/profile supplied by the uploaded dataset.
     """
 
-    by_id = {
-        str(document["id"]): document
-        for document in documents
-    }
-
-    plan.document_ids = [
-        document_id
-        for document_id in plan.document_ids
-        if document_id in by_id
+    csv_docs = [
+        d for d in documents
+        if d["file_type"] in {"csv", "excel"}
     ]
 
-    plan.document_hints = _valid_document_hints(
-        hints=plan.document_hints,
-        documents=documents,
+    if not csv_docs:
+        return plan
+
+    # Do not modify conversational history/repeat plans here.
+    if getattr(plan, "conversation_intent", "normal") in {
+        "history",
+        "repeat",
+    }:
+        return plan
+
+    doc = _choose_csv_document(
+        plan=plan,
+        csv_docs=csv_docs,
     )
 
-    # Resolve filename hints into IDs where possible.
-    hinted_ids = _ids_for_hints(
-        hints=plan.document_hints,
-        documents=documents,
-    )
+    if doc is None:
+        return plan
 
-    for document_id in hinted_ids:
-        if document_id not in plan.document_ids:
-            plan.document_ids.append(document_id)
+    profile = _get_profile(doc)
 
-    # If Gemini selected no document, use deterministic routing where there is
-    # an obvious single candidate.
-    if not plan.document_ids:
-        candidates = _documents_for_mode(
-            mode=plan.mode,
-            documents=documents,
+    columns = [
+        str(c)
+        for c in (
+            profile.get("columns")
+            or []
         )
+    ]
 
-        if len(candidates) == 1:
-            plan.document_ids = [
-                str(candidates[0]["id"])
-            ]
+    numeric_columns = [
+        str(c)
+        for c in (
+            profile.get("numeric_columns")
+            or []
+        )
+    ]
 
-    # Follow-up document inheritance. Only use it when the current planner
-    # failed to identify documents.
-    if (
-        not plan.document_ids
-        and context is not None
-        and context.document_ids
-    ):
-        inherited = [
-            document_id
-            for document_id in context.document_ids
-            if document_id in by_id
+    entity_columns = [
+        str(c)
+        for c in (
+            profile.get("entity_columns")
+            or []
+        )
+    ]
+
+    year_columns = [
+        str(c)
+        for c in (
+            profile.get("year_columns")
+            or []
+        )
+    ]
+
+    date_columns = [
+        str(c)
+        for c in (
+            profile.get("date_columns")
+            or []
+        )
+    ]
+
+    q = question.casefold()
+
+    # If Gemini already produced real CSV operations, preserve them,
+    # but repair malformed filter/metric relationships.
+    csv_ops = [
+        op for op in plan.operations
+        if op.op in {
+            "load_csv",
+            "sum",
+            "average",
+            "min",
+            "max",
+            "count",
+            "filter",
+            "sort",
+            "rank",
+            "groupby",
+            "percentage_change",
+            "yoy",
+            "compare",
+        }
+    ]
+
+    # Determine the requested numeric metric from the actual schema.
+    metric_column = _find_metric_column(
+        question=question,
+        columns=columns,
+        numeric_columns=numeric_columns,
+        existing_metrics=plan.metrics,
+    )
+
+    if metric_column:
+        plan.metrics = [
+            metric_column
         ]
 
-        if inherited:
-            plan.document_ids = inherited
-            plan.is_follow_up = True
+    # Detect explicit year from the question.
+    years = _years_in_text(question)
 
-    # Ensure each execution mode has the corresponding natural-language task.
-    if plan.mode == ExecutionMode.STRUCTURED:
-        if not plan.structured_question:
-            plan.structured_question = question
+    if years:
+        plan.years = years
 
-        plan.retrieval_query = None
+    # Build filters from actual schema.
+    filters: list[PlanOp] = []
 
-    elif plan.mode == ExecutionMode.RETRIEVAL:
-        if not plan.retrieval_query:
-            plan.retrieval_query = question
+    # Year filter.
+    if plan.years and year_columns:
+        year_column = year_columns[0]
 
-        plan.structured_question = None
-
-    elif plan.mode == ExecutionMode.HYBRID:
-        if not plan.retrieval_query:
-            plan.retrieval_query = question
-
-        if not plan.structured_question:
-            plan.structured_question = question
-
-    # Do not let an inherited context accidentally select the wrong document
-    # type for a new execution mode.
-    plan.document_ids = _filter_ids_for_mode(
-        document_ids=plan.document_ids,
-        mode=plan.mode,
-        documents=documents,
-    )
-
-    # If filtering removed everything, try deterministic candidates once more.
-    if not plan.document_ids:
-        candidates = _documents_for_mode(
-            mode=plan.mode,
-            documents=documents,
+        filters.append(
+            PlanOp(
+                op="filter",
+                column=year_column,
+                value=plan.years[0],
+            )
         )
 
-        if len(candidates) == 1:
-            plan.document_ids = [
-                str(candidates[0]["id"])
-            ]
+    # Entity/product filter.
+    if plan.entities and entity_columns:
+        entity_column = _find_entity_column(
+            columns=columns,
+            entity_columns=entity_columns,
+            question=question,
+        )
+
+        if entity_column:
+            filters.append(
+                PlanOp(
+                    op="filter",
+                    column=entity_column,
+                    value=plan.entities[0],
+                )
+            )
+
+    # Date filter.
+    date_value = _extract_date_value(question)
+
+    if date_value and date_columns:
+        filters.append(
+            PlanOp(
+                op="filter",
+                column=date_columns[0],
+                value=date_value,
+            )
+        )
+
+    # Also use Gemini-provided filters, but repair their columns when
+    # they appear to confuse a numeric metric with an entity/date/year.
+    for existing in csv_ops:
+        if existing.op != "filter":
+            continue
+
+        column = existing.column
+        value = existing.value
+
+        if column:
+            resolved = _resolve_column_name(
+                columns,
+                column,
+            )
+
+            if resolved:
+                column = resolved
+
+        if value is None:
+            continue
+
+        if column and column not in columns:
+            continue
+
+        filters.append(
+            PlanOp(
+                op="filter",
+                column=column,
+                value=value,
+            )
+        )
+
+    filters = _deduplicate_filters(filters)
+
+    # Determine the intended aggregation.
+    aggregation = _requested_aggregation(
+        question,
+        plan,
+    )
+
+    # Numeric CSV question:
+    # construct a complete structured-data operation chain.
+    if metric_column and _is_numeric_csv_question(
+        question=question,
+        metric_column=metric_column,
+        columns=columns,
+    ):
+        ops: list[PlanOp] = [
+            PlanOp(
+                op="load_csv",
+                filename_hint=doc["filename"],
+            )
+        ]
+
+        ops.extend(filters)
+
+        ops.append(
+            PlanOp(
+                op=aggregation,
+                column=metric_column,
+                value_column=metric_column,
+            )
+        )
+
+        plan.operations = ops
+
+        if aggregation == "sum":
+            plan.intent = Intent.SUM
+        elif aggregation == "average":
+            plan.intent = Intent.AVERAGE
+        elif aggregation == "min":
+            plan.intent = Intent.MINIMUM
+        elif aggregation == "max":
+            plan.intent = Intent.MAXIMUM
+        elif aggregation == "count":
+            plan.intent = Intent.NUMERICAL_LOOKUP
+        else:
+            plan.intent = Intent.CSV_AGGREGATION
+
+        plan.document_ids = [doc["id"]]
+        plan.document_hints = [doc["filename"]]
+
+        return plan
 
     return plan
 
 
-def _fallback_plan(
+def _is_numeric_csv_question(
     *,
     question: str,
-    documents: list[dict[str, Any]],
-    context: ConversationContext | None,
-) -> QueryPlan:
-    """
-    Conservative fallback used only when Gemini planning fails.
-
-    There is deliberately no keyword -> analytical operation map here.
-
-    We only infer whether structured and/or textual evidence is likely needed.
-    """
-
-    mentioned = _documents_mentioned_in_question(
-        question=question,
-        documents=documents,
-    )
-
-    if mentioned:
-        mentioned_types = {
-            _document_type(document)
-            for document in mentioned
-        }
-
-        has_structured = bool(
-            mentioned_types.intersection(
-                STRUCTURED_TYPES
-            )
-        )
-
-        has_text = bool(
-            mentioned_types.intersection(
-                TEXT_TYPES
-            )
-        )
-
-        if has_structured and has_text:
-            mode = ExecutionMode.HYBRID
-
-        elif has_structured:
-            mode = ExecutionMode.STRUCTURED
-
-        else:
-            mode = ExecutionMode.RETRIEVAL
-
-        return QueryPlan(
-            mode=mode,
-            document_ids=[
-                str(document["id"])
-                for document in mentioned
-            ],
-            document_hints=[
-                str(document["filename"])
-                for document in mentioned
-            ],
-            retrieval_query=(
-                question
-                if mode in {
-                    ExecutionMode.RETRIEVAL,
-                    ExecutionMode.HYBRID,
-                }
-                else None
-            ),
-            structured_question=(
-                question
-                if mode in {
-                    ExecutionMode.STRUCTURED,
-                    ExecutionMode.HYBRID,
-                }
-                else None
-            ),
-        )
-
-    structured = [
-        document
-        for document in documents
-        if _document_type(document)
-        in STRUCTURED_TYPES
-    ]
-
-    textual = [
-        document
-        for document in documents
-        if _document_type(document)
-        in TEXT_TYPES
-    ]
-
-    # If only one evidence family exists, routing is deterministic.
-    if structured and not textual:
-        return QueryPlan(
-            mode=ExecutionMode.STRUCTURED,
-            document_ids=[
-                str(document["id"])
-                for document in structured
-            ],
-            structured_question=question,
-        )
-
-    if textual and not structured:
-        return QueryPlan(
-            mode=ExecutionMode.RETRIEVAL,
-            document_ids=[
-                str(document["id"])
-                for document in textual
-            ],
-            retrieval_query=question,
-        )
-
-    # Reuse previous mode/documents when this strongly looks like a follow-up.
-    if (
-        context is not None
-        and context.last_execution_mode is not None
-        and context.document_ids
-        and _looks_like_follow_up(question)
-    ):
-        mode = context.last_execution_mode
-
-        return QueryPlan(
-            mode=mode,
-            is_follow_up=True,
-            document_ids=list(
-                context.document_ids
-            ),
-            document_hints=list(
-                context.document_hints
-            ),
-            retrieval_query=(
-                question
-                if mode in {
-                    ExecutionMode.RETRIEVAL,
-                    ExecutionMode.HYBRID,
-                }
-                else None
-            ),
-            structured_question=(
-                question
-                if mode in {
-                    ExecutionMode.STRUCTURED,
-                    ExecutionMode.HYBRID,
-                }
-                else None
-            ),
-        )
-
-    # When both evidence families exist and planning failed, guessing could
-    # silently answer from the wrong source. Mark it ambiguous instead.
-    return QueryPlan(
-        mode=ExecutionMode.RETRIEVAL,
-        ambiguous=True,
-        ambiguity_reason=(
-            "The system could not determine which uploaded document "
-            "or data source should be used for this question."
-        ),
-    )
-
-
-def _documents_for_mode(
-    *,
-    mode: ExecutionMode,
-    documents: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if mode == ExecutionMode.STRUCTURED:
-        return [
-            document
-            for document in documents
-            if _document_type(document)
-            in STRUCTURED_TYPES
-        ]
-
-    if mode == ExecutionMode.RETRIEVAL:
-        return [
-            document
-            for document in documents
-            if _document_type(document)
-            in TEXT_TYPES
-        ]
-
-    # Hybrid needs both families. Returning all relevant documents allows the
-    # downstream retrieval and dataset loaders to take their respective types.
-    return [
-        document
-        for document in documents
-        if _document_type(document)
-        in STRUCTURED_TYPES.union(TEXT_TYPES)
-    ]
-
-
-def _filter_ids_for_mode(
-    *,
-    document_ids: list[str],
-    mode: ExecutionMode,
-    documents: list[dict[str, Any]],
-) -> list[str]:
-    by_id = {
-        str(document["id"]): document
-        for document in documents
-    }
-
-    result: list[str] = []
-
-    for document_id in document_ids:
-        document = by_id.get(document_id)
-
-        if document is None:
-            continue
-
-        file_type = _document_type(document)
-
-        if (
-            mode == ExecutionMode.STRUCTURED
-            and file_type not in STRUCTURED_TYPES
-        ):
-            continue
-
-        if (
-            mode == ExecutionMode.RETRIEVAL
-            and file_type not in TEXT_TYPES
-        ):
-            continue
-
-        if (
-            mode == ExecutionMode.HYBRID
-            and file_type
-            not in STRUCTURED_TYPES.union(TEXT_TYPES)
-        ):
-            continue
-
-        if document_id not in result:
-            result.append(document_id)
-
-    return result
-
-
-def _valid_document_hints(
-    *,
-    hints: list[str],
-    documents: list[dict[str, Any]],
-) -> list[str]:
-    filenames = [
-        str(document["filename"])
-        for document in documents
-    ]
-
-    result: list[str] = []
-
-    for hint in hints:
-        for filename in filenames:
-            if _filename_matches(
-                filename=filename,
-                hint=hint,
-            ):
-                if filename not in result:
-                    result.append(filename)
-
-                break
-
-    return result
-
-
-def _ids_for_hints(
-    *,
-    hints: list[str],
-    documents: list[dict[str, Any]],
-) -> list[str]:
-    result: list[str] = []
-
-    for hint in hints:
-        for document in documents:
-            filename = str(
-                document["filename"]
-            )
-
-            if _filename_matches(
-                filename=filename,
-                hint=hint,
-            ):
-                document_id = str(
-                    document["id"]
-                )
-
-                if document_id not in result:
-                    result.append(document_id)
-
-    return result
-
-
-def _documents_mentioned_in_question(
-    *,
-    question: str,
-    documents: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    lowered = question.casefold()
-
-    matches: list[dict[str, Any]] = []
-
-    for document in documents:
-        filename = str(
-            document["filename"]
-        )
-
-        stem = Path(filename).stem
-
-        if (
-            filename.casefold() in lowered
-            or (
-                len(stem) >= 3
-                and stem.casefold() in lowered
-            )
-        ):
-            matches.append(document)
-
-    return matches
-
-
-def _filename_matches(
-    *,
-    filename: str,
-    hint: str,
+    metric_column: str,
+    columns: list[str],
 ) -> bool:
-    filename = filename.strip().casefold()
-    hint = hint.strip().casefold()
-
-    if not filename or not hint:
+    if not metric_column:
         return False
 
-    if filename == hint:
-        return True
+    if metric_column not in columns:
+        return False
 
-    filename_stem = Path(filename).stem
-    hint_stem = Path(hint).stem
+    q = question.casefold()
 
-    return (
-        filename_stem == hint_stem
-        or hint in filename
+    numeric_terms = (
+        "how many",
+        "number of",
+        "units sold",
+        "total",
+        "sum",
+        "average",
+        "avg",
+        "mean",
+        "minimum",
+        "maximum",
+        "revenue",
+        "sales",
+        "profit",
+        "cost",
+        "expense",
+        "amount",
+        "value",
+        "growth",
+        "percentage",
+        "%",
     )
 
-
-def _document_type(
-    document: dict[str, Any],
-) -> str:
-    file_type = str(
-        document.get("file_type") or ""
-    ).strip().lower().lstrip(".")
-
-    if file_type:
-        return file_type
-
-    return Path(
-        str(document.get("filename") or "")
-    ).suffix.lower().lstrip(".")
+    return any(term in q for term in numeric_terms)
 
 
-def _parse_profile(
-    raw: Any,
-) -> dict[str, Any] | None:
-    if not raw:
+def _find_metric_column(
+    *,
+    question: str,
+    columns: list[str],
+    numeric_columns: list[str],
+    existing_metrics: list[str],
+) -> str | None:
+    # First trust an existing planner metric if it resolves to a real
+    # numeric column.
+    for metric in existing_metrics:
+        resolved = _resolve_column_name(
+            numeric_columns or columns,
+            metric,
+        )
+
+        if resolved and resolved in columns:
+            return resolved
+
+    q = question.casefold()
+
+    # Exact/near column-name matching.
+    candidates: list[tuple[int, str]] = []
+
+    for column in numeric_columns:
+        normalized = column.casefold()
+
+        score = 0
+
+        if normalized in q:
+            score += 100
+
+        words = [
+            word
+            for word in re.split(r"[^a-z0-9]+", normalized)
+            if word
+        ]
+
+        for word in words:
+            if len(word) >= 3 and word in q:
+                score += 10
+
+        # Natural-language aliases.
+        if normalized in {
+            "units sold",
+            "units",
+            "quantity",
+            "qty",
+        } and (
+            "units sold" in q
+            or "number of units" in q
+            or "how many units" in q
+            or "units" in q
+        ):
+            score += 80
+
+        if "revenue" in normalized and (
+            "revenue" in q
+            or "sales revenue" in q
+        ):
+            score += 80
+
+        if "profit" in normalized and "profit" in q:
+            score += 80
+
+        if "sales" in normalized and "sales" in q:
+            score += 60
+
+        if score:
+            candidates.append(
+                (
+                    score,
+                    column,
+                )
+            )
+
+    if candidates:
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        return candidates[0][1]
+
+    return None
+
+
+def _find_entity_column(
+    *,
+    columns: list[str],
+    entity_columns: list[str],
+    question: str,
+) -> str | None:
+    if not entity_columns:
         return None
+
+    q = question.casefold()
+
+    # Prefer product columns when the question explicitly discusses
+    # a product.
+    for column in entity_columns:
+        normalized = column.casefold()
+
+        if "product" in normalized and "product" in q:
+            return column
+
+    # Otherwise use the first known entity column.
+    return entity_columns[0]
+
+
+def _requested_aggregation(
+    question: str,
+    plan: QueryPlan,
+) -> str:
+    q = question.casefold()
+
+    if any(
+        term in q
+        for term in (
+            "average",
+            "avg",
+            "mean",
+        )
+    ):
+        return "average"
+
+    if any(
+        term in q
+        for term in (
+            "minimum",
+            "minimum value",
+            "lowest",
+            "smallest",
+        )
+    ):
+        return "min"
+
+    if any(
+        term in q
+        for term in (
+            "maximum",
+            "maximum value",
+            "highest",
+            "largest",
+        )
+    ):
+        return "max"
+
+    # "how many rows/records" means count.
+    if (
+        "how many rows" in q
+        or "how many records" in q
+        or "number of records" in q
+        or "number of rows" in q
+    ):
+        return "count"
+
+    # A requested numeric field such as Units Sold should be summed
+    # when the question asks for its value for matching rows.
+    return "sum"
+
+
+def _choose_csv_document(
+    *,
+    plan: QueryPlan,
+    csv_docs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for document_id in plan.document_ids:
+        for doc in csv_docs:
+            if doc["id"] == document_id:
+                return doc
+
+    for hint in plan.document_hints:
+        hint_lower = hint.casefold()
+
+        for doc in csv_docs:
+            if hint_lower in doc["filename"].casefold():
+                return doc
+
+    return csv_docs[0] if csv_docs else None
+
+
+def _get_profile(
+    doc: dict[str, Any],
+) -> dict[str, Any]:
+    raw = doc.get("csv_profile")
+
+    if not raw:
+        return {}
 
     if isinstance(raw, dict):
         return raw
 
     try:
-        parsed = json.loads(str(raw))
-    except (TypeError, ValueError, json.JSONDecodeError):
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _resolve_column_name(
+    columns: list[str],
+    name: str,
+) -> str | None:
+    if not name:
         return None
 
-    return (
-        parsed
-        if isinstance(parsed, dict)
-        else None
+    target = name.strip().casefold()
+
+    # Exact match.
+    for column in columns:
+        if column.casefold() == target:
+            return column
+
+    # Normalized match.
+    normalized_target = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        target,
+    ).strip()
+
+    for column in columns:
+        normalized_column = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            column.casefold(),
+        ).strip()
+
+        if normalized_column == normalized_target:
+            return column
+
+    # Safe substring match.
+    for column in columns:
+        lowered = column.casefold()
+
+        if target in lowered or lowered in target:
+            return column
+
+    return None
+
+
+def _deduplicate_filters(
+    filters: list[PlanOp],
+) -> list[PlanOp]:
+    result: list[PlanOp] = []
+    seen: set[tuple[str, str]] = set()
+
+    for op in filters:
+        if not op.column:
+            continue
+
+        key = (
+            op.column.casefold(),
+            str(op.value).casefold(),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(op)
+
+    return result
+
+
+def _extract_date_value(
+    question: str,
+) -> str | None:
+    # Numeric dates such as:
+    # 1/10/2014
+    # 01/10/2014
+    # 1-10-2014
+    match = re.search(
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
+        question,
     )
+
+    if match:
+        return match.group(0)
+
+    # Text dates such as:
+    # October 10, 2014
+    # 10 October 2014
+    match = re.search(
+        r"\b(?:"
+        r"january|february|march|april|may|june|july|august|"
+        r"september|october|november|december"
+        r")\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b",
+        question,
+        re.I,
+    )
+
+    if match:
+        return match.group(0)
+
+    match = re.search(
+        r"\b\d{1,2}(?:st|nd|rd|th)?\s+"
+        r"(?:january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)"
+        r"(?:\s+|,\s*)\d{4}\b",
+        question,
+        re.I,
+    )
+
+    if match:
+        return match.group(0)
+
+    return None
+
+
+def _apply_heuristics(
+    plan: QueryPlan,
+    question: str,
+    documents: list[dict[str, Any]],
+) -> QueryPlan:
+    """
+    Lightweight deterministic normalization.
+
+    This is only for structured operation normalization.
+    Conversation intent is handled semantically by Gemini.
+    """
+
+    # History/repeat plans must not become retrieval plans.
+    if getattr(plan, "conversation_intent", "normal") in {
+        "history",
+        "repeat",
+    }:
+        return plan
+
+    q = question.lower()
+
+    csv_docs = [
+        d for d in documents
+        if d["file_type"] in {"csv", "excel"}
+    ]
+
+    numeric_map = {
+        "sum": "sum",
+        "total": "sum",
+        "average": "average",
+        "avg": "average",
+        "mean": "average",
+        "minimum": "min",
+        "min ": "min",
+        "maximum": "max",
+        "max ": "max",
+        "rank": "rank",
+        "sort": "sort",
+        "filter": "filter",
+        "percentage": "percentage_change",
+        "percent": "percentage_change",
+        "year-over-year": "yoy",
+        "year over year": "yoy",
+        "yoy": "yoy",
+        "growth": "yoy",
+    }
+
+    # Only apply these heuristics when CSV exists.
+    if csv_docs and any(
+        key in q
+        for key in numeric_map
+    ):
+        op_name = next(
+            numeric_map[key]
+            for key in numeric_map
+            if key in q
+        )
+
+        # If CSV normalization already produced a proper structured plan,
+        # do not destroy it.
+        has_load = any(
+            op.op == "load_csv"
+            for op in plan.operations
+        )
+
+        has_metric_op = any(
+            op.op in {
+                "sum",
+                "average",
+                "min",
+                "max",
+                "count",
+                "rank",
+                "sort",
+                "percentage_change",
+                "yoy",
+                "compare",
+            }
+            for op in plan.operations
+        )
+
+        if not has_load and not has_metric_op:
+            hint = csv_docs[0]["filename"]
+
+            operations = [
+                PlanOp(
+                    op="load_csv",
+                    filename_hint=hint,
+                )
+            ]
+
+            if plan.metrics:
+                metric = plan.metrics[0]
+
+                operations.append(
+                    PlanOp(
+                        op=op_name,
+                        column=metric,
+                    )
+                )
+            else:
+                operations.append(
+                    PlanOp(
+                        op=op_name,
+                    )
+                )
+
+            plan.operations = operations
+
+        if plan.intent in {
+            Intent.FACTUAL_LOOKUP,
+            Intent.FOLLOW_UP_QUESTION,
+        }:
+            mapping = {
+                "sum": Intent.SUM,
+                "average": Intent.AVERAGE,
+                "min": Intent.MINIMUM,
+                "max": Intent.MAXIMUM,
+                "rank": Intent.RANKING,
+                "sort": Intent.SORTING,
+                "filter": Intent.FILTERING,
+                "percentage_change": Intent.PERCENTAGE_CHANGE,
+                "yoy": Intent.YEAR_OVER_YEAR_COMPARISON,
+            }
+
+            plan.intent = mapping.get(
+                op_name,
+                Intent.CSV_AGGREGATION,
+            )
+
+    if not plan.years:
+        plan.years = _years_in_text(question)
+
+    if not plan.operations:
+        plan.operations = [
+            PlanOp(op="retrieve")
+        ]
+
+    return plan
 
 
 def _looks_like_follow_up(
     question: str,
 ) -> bool:
-    """
-    This heuristic is intentionally about conversational dependency only.
-    It is NOT an analytical-operation heuristic.
-    """
+    q = question.strip().lower()
 
-    text = question.strip().casefold()
+    if any(
+        token in q
+        for token in (
+            "previous year",
+            "last year",
+            "prior year",
+            "the difference",
+            "compare that",
+        )
+    ):
+        return True
 
-    patterns = (
-        r"^(and|also|then)\b",
-        r"^what about\b",
-        r"^how about\b",
-        r"^what if\b",
-        r"\b(that|those|them|same|previous)\b",
-        r"\bthat year\b",
-        r"\bthat department\b",
-        r"\bthat file\b",
-        r"\bthat document\b",
+    if len(q.split()) <= 10 and q.startswith(
+        (
+            "what about",
+            "how about",
+            "and ",
+            "same for",
+            "now ",
+            "and what",
+        )
+    ):
+        return True
+
+    return bool(
+        re.match(
+            r"^(what about|how about)\b",
+            q,
+        )
     )
 
-    return any(
-        re.search(pattern, text)
-        for pattern in patterns
-    )
+
+def _entities_in_text(
+    text: str,
+) -> list[str]:
+    found: list[str] = []
+
+    for name in (
+        "Engineering",
+        "Sales",
+        "Marketing",
+        "Finance",
+        "HR",
+        "Operations",
+    ):
+        if re.search(
+            rf"\b{re.escape(name)}\b",
+            text,
+            re.I,
+        ):
+            found.append(name)
+
+    return found
+
+
+def _years_in_text(
+    text: str,
+) -> list[int]:
+    return [
+        int(year)
+        for year in re.findall(
+            r"\b(20\d{2}|19\d{2})\b",
+            text,
+        )
+    ]
