@@ -1,263 +1,490 @@
 from __future__ import annotations
 
-import math
-import re
-from typing import Any, Iterable
+from dataclasses import dataclass
+from typing import Any
 
 from app.models import AnalysisResult, Evidence, Source
 
 
-_NUMERIC_RE = re.compile(
-    r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?"
+MISSING_ANSWER = (
+    "I could not find enough information in the uploaded documents "
+    "to answer that question."
+)
+
+OUT_OF_SCOPE_ANSWER = (
+    "I can answer questions based on the uploaded PDF, TXT, CSV, "
+    "and Excel documents."
 )
 
 
-def sources_from_evidence(
-    evidence: Iterable[Evidence],
-    analysis: Iterable[AnalysisResult] | None = None,
-) -> list[Source]:
-    """
-    Convert retrieved evidence and structured analysis results into
-    source records exposed by the chat response.
-    """
-    sources: list[Source] = []
-    seen: set[tuple[Any, ...]] = set()
-
-    for item in evidence:
-        source = _source_from_evidence(item)
-
-        key = (
-            source.document_id,
-            source.filename,
-            source.page,
-            source.chunk_id,
-        )
-
-        if key not in seen:
-            seen.add(key)
-            sources.append(source)
-
-    for result in analysis or []:
-        source = Source(
-            document_id=result.inputs.get("document_id")
-            if isinstance(result.inputs, dict)
-            else None,
-            filename=result.source_file,
-            page=None,
-            chunk_id=None,
-            excerpt=_analysis_excerpt(result),
-        )
-
-        key = (
-            source.document_id,
-            source.filename,
-            source.page,
-            source.chunk_id,
-        )
-
-        if key not in seen:
-            seen.add(key)
-            sources.append(source)
-
-    return sources
+@dataclass(frozen=True)
+class ConflictResult:
+    genuine: bool
+    explanation: str | None = None
 
 
 def validate_evidence(
-    evidence: Iterable[Evidence],
-    analysis: Iterable[AnalysisResult],
+    evidence: list[Evidence],
+    analysis: list[AnalysisResult],
 ) -> bool:
     """
-    Determine whether the answer has sufficient grounded evidence.
+    Determine whether there is enough grounded information to answer
+    the user's question.
 
-    A successful structured analysis result is considered valid evidence
-    for numerical/analytical questions. Retrieval evidence is considered
-    valid when at least one usable item is present.
+    Structured-data analysis is considered valid when the analysis layer
+    produced at least one meaningful result.
+
+    Document questions require retrieved evidence containing actual text.
     """
-    evidence_list = list(evidence)
-    analysis_list = list(analysis)
 
-    if evidence_list:
-        return True
+    if analysis:
+        return any(_analysis_has_result(result) for result in analysis)
 
-    for result in analysis_list:
-        if _analysis_result_is_valid(result):
-            return True
+    if evidence:
+        return any(_evidence_has_content(item) for item in evidence)
 
     return False
 
 
-def detect_conflicts(
-    evidence: Iterable[Evidence],
-    analysis: Iterable[AnalysisResult],
-) -> list[str]:
+def sources_from_evidence(
+    evidence: list[Evidence],
+    analysis: list[AnalysisResult],
+) -> list[Source]:
     """
-    Detect obvious numeric conflicts between retrieved evidence and
-    structured analysis results.
+    Convert internal evidence and analysis results into the public
+    Source model returned by the API.
+    """
 
-    This is intentionally conservative. It only reports conflicts when
-    the same numeric value appears to be represented differently.
-    """
-    evidence_numbers = _extract_evidence_numbers(evidence)
-    conflicts: list[str] = []
+    sources: list[Source] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+
+    for item in evidence:
+        key = (
+            item.filename,
+            item.source_reference,
+            item.chunk_id,
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        sources.append(
+            Source(
+                filename=item.filename,
+                document_type=item.document_type,
+                source_reference=(
+                    item.source_reference
+                    or _default_source_reference(item)
+                ),
+                excerpt=_clean_excerpt(item.text),
+                page_number=item.page_number,
+                section=item.section,
+                columns=list(item.columns),
+                rows=[],
+            )
+        )
 
     for result in analysis:
-        value_numbers = _extract_result_numbers(result)
+        source = _source_from_analysis(result)
 
-        for value in value_numbers:
-            if not _has_close_numeric_match(value, evidence_numbers):
-                continue
+        if source is None:
+            continue
 
-        # The analysis result itself is authoritative for the structured
-        # calculation. We only report explicit contradictory numeric
-        # evidence when both sides contain comparable values.
-        if evidence_numbers and value_numbers:
-            unmatched = [
-                value
-                for value in value_numbers
-                if not _has_close_numeric_match(value, evidence_numbers)
-            ]
+        key = (
+            source.filename,
+            source.source_reference,
+            None,
+        )
 
-            if unmatched:
-                conflicts.append(
-                    (
-                        f"Structured analysis from {result.source_file!r} "
-                        f"contains numeric value(s) {unmatched}, while "
-                        "retrieved evidence contains different numeric values."
-                    )
-                )
+        if key in seen:
+            continue
 
-    return conflicts
+        seen.add(key)
+        sources.append(source)
+
+    return sources
 
 
-def _source_from_evidence(item: Evidence) -> Source:
+def detect_conflicts(
+    evidence: list[Evidence],
+    analysis: list[AnalysisResult],
+) -> ConflictResult:
     """
-    Build a Source object while tolerating the small differences that may
-    exist between retrieval evidence records.
+    Detect clear conflicts in grounded information.
+
+    This intentionally looks for explicit contradictions rather than
+    treating different passages or different calculated values as
+    automatically conflicting.
     """
-    data = (
-        item.model_dump()
-        if hasattr(item, "model_dump")
-        else dict(item)
-    )
+
+    evidence_conflict = _detect_evidence_conflict(evidence)
+
+    if evidence_conflict is not None:
+        return ConflictResult(
+            genuine=True,
+            explanation=evidence_conflict,
+        )
+
+    analysis_conflict = _detect_analysis_conflict(analysis)
+
+    if analysis_conflict is not None:
+        return ConflictResult(
+            genuine=True,
+            explanation=analysis_conflict,
+        )
+
+    return ConflictResult(genuine=False)
+
+
+def _analysis_has_result(result: AnalysisResult) -> bool:
+    """
+    Check whether an analysis result contains usable information.
+    """
+
+    if result.value is not None:
+        return True
+
+    if result.table:
+        return True
+
+    if result.inputs:
+        return True
+
+    return False
+
+
+def _evidence_has_content(item: Evidence) -> bool:
+    """
+    Check whether retrieved document evidence contains usable text.
+    """
+
+    return bool(item.text and item.text.strip())
+
+
+def _default_source_reference(item: Evidence) -> str:
+    """
+    Create a readable source reference when the retrieval layer did not
+    already provide one.
+    """
+
+    if item.page_number is not None:
+        return f"{item.filename}, page {item.page_number}"
+
+    if item.section:
+        return f"{item.filename}, {item.section}"
+
+    if item.start_line is not None:
+        if item.end_line is not None:
+            return (
+                f"{item.filename}, "
+                f"lines {item.start_line}-{item.end_line}"
+            )
+
+        return f"{item.filename}, line {item.start_line}"
+
+    if item.row_start is not None:
+        if item.row_end is not None:
+            return (
+                f"{item.filename}, "
+                f"rows {item.row_start}-{item.row_end}"
+            )
+
+        return f"{item.filename}, row {item.row_start}"
+
+    return item.filename
+
+
+def _clean_excerpt(text: str | None) -> str | None:
+    """
+    Keep source excerpts readable without changing their meaning.
+    """
+
+    if not text:
+        return None
+
+    cleaned = " ".join(text.split())
+
+    if not cleaned:
+        return None
+
+    max_length = 1200
+
+    if len(cleaned) <= max_length:
+        return cleaned
+
+    return cleaned[:max_length].rstrip() + "..."
+
+
+def _source_from_analysis(
+    result: AnalysisResult,
+) -> Source | None:
+    """
+    Convert a structured-data analysis result into a source entry.
+
+    AnalysisResult contains the source filename and the columns used,
+    so the API can tell the user which dataset produced the calculation.
+    """
+
+    if not result.source_file:
+        return None
+
+    rows: list[str] = []
+
+    if result.table:
+        rows = [
+            _format_table_row(row)
+            for row in result.table[:20]
+        ]
+
+    source_reference = result.source_file
+
+    if result.rows_used is not None:
+        source_reference = (
+            f"{result.source_file} "
+            f"({result.rows_used} rows used)"
+        )
 
     return Source(
-        document_id=data.get("document_id"),
-        filename=data.get("filename"),
-        page=data.get("page"),
-        chunk_id=data.get("chunk_id"),
-        excerpt=data.get("excerpt") or data.get("text"),
+        filename=result.source_file,
+        document_type=_document_type_from_filename(result.source_file),
+        source_reference=source_reference,
+        excerpt=_analysis_excerpt(result),
+        columns=list(result.columns_used),
+        rows=rows,
     )
 
 
-def _analysis_result_is_valid(result: AnalysisResult) -> bool:
+def _analysis_excerpt(
+    result: AnalysisResult,
+) -> str | None:
     """
-    A load-only result is not useful as final evidence. A result containing
-    an actual calculation, filtering, sorting, grouping, comparison, etc.
-    is considered structured evidence.
+    Produce a concise explanation of what the analysis result represents.
     """
-    operation = (result.operation or "").strip().lower()
 
-    return operation not in {
-        "",
-        "load_csv",
-        "load",
-    }
-
-
-def _analysis_excerpt(result: AnalysisResult) -> str:
-    """
-    Create a compact source excerpt from a structured analysis result.
-    """
     parts: list[str] = []
 
     if result.operation:
         parts.append(f"Operation: {result.operation}")
 
     if result.value is not None:
-        parts.append(f"Value: {result.value}")
-
-    if result.table:
-        parts.append(f"Rows: {len(result.table)}")
-
-        # Keep source excerpts compact. The full structured result is
-        # separately supplied to the answer-generation layer.
-        preview = result.table[:5]
-
-        for row in preview:
-            parts.append(str(row))
+        parts.append(f"Result: {_format_value(result.value)}")
 
     if result.formula:
-        parts.append(f"SQL: {result.formula}")
+        parts.append(f"Formula: {result.formula}")
 
-    return "\n".join(parts)
+    if result.rows_used is not None:
+        parts.append(f"Rows used: {result.rows_used}")
+
+    if not parts:
+        return None
+
+    return "; ".join(parts)
 
 
-def _extract_evidence_numbers(
-    evidence: Iterable[Evidence],
-) -> list[float]:
-    numbers: list[float] = []
+def _format_table_row(row: dict[str, Any]) -> str:
+    """
+    Convert one analysis table row into a compact source string.
+    """
+
+    parts: list[str] = []
+
+    for key, value in row.items():
+        parts.append(f"{key}={_format_value(value)}")
+
+    return ", ".join(parts)
+
+
+def _format_value(value: Any) -> str:
+    if value is None:
+        return "null"
+
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+
+    return str(value)
+
+
+def _document_type_from_filename(filename: str) -> str:
+    lower = filename.lower()
+
+    if lower.endswith(".csv"):
+        return "csv"
+
+    if lower.endswith(".xlsx"):
+        return "xlsx"
+
+    if lower.endswith(".xls"):
+        return "xls"
+
+    if lower.endswith(".pdf"):
+        return "pdf"
+
+    if lower.endswith(".txt"):
+        return "txt"
+
+    return "unknown"
+
+
+def _detect_evidence_conflict(
+    evidence: list[Evidence],
+) -> str | None:
+    """
+    Detect simple explicit numeric conflicts when the same source
+    location appears with different extracted values.
+
+    Retrieval can return multiple chunks from the same document. Merely
+    having different text is not considered a conflict.
+    """
+
+    grouped: dict[str, list[Evidence]] = {}
 
     for item in evidence:
-        data = (
-            item.model_dump()
-            if hasattr(item, "model_dump")
-            else dict(item)
+        key = (
+            item.source_reference
+            or item.chunk_id
+            or f"{item.filename}:{item.page_number}:{item.section}"
         )
 
-        for field in ("excerpt", "text", "content"):
-            value = data.get(field)
+        grouped.setdefault(key, []).append(item)
 
-            if not isinstance(value, str):
-                continue
-
-            numbers.extend(_extract_numbers(value))
-
-    return numbers
-
-
-def _extract_result_numbers(
-    result: AnalysisResult,
-) -> list[float]:
-    numbers: list[float] = []
-
-    if result.value is not None:
-        numbers.extend(_extract_numbers(str(result.value)))
-
-    if result.table:
-        for row in result.table:
-            numbers.extend(_extract_numbers(str(row)))
-
-    return numbers
-
-
-def _extract_numbers(text: str) -> list[float]:
-    values: list[float] = []
-
-    for match in _NUMERIC_RE.findall(text):
-        try:
-            values.append(float(match))
-        except ValueError:
+    for reference, items in grouped.items():
+        if len(items) < 2:
             continue
 
-    return values
+        normalized_texts = {
+            " ".join(item.text.split()).strip().lower()
+            for item in items
+            if item.text and item.text.strip()
+        }
+
+        if len(normalized_texts) <= 1:
+            continue
+
+        if _texts_contain_direct_conflict(items):
+            return (
+                "The retrieved evidence contains different values or "
+                f"statements for the same source location ({reference})."
+            )
+
+    return None
 
 
-def _has_close_numeric_match(
-    value: float,
-    candidates: list[float],
+def _texts_contain_direct_conflict(
+    items: list[Evidence],
 ) -> bool:
-    for candidate in candidates:
-        tolerance = max(
-            1e-9,
-            abs(value) * 1e-6,
+    """
+    Look for a narrow class of direct numeric contradictions.
+
+    This avoids declaring ordinary complementary document passages
+    contradictory.
+    """
+
+    numeric_values: set[str] = set()
+
+    for item in items:
+        text = item.text or ""
+
+        for token in _extract_numeric_tokens(text):
+            numeric_values.add(token)
+
+    return len(numeric_values) > 1
+
+
+def _extract_numeric_tokens(text: str) -> set[str]:
+    """
+    Extract numeric tokens useful for detecting obvious contradictions.
+
+    This is deliberately conservative and is not used to answer
+    questions or perform calculations.
+    """
+
+    import re
+
+    matches = re.findall(
+        r"(?<![\w.])-?\d+(?:,\d{3})*(?:\.\d+)?%?",
+        text,
+    )
+
+    return {
+        value.replace(",", "")
+        for value in matches
+    }
+
+
+def _detect_analysis_conflict(
+    analysis: list[AnalysisResult],
+) -> str | None:
+    """
+    Detect conflicting calculated results only when the same operation
+    and source column are represented by multiple different scalar values.
+    """
+
+    scalar_results: dict[
+        tuple[str, str | None, tuple[str, ...]],
+        list[Any],
+    ] = {}
+
+    for result in analysis:
+        if result.value is None:
+            continue
+
+        key = (
+            result.operation,
+            result.source_file,
+            tuple(result.columns_used),
         )
 
-        if math.isclose(
-            value,
-            candidate,
-            rel_tol=1e-6,
-            abs_tol=tolerance,
-        ):
-            return True
+        scalar_results.setdefault(key, []).append(result.value)
 
-    return False
+    for key, values in scalar_results.items():
+        normalized = {
+            _normalize_comparable_value(value)
+            for value in values
+        }
+
+        if len(normalized) > 1:
+            operation, source_file, columns = key
+
+            source_text = source_file or "the available datasets"
+            column_text = (
+                ", ".join(columns)
+                if columns
+                else "the requested columns"
+            )
+
+            return (
+                f"Different results were produced for the same "
+                f"{operation} operation on {column_text} in "
+                f"{source_text}."
+            )
+
+    return None
+
+
+def _normalize_comparable_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 10)
+
+    if isinstance(value, list):
+        return tuple(
+            _normalize_comparable_value(item)
+            for item in value
+        )
+
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (
+                    key,
+                    _normalize_comparable_value(item),
+                )
+                for key, item in value.items()
+            )
+        )
+
+    return value
