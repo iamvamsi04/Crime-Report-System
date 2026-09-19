@@ -8,161 +8,174 @@ from typing import Any
 
 import duckdb
 
+from app.config import Settings
 from app.errors import AnalysisError, NotFoundError
-from app.gemini import GeminiService
-from app.models import AnalysisResult, PlanOp, QueryPlan
+from app.models import AnalysisResult, QueryPlan
 from app.storage import Storage
+
 
 log = logging.getLogger(__name__)
 
 
-ANALYSIS_OPS = {
-    "load_csv",
-    "sum",
-    "average",
-    "min",
-    "max",
-    "count",
-    "sort",
-    "rank",
-    "filter",
-    "groupby",
-    "percentage_change",
-    "yoy",
-    "compare",
-}
+SQL_SYSTEM = """
+You are the SQL analysis engine for an intelligent document analysis system.
 
+Your job is to convert a user's natural-language question into ONE
+read-only DuckDB SQL query.
 
-SQL_GENERATION_SYSTEM = """
-You generate ONE read-only DuckDB SQL query for an uploaded CSV or Excel
-dataset.
+The query will run against a DuckDB relation named:
 
-The dataset is already exposed to DuckDB as a table named `dataset`.
+    dataset
 
-Return JSON only using exactly this structure:
+The relation contains the actual contents of a user-provided CSV file.
 
-{
-  "sql": "SELECT ...",
-  "operation": "sum"
-}
+You MUST answer the user's question by querying dataset.
 
-Rules:
+IMPORTANT RULES:
 
-1. Generate exactly ONE SQL statement.
+1. Return ONLY valid JSON.
+2. The JSON must have exactly this general structure:
 
-2. The SQL MUST be read-only.
+   {
+     "sql": "SELECT ...",
+     "operation": "..."
+   }
 
-3. The SQL MUST query ONLY the table:
-   dataset
-
-4. NEVER reference:
-   - files
-   - filesystem paths
-   - other tables
-   - SQLite
-   - information_schema
+3. Generate exactly ONE SQL statement.
+4. The statement must be read-only.
+5. The query must use ONLY the relation `dataset`.
+6. Do NOT read files directly.
+7. Do NOT use:
    - read_csv
    - read_csv_auto
+   - read_parquet
+   - read_json
    - read_xlsx
-   - parquet_scan
    - glob
+   - httpfs
+   - http_get
    - attach
    - install
    - load
    - copy
+8. Do NOT create, replace, alter, drop, insert, update, delete, merge,
+   export, or write anything.
+9. SELECT and WITH queries are allowed.
+10. Use only columns that actually exist in the supplied schema.
+11. Do not invent columns.
+12. Preserve the meaning of the user's question.
+13. Perform arithmetic and aggregation in SQL rather than asking the
+    language model to calculate from raw rows.
+14. For totals, use SUM.
+15. For averages, use AVG.
+16. For minimum and maximum, use MIN and MAX.
+17. For counts, use COUNT.
+18. For rankings, use ORDER BY and LIMIT where appropriate.
+19. For percentage calculations, calculate the percentage in SQL.
+20. For year-over-year calculations, calculate the values and the change
+    in SQL.
+21. If the user asks for a comparison, return the comparison directly.
+22. If grouping is required, use GROUP BY.
+23. If filtering is required, use WHERE.
+24. If the question asks for the top N or bottom N, respect N.
+25. If the dataset contains dates, use DuckDB date functions where useful.
+26. Never assume a column exists if it is not present in the schema.
+27. String comparisons should be reasonably tolerant of capitalization.
+28. When filtering textual values, prefer LOWER(column) = LOWER('value')
+    when exact matching is intended.
+29. When the user asks for a calculation involving a percentage, protect
+    against division by zero with NULLIF.
+30. Do not put markdown fences around SQL.
+31. Do not explain the SQL outside the JSON response.
 
-5. NEVER use:
-   INSERT
-   UPDATE
-   DELETE
-   MERGE
-   CREATE
-   DROP
-   ALTER
-   TRUNCATE
-   REPLACE
-   VACUUM
-   EXPORT
-   IMPORT
-   ATTACH
-   DETACH
-   INSTALL
-   LOAD
-   COPY
-
-6. The result must be directly useful to the application.
-
-7. For a numeric aggregation, return a single row with a clear column
-   named `result`.
-
-8. For a single matching row asking for a numeric value, SUM is acceptable
-   when the requested column represents a numeric measure.
-
-9. For percentage change, calculate the percentage in SQL.
-
-10. For year-over-year calculations, calculate the requested result in SQL.
-
-11. For ranking/sorting/grouping questions, return a result table.
-
-12. Never invent column names. Use only columns supplied in the schema.
-
-13. Preserve exact column names by using double quotes when necessary.
-
-14. String comparisons should generally be case-insensitive when appropriate.
-
-15. Date comparisons should use DuckDB date conversion when necessary.
-
-16. Do not perform calculations outside SQL.
-
-17. If the requested operation cannot be represented safely using the supplied
-    schema, return a query that produces no rows rather than inventing data.
-
-18. Do not add markdown fences around the SQL.
-
-19. The SQL must begin with SELECT or WITH.
+The SQL should return a result that is directly useful for answering the
+user's question.
 """
+
+
+FORBIDDEN_SQL_PATTERNS = (
+    r"\battach\b",
+    r"\bcopy\b",
+    r"\bcreate\b",
+    r"\breplace\b",
+    r"\balter\b",
+    r"\bdrop\b",
+    r"\binsert\b",
+    r"\bupdate\b",
+    r"\bdelete\b",
+    r"\bmerge\b",
+    r"\bexport\b",
+    r"\binstall\b",
+    r"\bload\b",
+    r"\bpragma\b",
+    r"\bvacuum\b",
+    r"\bcall\b",
+    r"\bread_csv\b",
+    r"\bread_csv_auto\b",
+    r"\bread_parquet\b",
+    r"\bread_json\b",
+    r"\bread_xlsx\b",
+    r"\bglob\b",
+    r"\bhttpfs\b",
+    r"\bhttp_get\b",
+)
+
+ALLOWED_START_PATTERN = re.compile(
+    r"^\s*(select|with)\b",
+    re.IGNORECASE,
+)
+
+DATASET_PATTERN = re.compile(
+    r"\bdataset\b",
+    re.IGNORECASE,
+)
 
 
 def needs_analysis(plan: QueryPlan) -> bool:
     """
-    Return True when the plan contains a structured CSV/Excel analysis
-    operation.
+    Return True when the query requires structured-data analysis.
 
-    Retrieval-only document questions do not require DuckDB.
+    `load_csv` alone means that structured data is involved, but a load
+    operation by itself is not an analysis request. A real analysis
+    operation must also be present.
     """
+
+    analysis_operations = {
+        "sum",
+        "average",
+        "min",
+        "max",
+        "count",
+        "sort",
+        "rank",
+        "filter",
+        "groupby",
+        "percentage_change",
+        "yoy",
+        "compare",
+    }
+
     return any(
-        op.op in ANALYSIS_OPS and op.op != "retrieve"
-        for op in plan.operations
+        operation.op in analysis_operations
+        for operation in plan.operations
     )
 
 
 def run_analysis(
     plan: QueryPlan,
+    question: str,
     store: Storage,
-    gemini: GeminiService,
-    settings: Any | None = None,
-) -> list[AnalysisResult]:
+    gemini: Any,
+    settings: Settings,
+) -> AnalysisResult:
     """
-    Execute CSV/Excel analysis using DuckDB.
+    Execute LLM-generated read-only SQL against a structured document.
 
-    The original uploaded file remains in data/uploads.
-    SQLite remains responsible for document metadata and csv_profile.
+    The LLM is responsible for understanding the question and generating
+    SQL. DuckDB is responsible for reading and calculating from the actual
+    CSV data.
 
-    Flow:
-
-        QueryPlan
-            ↓
-        csv_profile from SQLite
-            ↓
-        Gemini generates SQL
-            ↓
-        SQL validation
-            ↓
-        DuckDB exposes original file as `dataset`
-            ↓
-        SQL execution
-            ↓
-        AnalysisResult
+    No question-specific analytical logic is implemented in Python here.
     """
 
     document = _choose_document(
@@ -170,677 +183,656 @@ def run_analysis(
         store=store,
     )
 
-    if document is None:
-        raise AnalysisError(
-            "No CSV or Excel dataset is available for this calculation."
-        )
-
     document_id = document["id"]
-    source_file = document["filename"]
+    filename = document["filename"]
     file_type = document["file_type"]
 
-    try:
-        path = store.document_file(document_id)
-    except NotFoundError:
-        raise
-    except Exception as exc:
+    if file_type.lower() not in {
+        "csv",
+        "xlsx",
+        "xls",
+    }:
         raise AnalysisError(
-            "The CSV or Excel dataset could not be located."
-        ) from exc
-
-    if not path.exists():
-        raise AnalysisError(
-            "The uploaded CSV or Excel dataset could not be found."
+            "Structured analysis requires a CSV or Excel document."
         )
 
-    profile = _load_profile(document)
+    file_path = store.document_file(document_id)
 
-    question_context = _build_sql_context(
-        plan=plan,
-        document=document,
+    if file_path is None:
+        raise NotFoundError(
+            f"Source file for document {filename!r} was not found."
+        )
+
+    file_path = Path(file_path)
+
+    if not file_path.exists():
+        raise NotFoundError(
+            f"Source file for document {filename!r} was not found."
+        )
+
+    profile = store.parse_csv_profile(
+        document.get("csv_profile")
+    )
+
+    schema = _build_schema_description(
         profile=profile,
+        file_path=file_path,
     )
 
-    sql_payload = gemini.generate_json(
-        SQL_GENERATION_SYSTEM,
-        json.dumps(
-            question_context,
-            default=str,
-        ),
+    plan_description = _build_plan_description(
+        plan=plan,
     )
 
-    sql, generated_operation = _parse_generated_sql(
-        sql_payload
+    prompt = _build_sql_prompt(
+        question=question,
+        filename=filename,
+        schema=schema,
+        plan_description=plan_description,
     )
 
-    _validate_sql(sql)
-
-    log.info(
-        "duckdb_analysis document=%s operation=%s sql=%s",
-        source_file,
-        generated_operation,
-        sql,
+    generated = gemini.generate_json(
+        prompt,
+        system_instruction=SQL_SYSTEM,
+        temperature=0.0,
     )
 
-    connection = None
+    sql = generated.get("sql")
 
-    try:
-        connection = duckdb.connect(database=":memory:")
-
-        _register_dataset(
-            connection=connection,
-            path=path,
-            file_type=file_type,
-        )
-
-        rows = connection.execute(sql).fetchall()
-        columns = [
-            description[0]
-            for description in connection.description
-        ]
-
-    except Exception as exc:
-        log.exception(
-            "duckdb_analysis_failed file=%s",
-            source_file,
-        )
-
-        raise AnalysisError(
-            "The dataset analysis failed while executing the generated SQL."
-        ) from exc
-
-    finally:
-        if connection is not None:
-            connection.close()
-
-    return [
-        _build_analysis_result(
-            operation=generated_operation,
-            sql=sql,
-            rows=rows,
-            columns=columns,
-            source_file=source_file,
-        )
-    ]
-
-
-# ============================================================
-# DOCUMENT SELECTION
-# ============================================================
-
-
-def _choose_document(
-    *,
-    plan: QueryPlan,
-    store: Storage,
-) -> dict[str, Any] | None:
-    documents = [
-        document
-        for document in store.list_documents(
-            ready_only=True
-        )
-        if document["file_type"] in {"csv", "excel"}
-    ]
-
-    if not documents:
-        return None
-
-    # --------------------------------------------------------
-    # Explicit document ID
-    # --------------------------------------------------------
-
-    for document_id in plan.document_ids:
-        for document in documents:
-            if document["id"] == document_id:
-                return document
-
-    # --------------------------------------------------------
-    # Filename hint
-    # --------------------------------------------------------
-
-    for hint in plan.document_hints:
-        if not hint:
-            continue
-
-        hint_lower = hint.casefold()
-
-        for document in documents:
-            if hint_lower in document["filename"].casefold():
-                return document
-
-    # --------------------------------------------------------
-    # Operation filename hint
-    # --------------------------------------------------------
-
-    for operation in plan.operations:
-        if not operation.filename_hint:
-            continue
-
-        hint_lower = operation.filename_hint.casefold()
-
-        for document in documents:
-            if hint_lower in document["filename"].casefold():
-                return document
-
-    # --------------------------------------------------------
-    # Fallback
-    # --------------------------------------------------------
-
-    return documents[0]
-
-
-# ============================================================
-# CSV PROFILE
-# ============================================================
-
-
-def _load_profile(
-    document: dict[str, Any],
-) -> dict[str, Any]:
-    raw = document.get("csv_profile")
-
-    if not raw:
-        return {}
-
-    if isinstance(raw, dict):
-        return raw
-
-    try:
-        value = json.loads(raw)
-
-        if isinstance(value, dict):
-            return value
-
-    except (json.JSONDecodeError, TypeError):
-        log.warning(
-            "invalid_csv_profile document=%s",
-            document.get("id"),
-        )
-
-    return {}
-
-
-# ============================================================
-# SQL GENERATION CONTEXT
-# ============================================================
-
-
-def _build_sql_context(
-    *,
-    plan: QueryPlan,
-    document: dict[str, Any],
-    profile: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Give Gemini the actual SQLite csv_profile rather than asking it
-    to discover the dataset blindly.
-    """
-
-    operations = [
-        operation.model_dump(
-            by_alias=True
-        )
-        for operation in plan.operations
-        if operation.op != "retrieve"
-    ]
-
-    return {
-        "dataset": {
-            "document_id": document["id"],
-            "filename": document["filename"],
-            "file_type": document["file_type"],
-            "table_name": "dataset",
-            "profile": {
-                "columns": profile.get("columns") or [],
-                "dtypes": profile.get("dtypes") or {},
-                "row_count": profile.get("row_count"),
-                "numeric_columns": profile.get("numeric_columns") or [],
-                "year_columns": profile.get("year_columns") or [],
-                "entity_columns": profile.get("entity_columns") or [],
-                "categorical_columns": profile.get("categorical_columns") or [],
-                "null_counts": profile.get("null_counts") or {},
-            },
-        },
-        "query_plan": {
-            "intent": plan.intent.value,
-            "conversation_intent": plan.conversation_intent,
-            "is_follow_up": plan.is_follow_up,
-            "entities": plan.entities,
-            "metrics": plan.metrics,
-            "years": plan.years,
-            "filters": plan.filters,
-            "operations": operations,
-            "resolved_question": plan.resolved_question,
-            "retrieval_query": plan.retrieval_query,
-        },
-    }
-
-
-# ============================================================
-# DUCKDB DATASET REGISTRATION
-# ============================================================
-
-
-def _register_dataset(
-    *,
-    connection: Any,
-    path: Path,
-    file_type: str,
-) -> None:
-    """
-    Expose the original uploaded file as:
-
-        dataset
-
-    No data is copied into SQLite.
-    """
-
-    escaped_path = _escape_sql_string(
-        str(path)
-    )
-
-    if file_type == "csv":
-        sql = (
-            "CREATE VIEW dataset AS "
-            f"SELECT * FROM read_csv_auto('{escaped_path}', "
-            "header=true, "
-            "sample_size=-1)"
-        )
-
-    elif file_type == "excel":
-        # DuckDB's Excel reader is provided by the spatial extension
-        # in supported DuckDB releases.
-        try:
-            connection.execute(
-                "LOAD excel"
-            )
-        except Exception:
-            try:
-                connection.execute(
-                    "INSTALL excel"
-                )
-                connection.execute(
-                    "LOAD excel"
-                )
-            except Exception as exc:
-                raise AnalysisError(
-                    "DuckDB could not load its Excel reader. "
-                    "Please install a DuckDB version with Excel support."
-                ) from exc
-
-        sql = (
-            "CREATE VIEW dataset AS "
-            f"SELECT * FROM read_xlsx('{escaped_path}', "
-            "header=true)"
-        )
-
-    else:
-        raise AnalysisError(
-            f"Unsupported structured document type '{file_type}'."
-        )
-
-    connection.execute(sql)
-
-
-def _escape_sql_string(
-    value: str,
-) -> str:
-    return value.replace(
-        "'",
-        "''",
-    )
-
-
-# ============================================================
-# GENERATED SQL PARSING
-# ============================================================
-
-
-def _parse_generated_sql(
-    payload: Any,
-) -> tuple[str, str]:
-    if not isinstance(payload, dict):
-        raise AnalysisError(
-            "Gemini returned an invalid SQL analysis response."
-        )
-
-    sql = payload.get("sql")
-    operation = payload.get("operation") or "analysis"
-
-    if not isinstance(sql, str):
+    if not isinstance(sql, str) or not sql.strip():
         raise AnalysisError(
             "Gemini did not return a SQL query."
         )
 
-    sql = sql.strip()
+    sql = _clean_sql(sql)
+
+    _validate_sql(sql)
+
+    operation = generated.get(
+        "operation",
+        "query",
+    )
+
+    if not isinstance(operation, str):
+        operation = "query"
+
+    log.info(
+        "executing_duckdb_analysis document=%s operation=%s",
+        filename,
+        operation,
+    )
+
+    try:
+        return _execute_query(
+            sql=sql,
+            operation=operation,
+            file_path=file_path,
+            file_type=file_type,
+            filename=filename,
+        )
+    except AnalysisError:
+        raise
+    except Exception as exc:
+        log.exception(
+            "duckdb_analysis_failed document=%s",
+            filename,
+        )
+        raise AnalysisError(
+            "The generated query could not be executed against the "
+            "document."
+        ) from exc
+
+
+def _choose_document(
+    plan: QueryPlan,
+    store: Storage,
+) -> dict[str, Any]:
+    """
+    Resolve the structured document to analyze.
+
+    Prefer an explicitly selected document. Otherwise use filename hints.
+    If exactly one structured document is available, use it.
+
+    The planner remains responsible for deciding which document is relevant;
+    this function only resolves that decision against storage.
+    """
+
+    documents = store.list_documents()
+
+    ready = [
+        document
+        for document in documents
+        if document.get("status") == "ready"
+    ]
+
+    structured = [
+        document
+        for document in ready
+        if str(document.get("file_type", "")).lower()
+        in {"csv", "xlsx", "xls"}
+    ]
+
+    if not structured:
+        raise NotFoundError(
+            "No ready CSV or Excel document is available for analysis."
+        )
+
+    if plan.document_ids:
+        for document_id in plan.document_ids:
+            for document in structured:
+                if document.get("id") == document_id:
+                    return document
+
+    if plan.document_hints:
+        lowered_hints = [
+            hint.lower()
+            for hint in plan.document_hints
+        ]
+
+        for document in structured:
+            filename = str(
+                document.get("filename", "")
+            ).lower()
+
+            if any(
+                hint in filename
+                for hint in lowered_hints
+            ):
+                return document
+
+    if len(structured) == 1:
+        return structured[0]
+
+    raise AnalysisError(
+        "More than one CSV or Excel document is available. "
+        "The question must identify which document should be analyzed."
+    )
+
+
+def _build_schema_description(
+    profile: dict[str, Any],
+    file_path: Path,
+) -> str:
+    """
+    Build a compact schema description for Gemini.
+
+    The model receives the actual columns and inferred types rather than
+    having to guess them.
+    """
+
+    columns = profile.get("columns")
+
+    if not isinstance(columns, list):
+        columns = []
+
+    dtypes = profile.get("dtypes")
+
+    if not isinstance(dtypes, dict):
+        dtypes = {}
+
+    row_count = profile.get("row_count")
+
+    if row_count is None:
+        row_count = "unknown"
+
+    lines: list[str] = [
+        f"File: {file_path.name}",
+        f"Rows: {row_count}",
+        "",
+        "Columns:",
+    ]
+
+    for column in columns:
+        if not isinstance(column, str):
+            continue
+
+        dtype = dtypes.get(
+            column,
+            "unknown",
+        )
+
+        lines.append(
+            f"- {column}: {dtype}"
+        )
+
+    if not columns:
+        lines.append(
+            "No profile columns were available. "
+            "DuckDB schema inspection will be used."
+        )
+
+    return "\n".join(lines)
+
+
+def _build_plan_description(
+    plan: QueryPlan,
+) -> str:
+    """
+    Give Gemini the planner's interpretation without making Python
+    responsible for answering the question.
+
+    This is supporting context only. The SQL model still sees the original
+    user question and the actual dataset schema.
+    """
+
+    data = {
+        "intent": plan.intent.value,
+        "entities": plan.entities,
+        "metrics": plan.metrics,
+        "years": plan.years,
+        "filters": plan.filters,
+        "document_ids": plan.document_ids,
+        "document_hints": plan.document_hints,
+        "operations": [
+            operation.model_dump(
+                by_alias=True,
+            )
+            for operation in plan.operations
+        ],
+        "resolved_question": plan.resolved_question,
+        "is_follow_up": plan.is_follow_up,
+    }
+
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _build_sql_prompt(
+    question: str,
+    filename: str,
+    schema: str,
+    plan_description: str,
+) -> str:
+    return f"""
+User question:
+
+{question}
+
+Structured document selected for analysis:
+
+{filename}
+
+Actual dataset schema:
+
+{schema}
+
+Planner interpretation:
+
+{plan_description}
+
+Generate the single DuckDB SQL query needed to answer the user's question.
+
+Remember:
+
+- The only available relation is `dataset`.
+- Use only columns from the actual schema.
+- Query the data rather than guessing values.
+- Perform all required calculations in SQL.
+- Return one JSON object containing `sql` and `operation`.
+"""
+
+
+def _clean_sql(sql: str) -> str:
+    """
+    Normalize SQL returned by Gemini without changing its meaning.
+    """
+
+    value = sql.strip()
+
+    if value.startswith("```"):
+        value = re.sub(
+            r"^```(?:sql)?\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+        value = re.sub(
+            r"\s*```$",
+            "",
+            value,
+        )
+
+    value = value.strip()
+
+    if value.endswith(";"):
+        value = value[:-1].rstrip()
+
+    return value
+
+
+def _validate_sql(sql: str) -> None:
+    """
+    Validate generated SQL before executing it.
+
+    The query must be a single SELECT/WITH statement and must operate on
+    the registered `dataset` relation.
+    """
 
     if not sql:
         raise AnalysisError(
-            "Gemini returned an empty SQL query."
+            "Gemini generated an empty SQL query."
         )
 
-    return sql, str(operation)
-
-
-# ============================================================
-# SQL SAFETY VALIDATION
-# ============================================================
-
-
-def _validate_sql(
-    sql: str,
-) -> None:
-    """
-    Ensure Gemini can only produce a single read-only query
-    against the already-registered `dataset` view.
-    """
-
-    normalized = sql.strip()
-
-    # --------------------------------------------------------
-    # No markdown
-    # --------------------------------------------------------
-
-    if "```" in normalized:
-        raise AnalysisError(
-            "Generated SQL contained markdown formatting."
-        )
-
-    # --------------------------------------------------------
-    # Exactly one statement
-    # --------------------------------------------------------
-
-    if ";" in normalized.rstrip(";"):
+    if ";" in sql:
         raise AnalysisError(
             "Generated SQL contains multiple statements."
         )
 
-    normalized = normalized.rstrip(";").strip()
-
-    # --------------------------------------------------------
-    # Must be SELECT / WITH
-    # --------------------------------------------------------
-
-    if not re.match(
-        r"^(select|with)\b",
-        normalized,
-        re.IGNORECASE,
-    ):
+    if "--" in sql or "/*" in sql or "*/" in sql:
         raise AnalysisError(
-            "Generated SQL is not a read-only SELECT query."
+            "Generated SQL contains comments and was rejected."
         )
 
-    # --------------------------------------------------------
-    # Dangerous SQL keywords
-    # --------------------------------------------------------
+    if not ALLOWED_START_PATTERN.search(sql):
+        raise AnalysisError(
+            "Generated SQL must be a SELECT or WITH query."
+        )
 
-    forbidden_keywords = (
-        "insert",
-        "update",
-        "delete",
-        "merge",
-        "create",
-        "drop",
-        "alter",
-        "truncate",
-        "replace",
-        "vacuum",
-        "export",
-        "import",
-        "attach",
-        "detach",
-        "install",
-        "load",
-        "copy",
-        "call",
-    )
-
-    for keyword in forbidden_keywords:
+    for pattern in FORBIDDEN_SQL_PATTERNS:
         if re.search(
-            rf"\b{re.escape(keyword)}\b",
-            normalized,
-            re.IGNORECASE,
+            pattern,
+            sql,
+            flags=re.IGNORECASE,
         ):
             raise AnalysisError(
-                "Generated SQL contains a prohibited SQL operation."
+                "Generated SQL contains a forbidden operation."
             )
 
-    # --------------------------------------------------------
-    # Prevent direct filesystem access from generated SQL
-    # --------------------------------------------------------
+    if not DATASET_PATTERN.search(sql):
+        raise AnalysisError(
+            "Generated SQL does not reference the dataset."
+        )
 
-    forbidden_functions = (
-        "read_csv",
-        "read_csv_auto",
-        "read_xlsx",
-        "read_parquet",
-        "parquet_scan",
-        "glob",
-    )
+    _validate_dataset_references(sql)
 
-    for function_name in forbidden_functions:
-        if re.search(
-            rf"\b{re.escape(function_name)}\s*\(",
-            normalized,
-            re.IGNORECASE,
-        ):
+
+def _validate_dataset_references(sql: str) -> None:
+    """
+    Prevent generated SQL from directly accessing arbitrary relations.
+
+    We intentionally allow CTE names and aliases, but reject common
+    multi-table constructs that could bypass the registered dataset.
+    """
+
+    lowered = sql.lower()
+
+    if re.search(
+        r"\bfrom\s+(?!dataset\b)",
+        lowered,
+    ):
+        raise AnalysisError(
+            "Generated SQL attempted to read a relation other than dataset."
+        )
+
+    if re.search(
+        r"\bjoin\s+(?!dataset\b)",
+        lowered,
+    ):
+        raise AnalysisError(
+            "Generated SQL attempted to join a relation other than dataset."
+        )
+
+    if re.search(
+        r"\bunion\s+(?:all\s+)?select\b",
+        lowered,
+    ):
+        # UNION is allowed only when each branch remains based on dataset.
+        relation_names = re.findall(
+            r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+            lowered,
+        )
+
+        invalid = [
+            name
+            for name in relation_names
+            if name != "dataset"
+        ]
+
+        if invalid:
             raise AnalysisError(
-                "Generated SQL attempted to access the filesystem directly."
+                "Generated SQL references an unauthorized relation."
             )
 
-    # --------------------------------------------------------
-    # Prevent external database access
-    # --------------------------------------------------------
 
-    if re.search(
-        r"\binformation_schema\b",
-        normalized,
-        re.IGNORECASE,
-    ):
-        raise AnalysisError(
-            "Generated SQL attempted to access database metadata."
-        )
-
-    if re.search(
-        r"\bpragma\b",
-        normalized,
-        re.IGNORECASE,
-    ):
-        raise AnalysisError(
-            "Generated SQL contains a prohibited PRAGMA statement."
-        )
-
-    # --------------------------------------------------------
-    # Only the registered dataset should be queried.
-    #
-    # This is deliberately conservative. The generated query may
-    # use CTEs and aliases, but the physical source is `dataset`.
-    # --------------------------------------------------------
-
-    if not re.search(
-        r"\bdataset\b",
-        normalized,
-        re.IGNORECASE,
-    ):
-        raise AnalysisError(
-            "Generated SQL does not reference the uploaded dataset."
-        )
-
-    # --------------------------------------------------------
-    # Reject obvious external URI/file references.
-    # --------------------------------------------------------
-
-    if re.search(
-        r"(https?://|file://|[A-Za-z]:\\)",
-        normalized,
-        re.IGNORECASE,
-    ):
-        raise AnalysisError(
-            "Generated SQL contains an external file or network reference."
-        )
-
-
-# ============================================================
-# RESULT CONVERSION
-# ============================================================
-
-
-def _build_analysis_result(
-    *,
-    operation: str,
+def _execute_query(
     sql: str,
-    rows: list[tuple[Any, ...]],
-    columns: list[str],
-    source_file: str,
+    operation: str,
+    file_path: Path,
+    file_type: str,
+    filename: str,
 ) -> AnalysisResult:
     """
-    Convert DuckDB's result into the existing AnalysisResult model.
+    Register the actual file as `dataset` and execute the generated query.
 
-    This preserves the contract used by chat.py and evidence.py.
+    DuckDB runs entirely in memory. The generated SQL never receives direct
+    filesystem access.
     """
 
-    table = _rows_to_table(
-        rows=rows,
-        columns=columns,
+    connection = duckdb.connect(
+        database=":memory:",
     )
 
-    value = None
-
-    # --------------------------------------------------------
-    # Scalar result
-    # --------------------------------------------------------
-
-    if len(rows) == 1 and len(columns) == 1:
-        value = _clean_value(
-            rows[0][0]
+    try:
+        _register_dataset(
+            connection=connection,
+            file_path=file_path,
+            file_type=file_type,
         )
 
-    # --------------------------------------------------------
-    # Common generated aggregation format:
-    #
-    # SELECT SUM(...) AS result
-    # --------------------------------------------------------
+        cursor = connection.execute(sql)
 
-    elif len(rows) == 1:
-        result_index = _find_result_column(
-            columns
+        columns = [
+            description[0]
+            for description in cursor.description
+        ]
+
+        rows = cursor.fetchall()
+
+        table = [
+            {
+                column: _normalize_value(value),
+                for column, value in zip(
+                    columns,
+                    row,
+                )
+            }
+            for row in rows
+        ]
+
+        value = _extract_scalar_value(
+            table=table,
         )
 
-        if result_index is not None:
-            value = _clean_value(
-                rows[0][result_index]
+        return AnalysisResult(
+            operation=operation,
+            value=value,
+            table=table,
+            inputs={
+                "question_file": filename,
+                "file_path": file_path.name,
+                "sql": sql,
+            },
+            formula=None,
+            source_file=filename,
+            rows_used=_count_dataset_rows(
+                connection,
+            ),
+            columns_used=columns,
+        )
+
+    except Exception as exc:
+        raise AnalysisError(
+            f"DuckDB could not execute the generated query: {exc}"
+        ) from exc
+
+    finally:
+        connection.close()
+
+
+def _register_dataset(
+    connection: duckdb.DuckDBPyConnection,
+    file_path: Path,
+    file_type: str,
+) -> None:
+    """
+    Register the actual source file as the relation `dataset`.
+
+    CSV is the primary structured-data path.
+
+    Excel support is retained when the DuckDB Excel extension is already
+    available locally. We do not automatically INSTALL extensions because
+    corporate environments may block network access.
+    """
+
+    normalized_type = file_type.lower()
+
+    escaped_path = _duckdb_string_literal(
+        file_path,
+    )
+
+    if normalized_type == "csv":
+        connection.execute(
+            f"""
+            CREATE VIEW dataset AS
+            SELECT *
+            FROM read_csv_auto(
+                {escaped_path},
+                header = true,
+                sample_size = -1
             )
+            """
+        )
+        return
 
-    # --------------------------------------------------------
-    # Result metadata
-    # --------------------------------------------------------
+    if normalized_type in {"xlsx", "xls"}:
+        try:
+            connection.execute(
+                "LOAD excel"
+            )
+        except Exception as exc:
+            raise AnalysisError(
+                "Excel analysis requires DuckDB's Excel extension. "
+                "The extension is not available in this environment."
+            ) from exc
 
-    formula = sql
+        connection.execute(
+            f"""
+            CREATE VIEW dataset AS
+            SELECT *
+            FROM read_xlsx(
+                {escaped_path},
+                header = true
+            )
+            """
+        )
+        return
 
-    return AnalysisResult(
-        operation=operation,
-        value=value,
-        table=table if table else None,
-        inputs={
-            "sql": sql,
-        },
-        formula=formula,
-        source_file=source_file,
-        rows_used=len(rows),
-        columns_used=columns,
+    raise AnalysisError(
+        f"Unsupported structured document type: {file_type}"
     )
 
 
-def _rows_to_table(
-    *,
-    rows: list[tuple[Any, ...]],
-    columns: list[str],
-) -> list[dict[str, Any]]:
-    table: list[dict[str, Any]] = []
+def _duckdb_string_literal(path: Path) -> str:
+    """
+    Safely represent a local filesystem path as a DuckDB SQL string literal.
+    """
 
-    for row in rows:
-        record: dict[str, Any] = {}
+    value = str(
+        path.resolve()
+    )
 
-        for index, column in enumerate(columns):
-            value = row[index]
-
-            record[column] = _clean_value(
-                value
-            )
-
-        table.append(record)
-
-    return table
+    return "'" + value.replace(
+        "'",
+        "''",
+    ) + "'"
 
 
-def _find_result_column(
-    columns: list[str],
-) -> int | None:
-    preferred = {
-        "result",
-        "value",
-        "total",
-        "sum",
-        "average",
-        "avg",
-        "mean",
-        "minimum",
-        "maximum",
-        "count",
-        "percentage_change",
-        "percentage",
-        "growth",
-    }
-
-    for index, column in enumerate(columns):
-        if column.casefold().strip() in preferred:
-            return index
-
-    return None
-
-
-# ============================================================
-# VALUE NORMALIZATION
-# ============================================================
-
-
-def _clean_value(
-    value: Any,
+def _extract_scalar_value(
+    table: list[dict[str, Any]],
 ) -> Any:
+    """
+    Convert a one-cell/one-row result into a convenient scalar.
+
+    Larger result sets remain available through `table`.
+    """
+
+    if len(table) != 1:
+        return None
+
+    row = table[0]
+
+    if len(row) != 1:
+        return None
+
+    return next(
+        iter(row.values())
+    )
+
+
+def _count_dataset_rows(
+    connection: duckdb.DuckDBPyConnection,
+) -> int:
+    try:
+        result = connection.execute(
+            "SELECT COUNT(*) FROM dataset"
+        ).fetchone()
+
+        if not result:
+            return 0
+
+        return int(
+            result[0]
+        )
+    except Exception:
+        return 0
+
+
+def _normalize_value(value: Any) -> Any:
+    """
+    Convert DuckDB values into JSON-friendly Python values.
+    """
+
     if value is None:
         return None
 
-    # DuckDB DATE / TIMESTAMP objects.
     if hasattr(value, "isoformat"):
         try:
             return value.isoformat()
         except Exception:
             pass
 
-    # Numeric normalization.
-    if isinstance(value, float):
-        if value != value:
-            return None
-
-        if value.is_integer():
-            return int(value)
-
-        return round(value, 6)
-
-    if isinstance(value, int):
+    if isinstance(
+        value,
+        (
+            str,
+            int,
+            float,
+            bool,
+        ),
+    ):
         return value
 
-    # DuckDB decimal-like values.
-    if hasattr(value, "as_integer_ratio"):
-        try:
-            numeric = float(value)
+    if isinstance(
+        value,
+        (
+            list,
+            tuple,
+        ),
+    ):
+        return [
+            _normalize_value(item)
+            for item in value
+        ]
 
-            if numeric.is_integer():
-                return int(numeric)
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_value(item)
+            for key, item in value.items()
+        }
 
-            return round(numeric, 6)
-
-        except Exception:
-            pass
-
-    return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
