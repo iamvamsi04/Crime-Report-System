@@ -1,171 +1,74 @@
 from __future__ import annotations
+import truststore
 
+truststore.inject_into_ssl()
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api import router
-from app.config import load_settings
-from app.errors import AppError
+from app.config import Settings, load_settings, setup_logging
+from app.errors import AppError, http_error
 from app.gemini import GeminiClient
 from app.storage import Storage
 
 log = logging.getLogger(__name__)
 
 
-def configure_logging() -> None:
-    """
-    Configure application logging once.
+def create_app(
+    settings: Settings | None = None,
+    gemini: object | None = None,
+) -> FastAPI:
+    settings = settings or load_settings()
 
-    Individual modules use logging.getLogger(__name__), so the logging policy
-    stays centralized here.
-    """
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(asctime)s "
-            "%(levelname)s "
-            "%(name)s - "
-            "%(message)s"
-        ),
-    )
-
-
-@asynccontextmanager
-async def lifespan(
-    app: FastAPI,
-) -> AsyncIterator[None]:
-    """
-    Initialize long-lived application dependencies.
-
-    Storage owns SQLite/Chroma/filesystem persistence.
-    GeminiClient owns the lazy external model client.
-
-    DuckDB connections are intentionally NOT global. sql_executor.py creates
-    a fresh in-memory connection for each structured analysis request.
-    """
-
-    settings = load_settings()
-
-    store = Storage(
-        settings
-    )
-
-    gemini = GeminiClient(
-        settings
-    )
-
-    try:
-        store.initialize()
-
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        setup_logging()
+        store = Storage(settings)
+        store.init()
         app.state.settings = settings
         app.state.store = store
-        app.state.gemini = gemini
-
-        log.info(
-            "application_started"
-        )
-
-        yield
-
-    finally:
+        app.state.gemini = gemini or GeminiClient(settings)
+        app.state.gemini_is_stub = gemini is not None
+        log.info("application_started model=%s", settings.gemini_model)
         try:
+            yield
+        finally:
             store.close()
-        except Exception:
-            log.exception(
-                "storage_shutdown_failed"
-            )
 
-        log.info(
-            "application_stopped"
-        )
+    app = FastAPI(title="Intelligent Document Analysis System", lifespan=lifespan)
+    app.state.settings = settings
 
+    @app.exception_handler(AppError)
+    async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:
+        http_exc = http_error(exc)
+        return JSONResponse(status_code=http_exc.status_code, content={"detail": http_exc.detail})
 
-def create_app() -> FastAPI:
-    configure_logging()
-
-    app = FastAPI(
-        title="Document Analysis API",
-        version="2.0.0",
-        lifespan=lifespan,
-    )
-
-    # The existing Streamlit frontend may run on another local port.
-    # Keeping CORS permissive preserves the original development behavior.
-    #
-    # For an internet-facing deployment, replace "*" with the exact frontend
-    # origins you control.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[
-            "*"
-        ],
-        allow_credentials=False,
-        allow_methods=[
-            "*"
-        ],
-        allow_headers=[
-            "*"
-        ],
-    )
-
-    app.include_router(
-        router
-    )
-
-    @app.exception_handler(
-        AppError
-    )
-    async def app_error_handler(
-        request: Request,
-        exc: AppError,
-    ) -> JSONResponse:
-        log.warning(
-            "application_error "
-            "method=%s path=%s type=%s",
-            request.method,
-            request.url.path,
-            exc.__class__.__name__,
-        )
-
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+        log.info("api_validation_error")
         return JSONResponse(
-            status_code=(
-                exc.status_code
-            ),
-            content={
-                "detail": exc.message
-            },
+            status_code=422,
+            content={"detail": {"error": "validation_error", "message": "The request is invalid."}},
         )
 
-    @app.exception_handler(
-        Exception
-    )
-    async def unexpected_error_handler(
-        request: Request,
-        exc: Exception,
-    ) -> JSONResponse:
-        log.exception(
-            "unexpected_application_error "
-            "method=%s path=%s",
-            request.method,
-            request.url.path,
-        )
-
+    @app.exception_handler(Exception)
+    async def unhandled(_: Request, exc: Exception) -> JSONResponse:
+        if isinstance(exc, HTTPException):
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        log.exception("unhandled_error")
         return JSONResponse(
             status_code=500,
-            content={
-                "detail": (
-                    "An unexpected server error occurred."
-                )
-            },
+            content={"detail": {"error": "internal_error", "message": "An unexpected error occurred."}},
         )
 
+    app.include_router(router)
     return app
 
 
 app = create_app()
+
+
