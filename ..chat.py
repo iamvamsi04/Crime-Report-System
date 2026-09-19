@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Any
 
 from app.analyze import needs_analysis, run_analysis
-from app.errors import AppError, AnalysisError
 from app.evidence import (
     MISSING_ANSWER,
     OUT_OF_SCOPE_ANSWER,
@@ -19,7 +20,7 @@ from app.models import (
     ChatResponse,
     ChatStatus,
     ConversationContext,
-    Evidence,
+    ConversationOut,
     MessageOut,
     QueryPlan,
     Source,
@@ -27,32 +28,32 @@ from app.models import (
 from app.plan import build_plan
 from app.retrieve import retrieve_evidence
 from app.storage import Storage
-from app.config import Settings
 
 
 log = logging.getLogger(__name__)
 
 
 ANSWER_SYSTEM = """
-You are the answer-generation component of an intelligent document analysis
-system.
-
-Your answer MUST be based only on the evidence and analysis results supplied
-to you.
+You answer questions using ONLY the supplied document evidence
+and CSV/Excel analysis results.
 
 Rules:
-1. Never invent facts, numbers, names, dates, or calculations.
-2. Do not use outside knowledge.
-3. For CSV/Excel questions, trust the supplied analysis result because it was
-   calculated from the actual uploaded dataset.
-4. For PDF/TXT questions, use only the supplied retrieved evidence.
-5. If the supplied evidence does not contain enough information, say that the
-   information is not available in the uploaded documents.
-6. If analysis results contain a calculation, explain the result clearly.
-7. When useful, mention the source document and relevant page/section.
-8. Do not claim that you inspected a document if no evidence from that
-   document was supplied.
-9. Keep the answer concise but sufficiently explanatory.
+
+- Do not invent facts.
+- Do not use outside knowledge.
+- If the supplied evidence does not support the answer, say that the
+  information was not found in the uploaded documents.
+- If analysis results are supplied, use those calculated results directly.
+- Do not redo arithmetic yourself when a calculated analysis result is provided.
+- Be concise but explain the result clearly.
+- Mention the source filename when useful.
+- If genuinely conflicting information is supplied, explain the conflict
+  and identify the source associated with each value.
+- Return JSON with exactly this structure:
+
+{
+    "answer": "your answer"
+}
 """
 
 
@@ -62,260 +63,271 @@ def ask(
     conversation_id: str | None,
     store: Storage,
     gemini: GeminiService,
-    settings: Settings,
+    settings: Any,
 ) -> ChatResponse:
-    """
-    Process one user question.
-
-    Flow:
-
-        question
-            ↓
-        conversation/history
-            ↓
-        planner
-            ↓
-        structured analysis and/or RAG retrieval
-            ↓
-        evidence validation
-            ↓
-        Gemini answer
-            ↓
-        conversation persistence
-    """
-
     question = question.strip()
 
     if not question:
-        raise AppError("Question cannot be empty.")
+        raise ValueError("Question cannot be empty.")
 
-    conversation = _get_or_create_conversation(
+    conversation_id, context = _get_or_create_conversation(
         store=store,
         conversation_id=conversation_id,
     )
 
-    context = _get_context(conversation)
+    previous_messages = store.list_messages(
+        conversation_id
+    )
 
-    previous_messages = store.get_messages(
-        conversation_id=conversation["id"],
-        limit=20,
+    documents = store.list_documents(
+        ready_only=True
     )
 
     plan = build_plan(
         question=question,
         context=context,
-        messages=previous_messages,
-        store=store,
+        documents=documents,
         gemini=gemini,
-        settings=settings,
     )
 
-    _save_message(
+    _save_user_message(
         store=store,
-        conversation_id=conversation["id"],
-        role="user",
-        content=question,
+        conversation_id=conversation_id,
+        question=question,
     )
 
-    if plan.out_of_scope:
-        answer = OUT_OF_SCOPE_ANSWER
-
-        _save_message(
-            store=store,
-            conversation_id=conversation["id"],
-            role="assistant",
-            content=answer,
+    if plan.conversation_intent == "history":
+        answer, sources, execution_flow = _handle_history_request(
+            plan=plan,
+            previous_messages=previous_messages,
         )
 
-        _update_context(
+        _save_assistant_message(
             store=store,
-            conversation_id=conversation["id"],
-            context=context,
-            plan=plan,
+            conversation_id=conversation_id,
             answer=answer,
-            evidence=[],
-            analysis=None,
+            status=ChatStatus.ANSWERED,
+            sources=sources,
+            execution_flow=execution_flow,
+            plan=plan,
         )
 
         return ChatResponse(
-            conversation_id=conversation["id"],
+            conversation_id=conversation_id,
             answer=answer,
-            status=ChatStatus.OUT_OF_SCOPE,
-            sources=[],
-            analysis=None,
-            plan=plan,
+            status=ChatStatus.ANSWERED,
+            sources=sources,
+            execution_flow=execution_flow,
+            query_plan=plan.model_dump(
+                by_alias=True
+            ),
         )
 
-    if plan.ambiguous:
-        answer = plan.ambiguity_reason or (
-            "I need a little more information to determine which document "
-            "or data you mean."
-        )
-
-        _save_message(
-            store=store,
-            conversation_id=conversation["id"],
-            role="assistant",
-            content=answer,
-        )
-
-        _update_context(
-            store=store,
-            conversation_id=conversation["id"],
+    if plan.conversation_intent == "repeat":
+        (
+            answer,
+            sources,
+            execution_flow,
+            previous_plan,
+        ) = _handle_repeat_request(
+            previous_messages=previous_messages,
             context=context,
-            plan=plan,
+        )
+
+        response_plan = (
+            previous_plan
+            if previous_plan is not None
+            else plan
+        )
+
+        _save_assistant_message(
+            store=store,
+            conversation_id=conversation_id,
             answer=answer,
-            evidence=[],
-            analysis=None,
+            status=ChatStatus.ANSWERED,
+            sources=sources,
+            execution_flow=execution_flow,
+            plan=response_plan,
         )
 
         return ChatResponse(
-            conversation_id=conversation["id"],
+            conversation_id=conversation_id,
             answer=answer,
-            status=ChatStatus.AMBIGUOUS,
-            sources=[],
-            analysis=None,
-            plan=plan,
+            status=ChatStatus.ANSWERED,
+            sources=sources,
+            execution_flow=execution_flow,
+            query_plan=response_plan.model_dump(
+                by_alias=True
+            ),
         )
 
     effective_question = (
         plan.resolved_question.strip()
-        if plan.resolved_question and plan.resolved_question.strip()
+        if (
+            plan.conversation_intent == "follow_up"
+            and plan.resolved_question
+        )
         else question
     )
 
-    evidence: list[Evidence] = []
-    analysis: AnalysisResult | None = None
+    execution_flow: list[str] = [
+        "Understanding question"
+    ]
 
-    try:
-        if _needs_retrieval(plan):
-            evidence = retrieve_evidence(
-                plan=plan,
+    evidence = []
+    analysis: list[AnalysisResult] = []
+
+    if any(
+        operation.op == "retrieve"
+        for operation in plan.operations
+    ):
+        execution_flow.append(
+            "Retrieving document evidence"
+        )
+
+        evidence = retrieve_evidence(
+            plan=plan,
+            question=effective_question,
+            store=store,
+            gemini=gemini,
+            settings=settings,
+        )
+
+    if needs_analysis(plan):
+        execution_flow.append(
+            "Analyzing dataset"
+        )
+
+        analysis = run_analysis(
+            plan=plan,
+            store=store,
+        )
+
+    sources = sources_from_evidence(
+        evidence,
+        analysis,
+    )
+
+    if plan.out_of_scope:
+        status = ChatStatus.OUT_OF_SCOPE
+        answer = OUT_OF_SCOPE_ANSWER
+
+    elif plan.ambiguous:
+        status = ChatStatus.AMBIGUOUS
+        answer = (
+            plan.ambiguity_reason
+            or (
+                "The question is ambiguous. "
+                "Please provide more specific information."
+            )
+        )
+
+    elif not validate_evidence(
+        evidence,
+        analysis,
+    ):
+        status = ChatStatus.MISSING_INFORMATION
+        answer = MISSING_ANSWER
+
+    else:
+        conflict = detect_conflicts(
+            evidence,
+            analysis,
+        )
+
+        if conflict.genuine:
+            status = ChatStatus.CONFLICTING_INFORMATION
+
+            execution_flow.append(
+                "Checking conflicting evidence"
+            )
+
+            answer = _generate_answer(
                 question=effective_question,
-                store=store,
+                evidence=evidence,
+                analysis=analysis,
+                conflict_explanation=conflict.explanation,
                 gemini=gemini,
-                settings=settings,
             )
 
-        if needs_analysis(plan):
-            analysis = run_analysis(
-                plan=plan,
-                store=store,
+        else:
+            status = ChatStatus.ANSWERED
+
+            answer = _generate_answer(
+                question=effective_question,
+                evidence=evidence,
+                analysis=analysis,
+                conflict_explanation=None,
                 gemini=gemini,
-                settings=settings,
             )
 
-    except AnalysisError:
-        raise
-    except Exception as exc:
-        log.exception("question_processing_failed")
-        raise AppError(
-            "The question could not be processed."
-        ) from exc
-
-    conflict = detect_conflicts(evidence)
-
-    if conflict:
-        answer = conflict
-
-        _save_message(
-            store=store,
-            conversation_id=conversation["id"],
-            role="assistant",
-            content=answer,
-        )
-
-        _update_context(
-            store=store,
-            conversation_id=conversation["id"],
-            context=context,
-            plan=plan,
-            answer=answer,
-            evidence=evidence,
-            analysis=analysis,
-        )
-
-        return ChatResponse(
-            conversation_id=conversation["id"],
-            answer=answer,
-            status=ChatStatus.CONFLICTING_INFORMATION,
-            sources=sources_from_evidence(evidence),
-            analysis=analysis,
-            plan=plan,
-        )
-
-    evidence_valid = validate_evidence(
-        question=effective_question,
-        evidence=evidence,
-        analysis=analysis,
-        plan=plan,
+    execution_flow.append(
+        "Generating answer"
     )
 
-    if not evidence_valid:
-        answer = _missing_information_answer(
-            plan=plan,
-            evidence=evidence,
-            analysis=analysis,
-        )
-
-        _save_message(
-            store=store,
-            conversation_id=conversation["id"],
-            role="assistant",
-            content=answer,
-        )
-
-        _update_context(
-            store=store,
-            conversation_id=conversation["id"],
-            context=context,
-            plan=plan,
-            answer=answer,
-            evidence=evidence,
-            analysis=analysis,
-        )
-
-        return ChatResponse(
-            conversation_id=conversation["id"],
-            answer=answer,
-            status=ChatStatus.MISSING_INFORMATION,
-            sources=sources_from_evidence(evidence),
-            analysis=analysis,
-            plan=plan,
-        )
-
-    answer = _generate_answer(
-        question=effective_question,
-        plan=plan,
-        evidence=evidence,
-        analysis=analysis,
-        gemini=gemini,
-    )
-
-    _save_message(
+    _save_assistant_message(
         store=store,
-        conversation_id=conversation["id"],
-        role="assistant",
-        content=answer,
-    )
-
-    _update_context(
-        store=store,
-        conversation_id=conversation["id"],
-        context=context,
-        plan=plan,
+        conversation_id=conversation_id,
         answer=answer,
-        evidence=evidence,
+        status=status,
+        sources=sources,
+        execution_flow=execution_flow,
+        plan=plan,
+    )
+
+    new_context = _update_context(
+        context=context,
+        question=question,
+        answer=answer,
+        plan=plan,
         analysis=analysis,
+    )
+
+    store.update_conversation_context(
+        conversation_id,
+        new_context,
     )
 
     return ChatResponse(
-        conversation_id=conversation["id"],
+        conversation_id=conversation_id,
         answer=answer,
-        status=ChatStatus.ANSWERED,
-        sources=sources_from_evidence(evidence),
-        analysis=analysis,
-        plan=plan,
+        status=status,
+        sources=sources,
+        execution_flow=execution_flow,
+        query_plan=plan.model_dump(
+            by_alias=True
+        ),
+    )
+
+
+def get_conversation(
+    *,
+    store: Storage,
+    conversation_id: str,
+) -> ConversationOut:
+    record = store.get_conversation(
+        conversation_id
+    )
+
+    context = ConversationContext.model_validate_json(
+        record["context_json"]
+    )
+
+    raw_messages = store.list_messages(
+        conversation_id
+    )
+
+    messages = [
+        _message_out(message)
+        for message in raw_messages
+    ]
+
+    return ConversationOut(
+        conversation_id=conversation_id,
+        context=context,
+        messages=messages,
+        created_at=record["created_at"],
+        updated_at=record["updated_at"],
     )
 
 
@@ -323,256 +335,504 @@ def _get_or_create_conversation(
     *,
     store: Storage,
     conversation_id: str | None,
-) -> dict[str, Any]:
+) -> tuple[str, ConversationContext]:
     if conversation_id:
-        conversation = store.get_conversation(conversation_id)
+        record = store.get_conversation(
+            conversation_id
+        )
 
-        if conversation is not None:
-            return conversation
+        context = ConversationContext.model_validate_json(
+            record["context_json"]
+        )
 
-    return store.create_conversation()
+        return conversation_id, context
 
+    new_id = str(uuid4())
 
-def _get_context(
-    conversation: dict[str, Any],
-) -> ConversationContext:
-    raw_context = conversation.get("context")
+    record = store.create_conversation(
+        new_id
+    )
 
-    if isinstance(raw_context, ConversationContext):
-        return raw_context
+    context = ConversationContext.model_validate_json(
+        record["context_json"]
+    )
 
-    if isinstance(raw_context, dict):
-        try:
-            return ConversationContext.model_validate(raw_context)
-        except Exception:
-            log.warning("invalid_conversation_context")
-
-    return ConversationContext()
+    return new_id, context
 
 
-def _needs_retrieval(plan: QueryPlan) -> bool:
-    """
-    Decide whether semantic retrieval is required.
+def _handle_history_request(
+    *,
+    plan: QueryPlan,
+    previous_messages: list[dict[str, Any]],
+) -> tuple[str, list[Source], list[str]]:
+    target = plan.history_target
 
-    Retrieval is used for PDF/TXT evidence. Structured CSV/Excel analysis is
-    handled separately by analyze.py.
-    """
+    if target == "previous_question":
+        previous_question = _find_previous_message(
+            previous_messages,
+            role="user",
+        )
 
-    if not plan.operations:
-        return True
+        if previous_question is None:
+            return (
+                "There is no previous question in this conversation.",
+                [],
+                ["Reading conversation history"],
+            )
 
-    return any(
-        operation.op == "retrieve"
-        for operation in plan.operations
+        return (
+            (
+                f'Your previous question was: '
+                f'"{previous_question["content"]}"'
+            ),
+            [],
+            ["Reading conversation history"],
+        )
+
+    if target == "previous_answer":
+        previous_answer = _find_previous_message(
+            previous_messages,
+            role="assistant",
+        )
+
+        if previous_answer is None:
+            return (
+                "There is no previous answer in this conversation.",
+                [],
+                ["Reading conversation history"],
+            )
+
+        return (
+            previous_answer["content"],
+            _parse_sources(
+                previous_answer.get("sources_json")
+            ),
+            _parse_execution_flow(
+                previous_answer.get(
+                    "execution_flow_json"
+                )
+            ),
+        )
+
+    return (
+        _build_conversation_summary(
+            previous_messages
+        ),
+        [],
+        ["Reading conversation history"],
+    )
+
+
+def _handle_repeat_request(
+    *,
+    previous_messages: list[dict[str, Any]],
+    context: ConversationContext,
+) -> tuple[
+    str,
+    list[Source],
+    list[str],
+    QueryPlan | None,
+]:
+    previous_answer = _find_previous_message(
+        previous_messages,
+        role="assistant",
+    )
+
+    if previous_answer is not None:
+        return (
+            previous_answer["content"],
+            _parse_sources(
+                previous_answer.get(
+                    "sources_json"
+                )
+            ),
+            _parse_execution_flow(
+                previous_answer.get(
+                    "execution_flow_json"
+                )
+            ),
+            _parse_plan(
+                previous_answer.get(
+                    "query_plan_json"
+                )
+            ),
+        )
+
+    if context.last_answer:
+        return (
+            context.last_answer,
+            [],
+            ["Reading conversation context"],
+            None,
+        )
+
+    return (
+        "There is no previous answer to repeat.",
+        [],
+        ["Reading conversation history"],
+        None,
+    )
+
+
+def _find_previous_message(
+    messages: list[dict[str, Any]],
+    *,
+    role: str,
+) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") == role:
+            return message
+
+    return None
+
+
+def _build_conversation_summary(
+    messages: list[dict[str, Any]],
+) -> str:
+    if not messages:
+        return (
+            "There is no conversation history yet."
+        )
+
+    lines: list[str] = []
+
+    for message in messages:
+        role = message.get("role")
+
+        if role == "user":
+            lines.append(
+                f'User: {message.get("content", "")}'
+            )
+
+        elif role == "assistant":
+            lines.append(
+                f'Assistant: {message.get("content", "")}'
+            )
+
+    if not lines:
+        return (
+            "There is no conversation history yet."
+        )
+
+    return (
+        "Conversation history:\n"
+        + "\n".join(lines)
     )
 
 
 def _generate_answer(
     *,
     question: str,
-    plan: QueryPlan,
-    evidence: list[Evidence],
-    analysis: AnalysisResult | None,
+    evidence: list[Any],
+    analysis: list[AnalysisResult],
+    conflict_explanation: str | None,
     gemini: GeminiService,
 ) -> str:
-    prompt = _build_answer_prompt(
-        question=question,
-        plan=plan,
-        evidence=evidence,
-        analysis=analysis,
-    )
+    evidence_payload: list[dict[str, Any]] = []
 
-    answer = gemini.generate(
-        system_prompt=ANSWER_SYSTEM,
-        user_prompt=prompt,
-    )
-
-    answer = answer.strip()
-
-    if not answer:
-        raise AppError("The model returned an empty answer.")
-
-    return answer
-
-
-def _build_answer_prompt(
-    *,
-    question: str,
-    plan: QueryPlan,
-    evidence: list[Evidence],
-    analysis: AnalysisResult | None,
-) -> str:
-    payload: dict[str, Any] = {
-        "question": question,
-        "plan": _plan_for_prompt(plan),
-        "evidence": [
-            _evidence_for_prompt(item)
-            for item in evidence
-        ],
-        "analysis": (
-            _analysis_for_prompt(analysis)
-            if analysis is not None
-            else None
-        ),
-    }
-
-    return (
-        "Answer the user's question using only the supplied information.\n\n"
-        "USER QUESTION:\n"
-        f"{question}\n\n"
-        "SUPPLIED INFORMATION:\n"
-        f"{json.dumps(payload, ensure_ascii=False, default=str, indent=2)}\n\n"
-        "Write the final answer for the user."
-    )
-
-
-def _plan_for_prompt(plan: QueryPlan) -> dict[str, Any]:
-    return {
-        "intent": plan.intent.value
-        if hasattr(plan.intent, "value")
-        else str(plan.intent),
-        "is_follow_up": plan.is_follow_up,
-        "resolved_question": plan.resolved_question,
-        "entities": plan.entities,
-        "metrics": plan.metrics,
-        "years": plan.years,
-        "filters": plan.filters,
-        "document_hints": plan.document_hints,
-        "operations": [
-            operation.model_dump(
-                by_alias=True,
-                exclude_none=True,
-            )
-            for operation in plan.operations
-        ],
-    }
-
-
-def _evidence_for_prompt(
-    evidence: Evidence,
-) -> dict[str, Any]:
-    return {
-        "document_id": evidence.document_id,
-        "filename": evidence.filename,
-        "document_type": evidence.document_type,
-        "chunk_id": evidence.chunk_id,
-        "text": evidence.text,
-        "similarity": evidence.similarity,
-        "page_number": evidence.page_number,
-        "section": evidence.section,
-        "source_reference": evidence.source_reference,
-        "start_line": evidence.start_line,
-        "end_line": evidence.end_line,
-        "row_start": evidence.row_start,
-        "row_end": evidence.row_end,
-        "columns": evidence.columns,
-        "entities": evidence.entities,
-        "year": evidence.year,
-    }
-
-
-def _analysis_for_prompt(
-    analysis: AnalysisResult,
-) -> dict[str, Any]:
-    return {
-        "operation": analysis.operation,
-        "value": analysis.value,
-        "table": analysis.table,
-        "inputs": analysis.inputs,
-        "formula": analysis.formula,
-        "source_file": analysis.source_file,
-        "rows_used": analysis.rows_used,
-        "columns_used": analysis.columns_used,
-    }
-
-
-def _missing_information_answer(
-    *,
-    plan: QueryPlan,
-    evidence: list[Evidence],
-    analysis: AnalysisResult | None,
-) -> str:
-    if analysis is None and not evidence:
-        return MISSING_ANSWER
-
-    if analysis is None:
-        return (
-            "I found related information in the uploaded documents, "
-            "but it does not contain enough information to answer that "
-            "question reliably."
+    for item in evidence:
+        evidence_payload.append(
+            {
+                "filename": item.filename,
+                "document_type": item.document_type,
+                "source_reference": item.source_reference,
+                "page_number": item.page_number,
+                "section": item.section,
+                "start_line": item.start_line,
+                "end_line": item.end_line,
+                "row_start": item.row_start,
+                "row_end": item.row_end,
+                "text": item.text,
+            }
         )
 
-    return (
-        "I could not obtain enough information from the uploaded data "
-        "to answer that question reliably."
+    analysis_payload = [
+        result.model_dump(
+            by_alias=True
+        )
+        for result in analysis
+    ]
+
+    payload = {
+        "question": question,
+        "evidence": evidence_payload,
+        "analysis_results": analysis_payload,
+        "conflict": conflict_explanation,
+    }
+
+    response = gemini.generate_json(
+        system=ANSWER_SYSTEM,
+        user=json.dumps(
+            payload,
+            default=str,
+        ),
     )
 
+    answer = response.get("answer")
 
-def _save_message(
+    if isinstance(answer, str):
+        answer = answer.strip()
+
+        if answer:
+            return answer
+
+    return MISSING_ANSWER
+
+
+def _save_user_message(
     *,
     store: Storage,
     conversation_id: str,
-    role: str,
-    content: str,
+    question: str,
 ) -> None:
-    store.add_message(
-        conversation_id=conversation_id,
-        role=role,
-        content=content,
+    store.insert_message(
+        {
+            "message_id": str(uuid4()),
+            "conversation_id": conversation_id,
+            "role": "user",
+            "content": question,
+            "status": None,
+            "sources_json": None,
+            "execution_flow_json": None,
+            "query_plan_json": None,
+            "created_at": _utcnow(),
+        }
+    )
+
+
+def _save_assistant_message(
+    *,
+    store: Storage,
+    conversation_id: str,
+    answer: str,
+    status: ChatStatus,
+    sources: list[Source],
+    execution_flow: list[str],
+    plan: QueryPlan,
+) -> None:
+    store.insert_message(
+        {
+            "message_id": str(uuid4()),
+            "conversation_id": conversation_id,
+            "role": "assistant",
+            "content": answer,
+            "status": status.value,
+            "sources_json": json.dumps(
+                [
+                    source.model_dump(
+                        by_alias=True
+                    )
+                    for source in sources
+                ],
+                default=str,
+            ),
+            "execution_flow_json": json.dumps(
+                execution_flow
+            ),
+            "query_plan_json": json.dumps(
+                plan.model_dump(
+                    by_alias=True
+                ),
+                default=str,
+            ),
+            "created_at": _utcnow(),
+        }
     )
 
 
 def _update_context(
     *,
-    store: Storage,
-    conversation_id: str,
     context: ConversationContext,
-    plan: QueryPlan,
+    question: str,
     answer: str,
-    evidence: list[Evidence],
-    analysis: AnalysisResult | None,
-) -> None:
-    numeric_results: dict[str, Any] = {}
+    plan: QueryPlan,
+    analysis: list[AnalysisResult],
+) -> ConversationContext:
+    if plan.conversation_intent in {
+        "history",
+        "repeat",
+    }:
+        return context
 
-    if analysis is not None:
-        numeric_results = {
-            "operation": analysis.operation,
-            "value": analysis.value,
-            "source_file": analysis.source_file,
-        }
-
-    updated = context.model_copy(
-        update={
-            "last_intent": (
-                plan.intent.value
-                if hasattr(plan.intent, "value")
-                else str(plan.intent)
-            ),
-            "last_question": plan.resolved_question or "",
-            "last_answer": answer,
-            "entities": list(plan.entities),
-            "metrics": list(plan.metrics),
-            "years": list(plan.years),
-            "document_ids": list(plan.document_ids),
-            "last_plan_summary": {
-                "intent": (
-                    plan.intent.value
-                    if hasattr(plan.intent, "value")
-                    else str(plan.intent)
-                ),
-                "operations": [
-                    operation.model_dump(
-                        by_alias=True,
-                        exclude_none=True,
-                    )
-                    for operation in plan.operations
-                ],
-            },
-            "last_numeric_results": numeric_results,
-        }
+    return ConversationContext(
+        last_question=question,
+        last_answer=answer,
+        last_intent=plan.intent.value,
+        last_resolved_question=(
+            plan.resolved_question
+            or question
+        ),
+        entities=list(
+            plan.entities
+        ),
+        metrics=list(
+            plan.metrics
+        ),
+        years=list(
+            plan.years
+        ),
+        filters=list(
+            plan.filters
+        ),
+        document_ids=list(
+            plan.document_ids
+        ),
+        document_hints=list(
+            plan.document_hints
+        ),
+        operations=list(
+            plan.operations
+        ),
+        last_analysis=[
+            result
+            for result in analysis
+        ],
     )
 
-    store.update_conversation_context(
-        conversation_id=conversation_id,
-        context=updated.model_dump(),
+
+def _message_out(
+    message: dict[str, Any],
+) -> MessageOut:
+    return MessageOut(
+        message_id=message["message_id"],
+        role=message["role"],
+        content=message["content"],
+        status=message.get("status"),
+        sources=_parse_sources(
+            message.get("sources_json")
+        ),
+        execution_flow=_parse_execution_flow(
+            message.get("execution_flow_json")
+        ),
+        query_plan=_parse_query_plan_dict(
+            message.get("query_plan_json")
+        ),
+        created_at=message.get("created_at"),
+    )
+
+
+def _parse_sources(
+    raw: str | None,
+) -> list[Source]:
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
+        log.warning(
+            "invalid_sources_json"
+        )
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    sources: list[Source] = []
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            sources.append(
+                Source.model_validate(item)
+            )
+        except ValueError:
+            log.warning(
+                "invalid_source_item"
+            )
+
+    return sources
+
+
+def _parse_execution_flow(
+    raw: str | None,
+) -> list[str]:
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
+        log.warning(
+            "invalid_execution_flow_json"
+        )
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    return [
+        str(item)
+        for item in data
+    ]
+
+
+def _parse_plan(
+    raw: str | None,
+) -> QueryPlan | None:
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
+        log.warning(
+            "invalid_query_plan_json"
+        )
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    try:
+        return QueryPlan.model_validate(
+            data
+        )
+    except ValueError:
+        log.warning(
+            "invalid_query_plan"
+        )
+        return None
+
+
+def _parse_query_plan_dict(
+    raw: str | None,
+) -> dict[str, Any] | None:
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
+        return None
+
+    if isinstance(data, dict):
+        return data
+
+    return None
+
+
+def _utcnow() -> str:
+    return (
+        datetime.now(
+            timezone.utc
+        )
+        .replace(
+            microsecond=0
+        )
+        .isoformat()
     )
