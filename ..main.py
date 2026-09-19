@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 import truststore
 
 truststore.inject_into_ssl()
+
 import logging
 from contextlib import asynccontextmanager
 
@@ -39,30 +41,60 @@ def create_app(
         finally:
             store.close()
 
-    app = FastAPI(title="Intelligent Document Analysis System", lifespan=lifespan)
+    app = FastAPI(
+        title="Intelligent Document Analysis System",
+        lifespan=lifespan,
+    )
     app.state.settings = settings
 
     @app.exception_handler(AppError)
-    async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:
+    async def app_error_handler(
+        _: Request,
+        exc: AppError,
+    ) -> JSONResponse:
         http_exc = http_error(exc)
-        return JSONResponse(status_code=http_exc.status_code, content={"detail": http_exc.detail})
+        return JSONResponse(
+            status_code=http_exc.status_code,
+            content={"detail": http_exc.detail},
+        )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_handler(
+        _: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
         log.info("api_validation_error")
         return JSONResponse(
             status_code=422,
-            content={"detail": {"error": "validation_error", "message": "The request is invalid."}},
+            content={
+                "detail": {
+                    "error": "validation_error",
+                    "message": "The request is invalid.",
+                }
+            },
         )
 
     @app.exception_handler(Exception)
-    async def unhandled(_: Request, exc: Exception) -> JSONResponse:
+    async def unhandled(
+        _: Request,
+        exc: Exception,
+    ) -> JSONResponse:
         if isinstance(exc, HTTPException):
-            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+            )
+
         log.exception("unhandled_error")
+
         return JSONResponse(
             status_code=500,
-            content={"detail": {"error": "internal_error", "message": "An unexpected error occurred."}},
+            content={
+                "detail": {
+                    "error": "internal_error",
+                    "message": "An unexpected error occurred.",
+                }
+            },
         )
 
     app.include_router(router)
@@ -70,5 +102,3 @@ def create_app(
 
 
 app = create_app()
-
-
