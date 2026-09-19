@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from typing import Any, Protocol, runtime_checkable
 
-import httpx
 from google import genai
 from google.genai import types
 
 from app.config import Settings
-from app.errors import EmbeddingError, GeminiError
+from app.errors import GeminiError
+
 
 log = logging.getLogger(__name__)
 
@@ -18,44 +17,54 @@ log = logging.getLogger(__name__)
 @runtime_checkable
 class GeminiService(Protocol):
     """
-    Minimal interface consumed by the application.
+    Minimal Gemini interface used by the rest of the application.
 
-    Keeping the rest of the backend dependent on this protocol rather than
-    the Google SDK makes the Gemini integration easier to test and replace.
+    Keeping the application dependent on this interface rather than directly
+    on the Google SDK makes the planner, retriever, analyzer, and chat layer
+    easier to test and keeps Gemini-specific code in one place.
     """
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system_instruction: str | None = None,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        ...
+
+    def generate_json(
+        self,
+        prompt: str,
+        *,
+        system_instruction: str | None = None,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        ...
 
     def embed_texts(
         self,
         texts: list[str],
         *,
-        task_type: str = "RETRIEVAL_DOCUMENT",
+        task_type: str | None = None,
     ) -> list[list[float]]:
-        ...
-
-    def generate_json(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> dict[str, Any]:
-        ...
-
-    def generate_text(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> str:
         ...
 
 
 class GeminiClient:
     """
-    Gemini client used by the application.
+    Synchronous Gemini client used by the application.
 
-    The same client is used for:
-      - document embeddings
-      - planner JSON generation
-      - DuckDB SQL generation
-      - final answer generation
+    Responsibilities:
+        - text generation
+        - structured JSON generation
+        - text embeddings
+
+    No application-specific planning, SQL generation, retrieval logic, or
+    answer-generation rules belong here. Those are handled by their
+    respective application layers.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -66,120 +75,123 @@ class GeminiClient:
                 "GEMINI_API_KEY is not configured."
             )
 
-        timeout_seconds = max(
-            settings.gemini_timeout_ms / 1000,
-            1,
-        )
-
-        self._http_client = httpx.Client(
-            timeout=timeout_seconds,
-            transport=httpx.HTTPTransport(
-                local_address="0.0.0.0",
-            ),
-        )
-
         try:
             self.client = genai.Client(
                 api_key=settings.gemini_api_key,
-                http_options=types.HttpOptions(
-                    timeout=settings.gemini_timeout_ms,
+            )
+        except Exception as exc:
+            log.exception("gemini_client_initialization_failed")
+            raise GeminiError(
+                "Failed to initialize the Gemini client."
+            ) from exc
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system_instruction: str | None = None,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        """
+        Generate plain text from Gemini.
+
+        The application uses this for tasks such as:
+            - final grounded answers
+            - query interpretation
+            - other text-only generation
+        """
+
+        if not prompt or not prompt.strip():
+            raise GeminiError(
+                "Gemini generation requires a non-empty prompt."
+            )
+
+        config_kwargs: dict[str, Any] = {
+            "temperature": temperature,
+        }
+
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+
+        if max_output_tokens is not None:
+            config_kwargs["max_output_tokens"] = max_output_tokens
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.settings.gemini_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    **config_kwargs,
                 ),
             )
         except Exception as exc:
-            log.exception("Failed to initialize Gemini client")
+            log.exception(
+                "gemini_generate_failed model=%s",
+                self.settings.gemini_model,
+            )
             raise GeminiError(
-                f"Failed to initialize Gemini client: {exc}"
+                "Gemini generation failed."
             ) from exc
 
-    def embed_texts(
-        self,
-        texts: list[str],
-        *,
-        task_type: str = "RETRIEVAL_DOCUMENT",
-    ) -> list[list[float]]:
-        if not texts:
-            return []
+        text = self._extract_text(response)
 
-        embeddings: list[list[float]] = []
-
-        batch_size = max(
-            1,
-            self.settings.embed_batch_size,
-        )
-
-        for start in range(0, len(texts), batch_size):
-            batch = texts[start : start + batch_size]
-
-            try:
-                response = self.client.models.embed_content(
-                    model=self.settings.embedding_model,
-                    contents=batch,
-                    config=types.EmbedContentConfig(
-                        task_type=task_type,
-                        output_dimensionality=(
-                            self.settings.embedding_dimensions
-                        ),
-                    ),
-                )
-
-                values = getattr(response, "embeddings", None)
-
-                if values is None:
-                    raise EmbeddingError(
-                        "Gemini returned no embeddings."
-                    )
-
-                for embedding in values:
-                    vector = getattr(
-                        embedding,
-                        "values",
-                        None,
-                    )
-
-                    if not vector:
-                        raise EmbeddingError(
-                            "Gemini returned an empty embedding."
-                        )
-
-                    embeddings.append(
-                        [float(value) for value in vector]
-                    )
-
-            except EmbeddingError:
-                raise
-            except Exception as exc:
-                log.exception(
-                    "Gemini embedding request failed"
-                )
-                raise EmbeddingError(
-                    f"Gemini embedding failed: {exc}"
-                ) from exc
-
-        if len(embeddings) != len(texts):
-            raise EmbeddingError(
-                "Gemini returned an unexpected number of embeddings."
+        if not text:
+            raise GeminiError(
+                "Gemini returned an empty response."
             )
 
-        return embeddings
+        return text
 
     def generate_json(
         self,
-        system_prompt: str,
-        user_prompt: str,
+        prompt: str,
+        *,
+        system_instruction: str | None = None,
+        temperature: float = 0.0,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         """
-        Generate a JSON object from Gemini.
+        Generate and parse a JSON object from Gemini.
 
-        This is also used by the DuckDB analysis layer. The SQL generator
-        therefore does not need its own LLM client.
+        This is intentionally a generic JSON interface. The planner and
+        analyzer validate the returned structure against their own models.
         """
-        response = self._generate(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_mime_type="application/json",
-        )
 
-        text = self._response_text(response)
+        if not prompt or not prompt.strip():
+            raise GeminiError(
+                "Gemini JSON generation requires a non-empty prompt."
+            )
+
+        config_kwargs: dict[str, Any] = {
+            "temperature": temperature,
+            "response_mime_type": "application/json",
+        }
+
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+
+        if max_output_tokens is not None:
+            config_kwargs["max_output_tokens"] = max_output_tokens
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.settings.gemini_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    **config_kwargs,
+                ),
+            )
+        except Exception as exc:
+            log.exception(
+                "gemini_generate_json_failed model=%s",
+                self.settings.gemini_model,
+            )
+            raise GeminiError(
+                "Gemini JSON generation failed."
+            ) from exc
+
+        text = self._extract_text(response)
 
         if not text:
             raise GeminiError(
@@ -187,125 +199,214 @@ class GeminiClient:
             )
 
         try:
-            data = json.loads(text)
+            value = json.loads(text)
         except json.JSONDecodeError as exc:
             log.error(
-                "Invalid JSON returned by Gemini: %s",
+                "gemini_invalid_json response=%r",
                 text[:1000],
             )
             raise GeminiError(
                 "Gemini returned invalid JSON."
             ) from exc
 
-        if not isinstance(data, dict):
+        if not isinstance(value, dict):
             raise GeminiError(
                 "Gemini JSON response must be an object."
             )
 
-        return data
+        return value
 
-    def generate_text(
+    def embed_texts(
         self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> str:
-        response = self._generate(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_mime_type="text/plain",
+        texts: list[str],
+        *,
+        task_type: str | None = None,
+    ) -> list[list[float]]:
+        """
+        Generate embeddings for multiple text chunks.
+
+        Embeddings are requested in batches so a large document does not
+        become one enormous API request.
+
+        The returned list has exactly one embedding for every non-empty
+        input text.
+        """
+
+        if not texts:
+            return []
+
+        cleaned: list[str] = []
+
+        for text in texts:
+            if text is None:
+                continue
+
+            value = str(text).strip()
+
+            if value:
+                cleaned.append(value)
+
+        if not cleaned:
+            return []
+
+        batch_size = max(
+            1,
+            self.settings.embed_batch_size,
         )
 
-        text = self._response_text(response)
+        all_embeddings: list[list[float]] = []
 
-        if not text:
-            raise GeminiError(
-                "Gemini returned an empty response."
+        for start in range(0, len(cleaned), batch_size):
+            batch = cleaned[
+                start : start + batch_size
+            ]
+
+            embeddings = self._embed_batch(
+                batch,
+                task_type=task_type,
             )
 
-        return text.strip()
+            all_embeddings.extend(embeddings)
 
-    def _generate(
+        if len(all_embeddings) != len(cleaned):
+            raise GeminiError(
+                "Gemini returned an unexpected number of embeddings."
+            )
+
+        return all_embeddings
+
+    def _embed_batch(
         self,
+        texts: list[str],
         *,
-        system_prompt: str,
-        user_prompt: str,
-        response_mime_type: str,
-    ) -> Any:
-        started = time.perf_counter()
+        task_type: str | None = None,
+    ) -> list[list[float]]:
+        """
+        Embed one batch of texts.
+        """
+
+        config_kwargs: dict[str, Any] = {
+            "output_dimensionality": self.settings.embedding_dimensions,
+        }
+
+        if task_type:
+            config_kwargs["task_type"] = task_type
 
         try:
-            response = self.client.models.generate_content(
-                model=self.settings.gemini_model,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    response_mime_type=response_mime_type,
-                    temperature=0,
+            response = self.client.models.embed_content(
+                model=self.settings.embedding_model,
+                contents=texts,
+                config=types.EmbedContentConfig(
+                    **config_kwargs,
                 ),
             )
-
-            elapsed = time.perf_counter() - started
-
-            log.debug(
-                "Gemini generation completed in %.2fs",
-                elapsed,
-            )
-
-            return response
-
         except Exception as exc:
-            elapsed = time.perf_counter() - started
-
             log.exception(
-                "Gemini generation failed after %.2fs",
-                elapsed,
+                "gemini_embedding_failed model=%s batch_size=%d",
+                self.settings.embedding_model,
+                len(texts),
             )
-
             raise GeminiError(
-                f"Gemini generation failed: {exc}"
+                "Gemini embedding generation failed."
             ) from exc
 
-    @staticmethod
-    def _response_text(response: Any) -> str:
-        """
-        Extract text from the Google GenAI response while tolerating
-        SDK response-shape differences.
-        """
-        text = getattr(response, "text", None)
+        raw_embeddings = getattr(
+            response,
+            "embeddings",
+            None,
+        )
 
-        if isinstance(text, str):
+        if not raw_embeddings:
+            raise GeminiError(
+                "Gemini returned no embeddings."
+            )
+
+        result: list[list[float]] = []
+
+        for item in raw_embeddings:
+            values = getattr(
+                item,
+                "values",
+                None,
+            )
+
+            if values is None:
+                if isinstance(item, dict):
+                    values = item.get("values")
+
+            if not values:
+                raise GeminiError(
+                    "Gemini returned an invalid embedding."
+                )
+
+            vector = [
+                float(value)
+                for value in values
+            ]
+
+            result.append(vector)
+
+        return result
+
+    @staticmethod
+    def _extract_text(response: Any) -> str:
+        """
+        Extract response text safely from a Google GenAI response.
+
+        The SDK normally exposes response.text, but this method also handles
+        responses where text is unavailable and the candidate parts need to
+        be inspected.
+        """
+
+        text = getattr(
+            response,
+            "text",
+            None,
+        )
+
+        if isinstance(text, str) and text.strip():
             return text.strip()
 
-        candidates = getattr(response, "candidates", None)
+        candidates = getattr(
+            response,
+            "candidates",
+            None,
+        )
 
         if not candidates:
             return ""
 
-        parts: list[str] = []
+        parts_text: list[str] = []
 
         for candidate in candidates:
-            content = getattr(candidate, "content", None)
+            content = getattr(
+                candidate,
+                "content",
+                None,
+            )
 
             if content is None:
                 continue
 
-            response_parts = getattr(
+            parts = getattr(
                 content,
                 "parts",
                 None,
             )
 
-            if not response_parts:
+            if not parts:
                 continue
 
-            for part in response_parts:
+            for part in parts:
                 part_text = getattr(
                     part,
                     "text",
                     None,
                 )
 
-                if isinstance(part_text, str):
-                    parts.append(part_text)
+                if isinstance(part_text, str) and part_text.strip():
+                    parts_text.append(
+                        part_text.strip()
+                    )
 
-        return "".join(parts).strip()
+        return "\n".join(parts_text).strip()
