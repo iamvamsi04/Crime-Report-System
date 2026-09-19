@@ -1,632 +1,142 @@
 from __future__ import annotations
 
-from typing import Any
-
-import requests
+import httpx
 import streamlit as st
 
-
-# ---------------------------------------------------------------------------
-# Page configuration
-# ---------------------------------------------------------------------------
-
-st.set_page_config(
-    page_title="Document Analysis",
-    page_icon="📄",
-    layout="wide",
-)
-
-
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+st.set_page_config(page_title="Document Analysis", layout="wide")
 
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
-
-if "backend_url" not in st.session_state:
-    st.session_state.backend_url = (
-        "http://127.0.0.1:8000"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def api_url(
-    path: str,
-) -> str:
-    base = (
-        st.session_state.backend_url
-        .strip()
-        .rstrip("/")
-    )
-
-    return (
-        f"{base}/{path.lstrip('/')}"
-    )
-
-
-def request_json(
-    method: str,
-    path: str,
-    *,
-    timeout: float = 120.0,
-    **kwargs: Any,
-) -> Any:
-    response = requests.request(
-        method=method,
-        url=api_url(path),
-        timeout=timeout,
-        **kwargs,
-    )
-
-    if response.ok:
-        if not response.content:
-            return None
-
-        return response.json()
-
-    detail = None
-
-    try:
-        payload = response.json()
-
-        if isinstance(
-            payload,
-            dict,
-        ):
-            detail = payload.get(
-                "detail"
-            )
-
-    except ValueError:
-        detail = None
-
-    if not detail:
-        detail = (
-            response.text.strip()
-            or (
-                f"Request failed with "
-                f"status {response.status_code}."
-            )
-        )
-
-    raise RuntimeError(
-        str(detail)
-    )
-
-
-def load_documents() -> list[
-    dict[str, Any]
-]:
-    try:
-        payload = request_json(
-            "GET",
-            "/documents",
-            timeout=30.0,
-        )
-
-        if isinstance(
-            payload,
-            list,
-        ):
-            return payload
-
-    except Exception:
-        return []
-
-    return []
-
-
-def render_sources(
-    sources: list[
-        dict[str, Any]
-    ],
-) -> None:
-    if not sources:
-        return
-
-    st.markdown(
-        "**Sources**"
-    )
-
-    for source in sources:
-        filename = str(
-            source.get(
-                "filename"
-            )
-            or "Document"
-        )
-
-        reference = (
-            source.get(
-                "source_reference"
-            )
-        )
-
-        if not reference:
-            page_number = (
-                source.get(
-                    "page_number"
-                )
-            )
-
-            section = (
-                source.get(
-                    "section"
-                )
-            )
-
-            row_start = (
-                source.get(
-                    "row_start"
-                )
-            )
-
-            row_end = (
-                source.get(
-                    "row_end"
-                )
-            )
-
-            if page_number is not None:
-                reference = (
-                    f"Page {page_number}"
-                )
-
-            elif section:
-                reference = str(
-                    section
-                )
-
-            elif (
-                row_start is not None
-                and row_end is not None
-            ):
-                if row_start == row_end:
-                    reference = (
-                        f"Row {row_start}"
-                    )
-                else:
-                    reference = (
-                        f"Rows "
-                        f"{row_start}–{row_end}"
-                    )
-
-        if reference:
-            st.caption(
-                f"{filename} — {reference}"
-            )
-        else:
-            st.caption(
-                filename
-            )
-
-        excerpt = (
-            source.get(
-                "excerpt"
-            )
-        )
-
-        if excerpt:
-            st.caption(
-                str(excerpt)
-            )
-
-
-def render_execution_flow(
-    execution_flow: list[str],
-) -> None:
-    if not execution_flow:
-        return
-
-    with st.expander(
-        "Execution flow"
-    ):
-        for step in execution_flow:
-            st.write(
-                f"• {step}"
-            )
-
-
-def render_assistant_payload(
-    message: dict[str, Any],
-) -> None:
-    content = str(
-        message.get(
-            "content"
-        )
-        or ""
-    )
-
-    st.markdown(
-        content
-    )
-
-    sources = (
-        message.get(
-            "sources"
-        )
-        or []
-    )
-
-    if isinstance(
-        sources,
-        list,
-    ):
-        render_sources(
-            sources
-        )
-
-    execution_flow = (
-        message.get(
-            "execution_flow"
-        )
-        or []
-    )
-
-    if isinstance(
-        execution_flow,
-        list,
-    ):
-        render_execution_flow(
-            [
-                str(step)
-                for step
-                in execution_flow
-            ]
-        )
-
-
-def reset_conversation() -> None:
+if "messages" not in st.session_state:
     st.session_state.messages = []
-    st.session_state.conversation_id = None
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None
 
+LIST_TIMEOUT = 5.0
+UPLOAD_TIMEOUT = 300.0
+CHAT_TIMEOUT = 180.0
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
+def api_url(base: str, path: str) -> str:
+    return base.rstrip("/") + path
+
+def request_error_message(exc: Exception) -> str:
+    if isinstance(exc, httpx.ConnectError):
+        return "Cannot reach the FastAPI backend. Start Uvicorn on the Backend URL (port 8000)."
+    if isinstance(exc, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException)):
+        return "The backend is still working or took too long. Keep Uvicorn running and try again."
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            detail = exc.response.json().get("detail")
+            if isinstance(detail, dict) and detail.get("message"):
+                return str(detail["message"])
+        except Exception:
+            return "The backend returned an error."
+        return "The backend returned an error."
+    return "The request failed."
+
+def fetch_documents(base: str) -> tuple[list[dict], str | None]:
+    try:
+        response = httpx.get(api_url(base, "/documents"), timeout=LIST_TIMEOUT)
+        response.raise_for_status()
+        return response.json(), None
+    except Exception as exc:
+        return [], request_error_message(exc)
+
+st.title("Intelligent Document Analysis")
+st.caption("Ask questions about uploaded PDF, TXT, CSV, and Excel files. Answers are grounded in retrieved evidence.")
 
 with st.sidebar:
-    st.header(
-        "Documents"
-    )
-
-    backend_url = st.text_input(
-        "Backend URL",
-        value=(
-            st.session_state.backend_url
-        ),
-    )
-
-    st.session_state.backend_url = (
-        backend_url
-    )
-
-    uploaded_file = st.file_uploader(
-        "Upload a document",
-        type=[
-            "pdf",
-            "txt",
-            "csv",
-            "xlsx",
-            "xls",
-        ],
-    )
-
-    st.caption(
-        "For Excel files, the first worksheet is analyzed."
-    )
-
-    if st.button(
-        "Ingest document",
-        disabled=(
-            uploaded_file is None
-        ),
-        use_container_width=True,
-    ):
-        if uploaded_file is not None:
+    st.subheader("Workspace")
+    backend = st.text_input("Backend URL", value="http://127.0.0.1:8000")
+    uploaded = st.file_uploader("Upload document", type=["pdf", "txt", "csv", "xlsx", "xls"])
+    if uploaded is not None and uploaded.name.lower().endswith((".xlsx", ".xls")):
+        st.caption("Excel: uses the first worksheet, with column headers in the first row.")
+    if uploaded is not None and st.button("Ingest file"):
+        with st.spinner("Ingesting document (embedding can take a minute)..."):
             try:
-                with st.spinner(
-                    "Ingesting document..."
-                ):
-                    request_json(
-                        "POST",
-                        "/documents/upload",
-                        files={
-                            "file": (
-                                uploaded_file.name,
-                                uploaded_file.getvalue(),
-                                uploaded_file.type
-                                or (
-                                    "application/"
-                                    "octet-stream"
-                                ),
-                            )
-                        },
-                        timeout=300.0,
-                    )
-
-                st.success(
-                    "Document ingested."
+                files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type or "application/octet-stream")}
+                response = httpx.post(
+                    api_url(backend, "/documents/upload"),
+                    files=files,
+                    timeout=UPLOAD_TIMEOUT,
                 )
-
+                response.raise_for_status()
+                st.success(f"Uploaded {response.json().get('filename')}")
                 st.rerun()
-
             except Exception as exc:
-                st.error(
-                    str(exc)
+                st.error(request_error_message(exc))
+
+    st.markdown("**Documents**")
+    documents, list_error = fetch_documents(backend)
+    if list_error:
+        st.caption(list_error)
+    elif not documents:
+        st.caption("No documents uploaded.")
+    for doc in documents:
+        cols = st.columns([4, 1])
+        cols[0].write(f"{doc['filename']} ({doc['file_type']}, {doc['status']})")
+        if cols[1].button("Delete", key=f"del-{doc['document_id']}"):
+            try:
+                response = httpx.delete(
+                    api_url(backend, f"/documents/{doc['document_id']}"),
+                    timeout=LIST_TIMEOUT,
                 )
+                response.raise_for_status()
+                st.rerun()
+            except Exception as exc:
+                st.error(request_error_message(exc))
 
-    st.divider()
-
-    documents = (
-        load_documents()
-    )
-
-    if not documents:
-        st.caption(
-            "No documents uploaded."
-        )
-
-    else:
-        for document in documents:
-            document_id = str(
-                document.get(
-                    "id"
-                )
-                or ""
-            )
-
-            filename = str(
-                document.get(
-                    "filename"
-                )
-                or "Document"
-            )
-
-            file_type = str(
-                document.get(
-                    "file_type"
-                )
-                or ""
-            ).upper()
-
-            status = str(
-                document.get(
-                    "status"
-                )
-                or ""
-            )
-
-            col_name, col_delete = (
-                st.columns(
-                    [
-                        5,
-                        1,
-                    ]
-                )
-            )
-
-            with col_name:
-                st.write(
-                    filename
-                )
-
-                details = (
-                    file_type
-                )
-
-                if status:
-                    details = (
-                        f"{details} · "
-                        f"{status}"
-                    )
-
-                st.caption(
-                    details
-                )
-
-            with col_delete:
-                if st.button(
-                    "×",
-                    key=(
-                        f"delete_"
-                        f"{document_id}"
-                    ),
-                    help=(
-                        "Delete document"
-                    ),
-                ):
-                    try:
-                        request_json(
-                            "DELETE",
-                            (
-                                "/documents/"
-                                f"{document_id}"
-                            ),
-                            timeout=60.0,
-                        )
-
-                        st.rerun()
-
-                    except Exception as exc:
-                        st.error(
-                            str(exc)
-                        )
-
-    st.divider()
-
-    if st.button(
-        "New conversation",
-        use_container_width=True,
-    ):
-        reset_conversation()
-
+    if st.button("New conversation"):
+        st.session_state.conversation_id = None
+        st.session_state.messages = []
+        st.session_state.pending_question = None
         st.rerun()
 
+if any(doc.get("status") == "processing" for doc in documents):
+    st.info("A document is still being ingested (embeddings). Wait until status is ready, then ask again.")
 
-# ---------------------------------------------------------------------------
-# Main chat
-# ---------------------------------------------------------------------------
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+        if message.get("sources"):
+            st.markdown("**Sources**")
+            for source in message["sources"]:
+                st.markdown(f"- {source.get('source_reference') or source.get('filename')}")
+                if source.get("excerpt"):
+                    st.caption(source["excerpt"])
+        if message.get("execution_flow"):
+            with st.expander("How this was processed"):
+                st.write(" → ".join(message["execution_flow"]))
 
-st.title(
-    "Document Analysis"
-)
-
-for message in (
-    st.session_state.messages
-):
-    role = (
-        message.get(
-            "role"
-        )
-        or "assistant"
-    )
-
-    with st.chat_message(
-        role
-    ):
-        if role == "assistant":
-            render_assistant_payload(
-                message
-            )
-        else:
-            st.markdown(
-                str(
-                    message.get(
-                        "content"
-                    )
-                    or ""
-                )
-            )
-
-
-question = st.chat_input(
-    "Ask a question about your documents"
-)
-
+question = st.chat_input("Ask a question about the documents")
 if question:
-    user_message = {
-        "role": "user",
-        "content": question,
-    }
+    st.session_state.messages.append({"role": "user", "content": question})
+    st.session_state.pending_question = question
+    st.rerun()
 
-    st.session_state.messages.append(
-        user_message
-    )
-
-    with st.chat_message(
-        "user"
-    ):
-        st.markdown(
-            question
-        )
-
-    with st.chat_message(
-        "assistant"
-    ):
+if st.session_state.pending_question:
+    pending = st.session_state.pending_question
+    st.session_state.pending_question = None
+    with st.spinner("Answering..."):
         try:
-            with st.spinner(
-                "Analyzing..."
-            ):
-                payload = request_json(
-                    "POST",
-                    "/chat",
-                    json={
-                        "question": question,
-                        "conversation_id": (
-                            st.session_state
-                            .conversation_id
-                        ),
-                    },
-                    timeout=300.0,
-                )
-
-            if not isinstance(
-                payload,
-                dict,
-            ):
-                raise RuntimeError(
-                    "The backend returned an invalid response."
-                )
-
-            conversation_id = (
-                payload.get(
-                    "conversation_id"
-                )
+            response = httpx.post(
+                api_url(backend, "/chat"),
+                json={"question": pending, "conversation_id": st.session_state.conversation_id},
+                timeout=CHAT_TIMEOUT,
             )
-
-            if conversation_id:
-                st.session_state.conversation_id = (
-                    str(
-                        conversation_id
-                    )
-                )
-
-            assistant_message = {
-                "role": "assistant",
-                "content": str(
-                    payload.get(
-                        "answer"
-                    )
-                    or ""
-                ),
-                "status": (
-                    payload.get(
-                        "status"
-                    )
-                ),
-                "sources": (
-                    payload.get(
-                        "sources"
-                    )
-                    or []
-                ),
-                "execution_flow": (
-                    payload.get(
-                        "execution_flow"
-                    )
-                    or []
-                ),
-                "query_plan": (
-                    payload.get(
-                        "query_plan"
-                    )
-                ),
-            }
-
-            st.session_state.messages.append(
-                assistant_message
-            )
-
-            render_assistant_payload(
-                assistant_message
-            )
-
-        except Exception as exc:
-            error_message = (
-                f"Request failed: {exc}"
-            )
-
-            st.error(
-                error_message
-            )
-
+            response.raise_for_status()
+            body = response.json()
+            st.session_state.conversation_id = body["conversation_id"]
             st.session_state.messages.append(
                 {
                     "role": "assistant",
-                    "content": (
-                        error_message
-                    ),
-                    "status": "error",
-                    "sources": [],
-                    "execution_flow": [],
+                    "content": body["answer"],
+                    "sources": body.get("sources") or [],
+                    "execution_flow": body.get("execution_flow") or [],
                 }
             )
+        except Exception as exc:
+            st.session_state.messages.append(
+                {"role": "assistant", "content": request_error_message(exc)}
+            )
+    st.rerun()
