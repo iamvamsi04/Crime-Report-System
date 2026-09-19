@@ -1,184 +1,263 @@
 from __future__ import annotations
 
-import logging
+import math
 import re
-from collections import defaultdict
+from typing import Any, Iterable
 
-from app.models import AnalysisResult, ConflictReport, Evidence, NumericClaim, Source
-
-log = logging.getLogger(__name__)
-
-MISSING_ANSWER = "The requested information was not found in the available documents."
-OUT_OF_SCOPE_ANSWER = "The requested information is outside the available document evidence."
-
-M_SUFFIX = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+from app.models import AnalysisResult, Evidence, Source
 
 
-def sources_from_evidence(evidence: list[Evidence], analysis: list[AnalysisResult] | None = None) -> list[Source]:
+_NUMERIC_RE = re.compile(
+    r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?"
+)
+
+
+def sources_from_evidence(
+    evidence: Iterable[Evidence],
+    analysis: Iterable[AnalysisResult] | None = None,
+) -> list[Source]:
+    """
+    Convert retrieved evidence and structured analysis results into
+    source records exposed by the chat response.
+    """
     sources: list[Source] = []
-    seen: set[str] = set()
+    seen: set[tuple[Any, ...]] = set()
+
     for item in evidence:
-        key = f"{item.document_id}:{item.chunk_id}"
-        if key in seen:
-            continue
-        seen.add(key)
-        excerpt = item.text.strip()
-        if len(excerpt) > 400:
-            excerpt = excerpt[:397] + "..."
-        sources.append(
-            Source(
-                filename=item.filename,
-                document_type=item.document_type,
-                source_reference=item.source_reference,
-                excerpt=excerpt,
-                page_number=item.page_number or None,
-                section=item.section or None,
-                columns=item.columns or None,
-                rows=f"{item.row_start}-{item.row_end}" if item.row_start else None,
-            )
+        source = _source_from_evidence(item)
+
+        key = (
+            source.document_id,
+            source.filename,
+            source.page,
+            source.chunk_id,
         )
-    if analysis:
-        for result in analysis:
-            if not result.source_file:
-                continue
-            key = f"csv:{result.source_file}:{result.operation}"
-            if key in seen:
-                continue
+
+        if key not in seen:
             seen.add(key)
-            sources.append(
-                Source(
-                    filename=result.source_file,
-                    document_type="excel" if result.source_file.lower().endswith((".xlsx", ".xls")) else "csv",
-                    source_reference=f"{result.source_file} ({result.operation})",
-                    excerpt=result.formula or str(result.value),
-                    columns=", ".join(result.columns_used) or None,
-                    rows=str(result.rows_used) if result.rows_used else None,
-                )
-            )
+            sources.append(source)
+
+    for result in analysis or []:
+        source = Source(
+            document_id=result.inputs.get("document_id")
+            if isinstance(result.inputs, dict)
+            else None,
+            filename=result.source_file,
+            page=None,
+            chunk_id=None,
+            excerpt=_analysis_excerpt(result),
+        )
+
+        key = (
+            source.document_id,
+            source.filename,
+            source.page,
+            source.chunk_id,
+        )
+
+        if key not in seen:
+            seen.add(key)
+            sources.append(source)
+
     return sources
 
 
-def validate_evidence(evidence: list[Evidence], analysis: list[AnalysisResult] | None) -> bool:
-    if analysis and any(r.operation not in {"load_csv", "filter"} for r in analysis):
+def validate_evidence(
+    evidence: Iterable[Evidence],
+    analysis: Iterable[AnalysisResult],
+) -> bool:
+    """
+    Determine whether the answer has sufficient grounded evidence.
+
+    A successful structured analysis result is considered valid evidence
+    for numerical/analytical questions. Retrieval evidence is considered
+    valid when at least one usable item is present.
+    """
+    evidence_list = list(evidence)
+    analysis_list = list(analysis)
+
+    if evidence_list:
         return True
-    return bool(evidence)
+
+    for result in analysis_list:
+        if _analysis_result_is_valid(result):
+            return True
+
+    return False
 
 
-def detect_conflicts(evidence: list[Evidence], analysis: list[AnalysisResult] | None = None) -> ConflictReport:
-    claims: list[NumericClaim] = []
-    for item in evidence:
-        claims.extend(_claims_from_text(item))
-    if analysis:
-        for result in analysis:
-            if isinstance(result.value, (int, float)) and result.operation not in {"load_csv", "filter"}:
-                year = None
-                if isinstance(result.inputs.get("to"), int):
-                    year = result.inputs.get("to")
-                claims.append(
-                    NumericClaim(
-                        metric=result.operation,
-                        year=year,
-                        value=float(result.value),
-                        source_filename=result.source_file or "csv",
-                        source_reference=result.source_file or "csv",
-                        excerpt=result.formula or str(result.value),
+def detect_conflicts(
+    evidence: Iterable[Evidence],
+    analysis: Iterable[AnalysisResult],
+) -> list[str]:
+    """
+    Detect obvious numeric conflicts between retrieved evidence and
+    structured analysis results.
+
+    This is intentionally conservative. It only reports conflicts when
+    the same numeric value appears to be represented differently.
+    """
+    evidence_numbers = _extract_evidence_numbers(evidence)
+    conflicts: list[str] = []
+
+    for result in analysis:
+        value_numbers = _extract_result_numbers(result)
+
+        for value in value_numbers:
+            if not _has_close_numeric_match(value, evidence_numbers):
+                continue
+
+        # The analysis result itself is authoritative for the structured
+        # calculation. We only report explicit contradictory numeric
+        # evidence when both sides contain comparable values.
+        if evidence_numbers and value_numbers:
+            unmatched = [
+                value
+                for value in value_numbers
+                if not _has_close_numeric_match(value, evidence_numbers)
+            ]
+
+            if unmatched:
+                conflicts.append(
+                    (
+                        f"Structured analysis from {result.source_file!r} "
+                        f"contains numeric value(s) {unmatched}, while "
+                        "retrieved evidence contains different numeric values."
                     )
                 )
 
-    groups: dict[tuple[str, str | None, int | None, str | None], list[NumericClaim]] = defaultdict(list)
-    for claim in claims:
-        key = (
-            claim.metric.lower(),
-            (claim.entity or "").lower() or None,
-            claim.year,
-            (claim.unit or "").lower() or None,
+    return conflicts
+
+
+def _source_from_evidence(item: Evidence) -> Source:
+    """
+    Build a Source object while tolerating the small differences that may
+    exist between retrieval evidence records.
+    """
+    data = (
+        item.model_dump()
+        if hasattr(item, "model_dump")
+        else dict(item)
+    )
+
+    return Source(
+        document_id=data.get("document_id"),
+        filename=data.get("filename"),
+        page=data.get("page"),
+        chunk_id=data.get("chunk_id"),
+        excerpt=data.get("excerpt") or data.get("text"),
+    )
+
+
+def _analysis_result_is_valid(result: AnalysisResult) -> bool:
+    """
+    A load-only result is not useful as final evidence. A result containing
+    an actual calculation, filtering, sorting, grouping, comparison, etc.
+    is considered structured evidence.
+    """
+    operation = (result.operation or "").strip().lower()
+
+    return operation not in {
+        "",
+        "load_csv",
+        "load",
+    }
+
+
+def _analysis_excerpt(result: AnalysisResult) -> str:
+    """
+    Create a compact source excerpt from a structured analysis result.
+    """
+    parts: list[str] = []
+
+    if result.operation:
+        parts.append(f"Operation: {result.operation}")
+
+    if result.value is not None:
+        parts.append(f"Value: {result.value}")
+
+    if result.table:
+        parts.append(f"Rows: {len(result.table)}")
+
+        # Keep source excerpts compact. The full structured result is
+        # separately supplied to the answer-generation layer.
+        preview = result.table[:5]
+
+        for row in preview:
+            parts.append(str(row))
+
+    if result.formula:
+        parts.append(f"SQL: {result.formula}")
+
+    return "\n".join(parts)
+
+
+def _extract_evidence_numbers(
+    evidence: Iterable[Evidence],
+) -> list[float]:
+    numbers: list[float] = []
+
+    for item in evidence:
+        data = (
+            item.model_dump()
+            if hasattr(item, "model_dump")
+            else dict(item)
         )
-        groups[key].append(claim)
 
-    genuine: list[NumericClaim] = []
-    explanations: list[str] = []
-    for key, group in groups.items():
-        values = {round(c.value, 4) for c in group}
-        files = {c.source_filename for c in group}
-        if len(values) > 1 and len(files) > 1:
-            genuine.extend(group)
-            metric, entity, year, unit = key
-            label = metric
-            if entity:
-                label = f"{entity} {label}"
-            period = f" for {year}" if year else ""
-            unit_s = f" {unit}" if unit else ""
-            parts = [f"{c.source_filename} reports {c.value}{unit_s}" for c in group]
-            explanations.append(
-                f"{label}{period}: " + ", while ".join(parts) + ". The documents contain conflicting values."
-            )
+        for field in ("excerpt", "text", "content"):
+            value = data.get(field)
 
-    report = ConflictReport(
-        genuine=bool(genuine),
-        explanation=" ".join(explanations),
-        claims=genuine or claims,
-    )
-    if report.genuine:
-        log.info("conflict_detection genuine=true claims=%s", len(genuine))
-    else:
-        log.info("conflict_detection genuine=false")
-    return report
+            if not isinstance(value, str):
+                continue
+
+            numbers.extend(_extract_numbers(value))
+
+    return numbers
 
 
-def _claims_from_text(item: Evidence) -> list[NumericClaim]:
-    claims: list[NumericClaim] = []
-    text = item.text
-    year = item.year or _year(text)
-    entity = item.entities or _entity(text)
-    metric_match = re.search(
-        r"(?i)\b(revenue|profit|income|sales|salary|total|amount|cost|expense)\b",
-        text,
-    )
-    metric = metric_match.group(1).lower() if metric_match else ""
-    if not metric:
-        return claims
-    for match in re.finditer(
-        r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*([kmb])?|\b(\d{1,3}(?:,\d{3})+)(?:\.\d+)?\s*([kmb])?\b",
-        text,
-        re.I,
-    ):
-        raw = match.group(1) or match.group(3)
-        suffix = (match.group(2) or match.group(4) or "").lower()
-        if not raw:
+def _extract_result_numbers(
+    result: AnalysisResult,
+) -> list[float]:
+    numbers: list[float] = []
+
+    if result.value is not None:
+        numbers.extend(_extract_numbers(str(result.value)))
+
+    if result.table:
+        for row in result.table:
+            numbers.extend(_extract_numbers(str(row)))
+
+    return numbers
+
+
+def _extract_numbers(text: str) -> list[float]:
+    values: list[float] = []
+
+    for match in _NUMERIC_RE.findall(text):
+        try:
+            values.append(float(match))
+        except ValueError:
             continue
-        number = float(raw.replace(",", ""))
-        if suffix in M_SUFFIX:
-            number *= M_SUFFIX[suffix]
-        has_dollar = match.group(0).strip().startswith("$")
-        claims.append(
-            NumericClaim(
-                metric=metric,
-                entity=entity or None,
-                year=year or None,
-                value=number,
-                unit=("USD" if has_dollar else None),
-                source_filename=item.filename,
-                source_reference=item.source_reference,
-                excerpt=item.text[:240],
-            )
+
+    return values
+
+
+def _has_close_numeric_match(
+    value: float,
+    candidates: list[float],
+) -> bool:
+    for candidate in candidates:
+        tolerance = max(
+            1e-9,
+            abs(value) * 1e-6,
         )
-    return claims
 
+        if math.isclose(
+            value,
+            candidate,
+            rel_tol=1e-6,
+            abs_tol=tolerance,
+        ):
+            return True
 
-def _year(text: str) -> int:
-    match = re.search(r"\b(20\d{2}|19\d{2})\b", text)
-    return int(match.group(1)) if match else 0
-
-
-def _entity(text: str) -> str:
-    near = re.search(
-        r"\b(Engineering|Sales|Marketing|Finance|HR|Operations)\b(?=\s+revenue)",
-        text,
-        re.I,
-    )
-    if near:
-        return near.group(1)
-    match = re.search(r"\b(Engineering|Sales|Marketing|HR|Operations)\b", text, re.I)
-    return match.group(1) if match else ""
-
-
+    return False
