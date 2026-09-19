@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
+
 import truststore
 
 truststore.inject_into_ssl()
-
-import logging
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -17,88 +17,108 @@ from app.errors import AppError, http_error
 from app.gemini import GeminiClient
 from app.storage import Storage
 
-log = logging.getLogger(__name__)
-
+log = logging.getLogger(**name**)
 
 def create_app(
-    settings: Settings | None = None,
-    gemini: object | None = None,
+settings: Settings | None = None,
+gemini: object | None = None,
 ) -> FastAPI:
-    settings = settings or load_settings()
+settings = settings or load_settings()
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        setup_logging()
-        store = Storage(settings)
-        store.init()
-        app.state.settings = settings
-        app.state.store = store
-        app.state.gemini = gemini or GeminiClient(settings)
-        app.state.gemini_is_stub = gemini is not None
-        log.info("application_started model=%s", settings.gemini_model)
-        try:
-            yield
-        finally:
-            store.close()
 
-    app = FastAPI(
-        title="Intelligent Document Analysis System",
-        lifespan=lifespan,
-    )
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging()
+
+    store = Storage(settings)
+    store.init()
+
     app.state.settings = settings
+    app.state.store = store
+    app.state.gemini = gemini or GeminiClient(settings)
+    app.state.gemini_is_stub = gemini is not None
 
-    @app.exception_handler(AppError)
-    async def app_error_handler(
-        _: Request,
-        exc: AppError,
-    ) -> JSONResponse:
-        http_exc = http_error(exc)
-        return JSONResponse(
-            status_code=http_exc.status_code,
-            content={"detail": http_exc.detail},
-        )
+    log.info(
+        "application_started model=%s",
+        settings.gemini_model,
+    )
 
-    @app.exception_handler(RequestValidationError)
-    async def validation_handler(
-        _: Request,
-        exc: RequestValidationError,
-    ) -> JSONResponse:
-        log.info("api_validation_error")
+    try:
+        yield
+    finally:
+        store.close()
+
+app = FastAPI(
+    title="Intelligent Document Analysis System",
+    lifespan=lifespan,
+)
+
+app.state.settings = settings
+
+@app.exception_handler(AppError)
+async def app_error_handler(
+    _: Request,
+    exc: AppError,
+) -> JSONResponse:
+    http_exc = http_error(exc)
+
+    return JSONResponse(
+        status_code=http_exc.status_code,
+        content={
+            "detail": http_exc.detail,
+        },
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(
+    _: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    log.info(
+        "api_validation_error errors=%s",
+        exc.errors(),
+    )
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": "validation_error",
+                "message": "The request is invalid.",
+            }
+        },
+    )
+
+@app.exception_handler(Exception)
+async def unhandled(
+    _: Request,
+    exc: Exception,
+) -> JSONResponse:
+    if isinstance(exc, HTTPException):
         return JSONResponse(
-            status_code=422,
+            status_code=exc.status_code,
             content={
-                "detail": {
-                    "error": "validation_error",
-                    "message": "The request is invalid.",
-                }
+                "detail": exc.detail,
             },
         )
 
-    @app.exception_handler(Exception)
-    async def unhandled(
-        _: Request,
-        exc: Exception,
-    ) -> JSONResponse:
-        if isinstance(exc, HTTPException):
-            return JSONResponse(
-                status_code=exc.status_code,
-                content={"detail": exc.detail},
-            )
+    log.exception(
+        "unhandled_error"
+    )
 
-        log.exception("unhandled_error")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": {
+                "error": "internal_error",
+                "message": "An unexpected error occurred.",
+            }
+        },
+    )
 
-        return JSONResponse(
-            status_code=500,
-            content={
-                "detail": {
-                    "error": "internal_error",
-                    "message": "An unexpected error occurred.",
-                }
-            },
-        )
+app.include_router(router)
 
-    app.include_router(router)
-    return app
+return app
 
 
 app = create_app()
