@@ -1,130 +1,450 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
-import pandas as pd
-
 from app.config import Settings
-from app.errors import StorageError
+from app.errors import RetrievalError
 from app.gemini import GeminiService
-from app.models import Evidence, Intent, QueryPlan
+from app.models import Evidence, QueryPlan
 from app.storage import Storage
+
 
 log = logging.getLogger(__name__)
 
 
+STRUCTURED_TYPES = {
+    "csv",
+    "xlsx",
+    "xls",
+}
+
+RAG_TYPES = {
+    "pdf",
+    "txt",
+}
+
+
 def retrieve_evidence(
-    *,
     plan: QueryPlan,
     question: str,
     store: Storage,
     gemini: GeminiService,
     settings: Settings,
 ) -> list[Evidence]:
-    query = _retrieval_query(plan, question)
-    log.info("retrieval query_len=%s intent=%s", len(query), plan.intent)
-    document_ids = list(plan.document_ids)
-    if not document_ids and plan.document_hints:
-        document_ids = _ids_for_hints(store, plan.document_hints)
+    """
+    Retrieve evidence for unstructured documents using semantic search.
 
-    # Name lookups need original table rows, which summary embeddings can omit.
-    if plan.intent == Intent.FACTUAL_LOOKUP and plan.entities:
-        rows = _matching_table_rows(store, plan.entities, document_ids, settings.retrieval_top_k)
-        if rows:
-            plan.document_ids = list(dict.fromkeys(row.document_id for row in rows))
-            return rows
+    PDF/TXT:
+        question
+            -> embedding
+            -> Chroma
+            -> relevant chunks
 
-    embedding = gemini.embed_texts([query])[0]
-    if len(document_ids) >= 2:
-        merged: list[Evidence] = []
-        per = max(settings.retrieval_top_k // len(document_ids), 3)
-        for doc_id in document_ids:
-            merged.extend(
-                store.query_chunks(
-                    embedding,
-                    n_results=per,
-                    where={"document_id": doc_id},
+    CSV/Excel:
+        return no RAG evidence.
+
+        Structured questions are handled by analyze.py through
+        LLM-generated DuckDB SQL.
+
+    This separation is intentional. We do not use vector similarity or
+    Pandas row scanning as a substitute for SQL over structured data.
+    """
+
+    document_ids = _resolve_document_ids(
+        plan=plan,
+        store=store,
+    )
+
+    if document_ids:
+        document_ids = _filter_to_rag_documents(
+            document_ids,
+            store,
+        )
+
+        if not document_ids:
+            return []
+
+    else:
+        document_ids = _all_ready_rag_documents(
+            store,
+        )
+
+        if not document_ids:
+            return []
+
+    retrieval_query = _retrieval_query(
+        plan=plan,
+        question=question,
+    )
+
+    if not retrieval_query.strip():
+        return []
+
+    try:
+        embedding = gemini.embed_texts(
+            [retrieval_query],
+            task_type="RETRIEVAL_QUERY",
+        )
+    except Exception as exc:
+        log.exception(
+            "retrieval_embedding_failed"
+        )
+        raise RetrievalError(
+            "Could not generate an embedding for the question."
+        ) from exc
+
+    if not embedding:
+        raise RetrievalError(
+            "The embedding service returned no query embedding."
+        )
+
+    query_embedding = embedding[0]
+
+    per_document = _results_per_document(
+        settings.retrieval_top_k,
+        len(document_ids),
+    )
+
+    evidence: list[Evidence] = []
+
+    for document_id in document_ids:
+        try:
+            matches = store.query_chunks(
+                query_embedding,
+                limit=per_document,
+                where={
+                    "document_id": document_id,
+                },
+            )
+        except Exception as exc:
+            log.exception(
+                "chroma_query_failed document_id=%s",
+                document_id,
+            )
+            raise RetrievalError(
+                "Could not search the document index."
+            ) from exc
+
+        for match in matches:
+            similarity = _normalize_similarity(
+                match.similarity
+            )
+
+            if (
+                similarity
+                < settings.retrieval_min_similarity
+            ):
+                continue
+
+            evidence.append(
+                match.model_copy(
+                    update={
+                        "similarity": similarity,
+                    }
                 )
             )
-        hits = merged
-    else:
-        where = _where_filter(document_ids)
-        hits = store.query_chunks(embedding, n_results=settings.retrieval_top_k, where=where)
 
-    kept = [h for h in hits if h.similarity >= settings.retrieval_min_similarity]
-    kept.sort(key=lambda item: item.similarity, reverse=True)
-    unique: list[Evidence] = []
-    seen: set[str] = set()
-    for item in kept:
-        key = f"{item.document_id}:{item.chunk_id}"
+    evidence.sort(
+        key=lambda item: item.similarity,
+        reverse=True,
+    )
+
+    evidence = _deduplicate(
+        evidence
+    )
+
+    return evidence[
+        : settings.retrieval_top_k
+    ]
+
+
+def _resolve_document_ids(
+    plan: QueryPlan,
+    store: Storage,
+) -> list[str]:
+    """
+    Resolve documents explicitly selected by the planner.
+
+    Document IDs are preferred because they are unambiguous.
+    Filename hints are resolved against storage only when IDs are absent.
+    """
+
+    if plan.document_ids:
+        return list(
+            dict.fromkeys(
+                plan.document_ids
+            )
+        )
+
+    if not plan.document_hints:
+        return []
+
+    documents = store.list_documents()
+
+    resolved: list[str] = []
+
+    for hint in plan.document_hints:
+        normalized_hint = (
+            hint.strip().lower()
+        )
+
+        if not normalized_hint:
+            continue
+
+        for document in documents:
+            if document.get(
+                "status"
+            ) != "ready":
+                continue
+
+            filename = str(
+                document.get(
+                    "filename",
+                    "",
+                )
+            ).lower()
+
+            if (
+                normalized_hint in filename
+            ):
+                resolved.append(
+                    str(
+                        document["id"]
+                    )
+                )
+
+    return list(
+        dict.fromkeys(
+            resolved
+        )
+    )
+
+
+def _filter_to_rag_documents(
+    document_ids: list[str],
+    store: Storage,
+) -> list[str]:
+    """
+    Keep only PDF/TXT documents.
+
+    Structured documents are intentionally excluded because their data
+    should be queried through DuckDB.
+    """
+
+    documents = store.list_documents()
+
+    allowed: list[str] = []
+
+    for document in documents:
+        document_id = str(
+            document.get("id")
+        )
+
+        if document_id not in document_ids:
+            continue
+
+        if document.get(
+            "status"
+        ) != "ready":
+            continue
+
+        file_type = str(
+            document.get(
+                "file_type",
+                "",
+            )
+        ).lower()
+
+        if file_type in RAG_TYPES:
+            allowed.append(
+                document_id
+            )
+
+    return list(
+        dict.fromkeys(
+            allowed
+        )
+    )
+
+
+def _all_ready_rag_documents(
+    store: Storage,
+) -> list[str]:
+    """
+    Return all ready PDF/TXT documents.
+
+    CSV/Excel are excluded.
+    """
+
+    documents = store.list_documents()
+
+    result: list[str] = []
+
+    for document in documents:
+        if document.get(
+            "status"
+        ) != "ready":
+            continue
+
+        file_type = str(
+            document.get(
+                "file_type",
+                "",
+            )
+        ).lower()
+
+        if file_type in RAG_TYPES:
+            result.append(
+                str(
+                    document["id"]
+                )
+            )
+
+    return result
+
+
+def _retrieval_query(
+    plan: QueryPlan,
+    question: str,
+) -> str:
+    """
+    Build the semantic retrieval query.
+
+    The original question remains the most important input. Planner
+    information is appended only as disambiguating context.
+    """
+
+    if plan.retrieval_query:
+        base = plan.retrieval_query.strip()
+    elif plan.resolved_question:
+        base = plan.resolved_question.strip()
+    else:
+        base = question.strip()
+
+    if not base:
+        return ""
+
+    context: list[str] = []
+
+    if plan.entities:
+        context.append(
+            "Entities: "
+            + ", ".join(
+                plan.entities
+            )
+        )
+
+    if plan.metrics:
+        context.append(
+            "Metrics: "
+            + ", ".join(
+                plan.metrics
+            )
+        )
+
+    if plan.years:
+        context.append(
+            "Years: "
+            + ", ".join(
+                str(year)
+                for year in plan.years
+            )
+        )
+
+    if plan.document_hints:
+        context.append(
+            "Documents: "
+            + ", ".join(
+                plan.document_hints
+            )
+        )
+
+    if not context:
+        return base
+
+    return (
+        f"{base}\n\n"
+        "Additional retrieval context:\n"
+        + "\n".join(context)
+    )
+
+
+def _results_per_document(
+    total: int,
+    document_count: int,
+) -> int:
+    """
+    Distribute retrieval capacity across multiple documents.
+
+    At least three chunks are requested per selected document when
+    possible, while keeping the total result count bounded.
+    """
+
+    if document_count <= 0:
+        return max(
+            1,
+            total,
+        )
+
+    if total <= 0:
+        return 1
+
+    if document_count == 1:
+        return total
+
+    return max(
+        3,
+        (total + document_count - 1)
+        // document_count,
+    )
+
+
+def _normalize_similarity(
+    value: Any,
+) -> float:
+    try:
+        similarity = float(
+            value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return 0.0
+
+    # Chroma's cosine-distance conversion is handled by Storage.
+    # Clamp here so malformed metadata cannot produce impossible
+    # similarity values.
+    return max(
+        0.0,
+        min(
+            1.0,
+            similarity,
+        ),
+    )
+
+
+def _deduplicate(
+    evidence: list[Evidence],
+) -> list[Evidence]:
+    """
+    Remove duplicate chunks while preserving highest similarity.
+    """
+
+    seen: set[tuple[str, str]] = set()
+    result: list[Evidence] = []
+
+    for item in evidence:
+        key = (
+            item.document_id,
+            item.chunk_id,
+        )
+
         if key in seen:
             continue
+
         seen.add(key)
-        unique.append(item)
-    log.info("retrieval_hits raw=%s kept=%s", len(hits), len(unique))
-    return unique[: settings.retrieval_top_k]
+        result.append(item)
 
-
-def _matching_table_rows(
-    store: Storage, entities: list[str], document_ids: list[str], limit: int,
-) -> list[Evidence]:
-    names = [re.escape(entity.strip()) for entity in entities if entity.strip()]
-    if not names:
-        return []
-    pattern = r"(?<!\w)(?:" + "|".join(names) + r")(?!\w)"
-    hits: list[Evidence] = []
-    for doc in store.list_documents(ready_only=True):
-        if doc["file_type"] not in {"csv", "excel"} or (document_ids and doc["id"] not in document_ids):
-            continue
-        try:
-            path = store.document_file(doc["id"])
-            frame = pd.read_excel(path, sheet_name=0) if doc["file_type"] == "excel" else pd.read_csv(path)
-        except Exception as exc:
-            raise StorageError("The dataset could not be read for this lookup.") from exc
-        matches = frame.astype(str).apply(lambda col: col.str.contains(pattern, case=False, na=False)).any(axis=1)
-        for idx, row in frame[matches].iterrows():
-            row_number = int(idx) + 2
-            text = ", ".join(f"{column}={value}" for column, value in row.items() if pd.notna(value))
-            hits.append(Evidence(
-                document_id=doc["id"], filename=doc["filename"], document_type=doc["file_type"],
-                chunk_id=f"row-{row_number}", text=text, similarity=1.0,
-                source_reference=f"{doc['filename']}, rows {row_number}-{row_number}",
-                row_start=row_number, row_end=row_number, columns=", ".join(map(str, frame.columns)),
-                entities=", ".join(entities),
-            ))
-            if len(hits) >= limit:
-                return hits
-    return hits
-
-
-def _retrieval_query(plan: QueryPlan, question: str) -> str:
-    if plan.retrieval_query:
-        return plan.retrieval_query
-    parts = [question, plan.intent.value]
-    parts.extend(plan.entities)
-    parts.extend(plan.metrics)
-    parts.extend(str(y) for y in plan.years)
-    parts.extend(plan.document_hints)
-    return " ".join(p for p in parts if p)
-
-
-def _ids_for_hints(store: Storage, hints: list[str]) -> list[str]:
-    docs = store.list_documents(ready_only=True)
-    ids: list[str] = []
-    lowered = [h.lower() for h in hints]
-    for doc in docs:
-        name = doc["filename"].lower()
-        if any(h in name or name in h for h in lowered):
-            ids.append(doc["id"])
-    return ids
-
-
-def _where_filter(document_ids: list[str]) -> dict[str, Any] | None:
-    if len(document_ids) == 1:
-        return {"document_id": document_ids[0]}
-    if len(document_ids) > 1:
-        return {"document_id": {"$in": document_ids}}
-    return None
-
+    return result
