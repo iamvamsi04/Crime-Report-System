@@ -71,44 +71,43 @@ percentage_change,
 yoy,
 compare.
 
-IMPORTANT CSV RULES:
+IMPORTANT STRUCTURED-DATA RULES:
 
 1. CSV and Excel files are structured tabular data.
-   Use Pandas analysis operations for questions that ask for values from CSV/Excel.
 
-2. Do NOT use retrieve-only for a CSV/Excel numerical question.
+2. For CSV/Excel numerical questions, use structured analysis operations.
+   Do NOT use retrieve-only for a question that requires calculation
+   from CSV/Excel rows.
 
-3. For an exact numeric lookup in a CSV/Excel file, use:
+3. The analysis engine executes these operations using DuckDB SQL.
+   Do NOT assume Pandas is used for calculation.
+
+4. For an exact numeric lookup in a CSV/Excel file, use:
    load_csv
    + filter operation(s)
    + an aggregation/value operation on the requested numeric column.
 
-4. When the user asks for the value of a numeric column for specific rows,
-   use "sum" as the final operation if the filters identify the intended row(s).
-   For a single matching row, sum returns that row's numeric value.
-
-5. Examples:
+5. For example:
 
    Question:
    "How many units were sold on 1/10/2014 for the product Carretera?"
 
-   If the catalog contains Product, Date, and Units Sold columns, plan:
+   If the dataset contains Product, Date, and Units Sold:
    load_csv
    filter Product = Carretera
    filter Date = 1/10/2014
    sum Units Sold
 
-   Question:
+6. For:
    "What was the total revenue in 2013?"
 
-   If the catalog contains Year and Revenue columns, plan:
+   If the dataset contains Year and Revenue:
    load_csv
    filter Year = 2013
    sum Revenue
 
-6. The requested metric must NEVER be used as the filter value.
+7. The requested metric must NEVER be used as the filter value.
 
-   For example:
    "units sold for Carretera"
    means:
    metric = Units Sold
@@ -117,46 +116,64 @@ IMPORTANT CSV RULES:
    It does NOT mean:
    filter Units Sold = Carretera.
 
-7. Use column names from the supplied document catalog whenever possible.
+8. Use column names from the supplied document catalog whenever possible.
 
-8. For dates, preserve the user's date value in the filter.
-   The analysis layer will normalize date formats.
+9. Never invent documents, columns, years, entities, or values.
 
-9. For a question asking "how many units", "number of units", or "units sold",
-   identify the actual numeric Units Sold column if it exists.
-   Do NOT use count unless the user is asking how many rows/records exist.
+10. For dates, preserve the user's date value in the filter.
 
-10. "total revenue", "total sales", etc. mean sum of the corresponding numeric column.
+11. For a question asking:
+    "how many units",
+    "number of units",
+    "units sold",
+    identify the numeric Units Sold column if it exists.
 
-11. "average revenue" means average of the Revenue column.
+    Do NOT use count unless the user is asking how many rows/records exist.
 
-12. "minimum revenue" means min of the Revenue column.
+12. "total revenue", "total sales", etc. mean SUM of the corresponding
+    numeric column.
 
-13. "maximum revenue" means max of the Revenue column.
+13. "average revenue" means AVG/average of the Revenue column.
 
-14. If the question contains a year and the dataset has a Year column,
-   create a filter operation for that Year.
+14. "minimum revenue" means MIN of the Revenue column.
 
-15. If the question contains a product/entity and the dataset has a matching
-   product/entity column, create a filter operation for that value.
+15. "maximum revenue" means MAX of the Revenue column.
 
-16. If the question contains a date and the dataset has a Date column,
-   create a filter operation for that date.
+16. If the question contains a year and the dataset has a Year column,
+    create a filter for that year when the question asks about that specific
+    year.
 
-17. Never invent documents, columns, years, entities, or values.
+17. If the question contains a product/entity and the dataset has a matching
+    entity/product column, identify the entity and allow the analysis layer
+    to filter it.
 
-18. For non-CSV document questions, retrieve relevant evidence normally.
+18. For ranking questions, use rank or sort and provide the requested
+    metric/column.
 
-19. If it is a follow-up, set is_follow_up true and resolve missing information
-   using the conversation context.
+19. For grouping questions such as:
+    "sales by department"
+    use groupby with the appropriate entity column and numeric value column.
 
-20. If a question requires both CSV calculation and document evidence,
-   include both the appropriate CSV operations and retrieve.
+20. For percentage-change questions, use percentage_change.
 
-21. Never perform arithmetic yourself. Pandas analysis operations must calculate
-   numerical results.
+21. For year-over-year questions, use yoy.
 
-22. document_hints must contain filenames from the supplied catalog when relevant.
+22. For comparing two entities, use compare.
+
+23. For questions involving multiple documents or both document evidence
+    and CSV calculations, include retrieve as well as the appropriate
+    structured-data operations.
+
+24. Never perform arithmetic yourself. The DuckDB analysis layer calculates
+    numerical results.
+
+25. If the question is a normal document question, use retrieve.
+
+26. If it is a follow-up, set is_follow_up true and resolve missing
+    information using the conversation context.
+
+27. document_hints must contain filenames from the supplied document catalog
+    when a particular document is relevant.
 """
 
 
@@ -188,10 +205,12 @@ def build_plan(
                 item["year_columns"] = profile.get("year_columns") or []
                 item["entity_columns"] = profile.get("entity_columns") or []
                 item["numeric_columns"] = profile.get("numeric_columns") or []
-                item["date_columns"] = profile.get("date_columns") or []
 
             except (json.JSONDecodeError, TypeError):
-                pass
+                log.warning(
+                    "invalid_csv_profile document_id=%s",
+                    doc.get("id"),
+                )
 
         catalog.append(item)
 
@@ -210,7 +229,10 @@ def build_plan(
         bool(context.last_question),
     )
 
-    raw = gemini.generate_json(PLAN_SYSTEM, user)
+    raw = gemini.generate_json(
+        PLAN_SYSTEM,
+        user,
+    )
 
     try:
         plan = QueryPlan.model_validate(raw)
@@ -219,7 +241,11 @@ def build_plan(
             "Question understanding returned an invalid plan."
         ) from exc
 
-    plan = _merge_follow_up(plan, context, question)
+    plan = _merge_follow_up(
+        plan,
+        context,
+        question,
+    )
 
     new_entities = {
         e.casefold()
@@ -229,9 +255,13 @@ def build_plan(
         for e in context.entities
     }
 
-    if (context.entities and new_entities) or context.last_answer == MISSING_ANSWER:
+    if (
+        (context.entities and new_entities)
+        or context.last_answer == MISSING_ANSWER
+    ):
         previous_docs = [
-            d for d in documents
+            d
+            for d in documents
             if d["id"] in context.document_ids
         ]
 
@@ -244,7 +274,9 @@ def build_plan(
             name in question.casefold()
             for name in previous_names
         ):
-            if set(plan.document_ids).issubset(context.document_ids):
+            if set(plan.document_ids).issubset(
+                context.document_ids
+            ):
                 plan.document_ids = []
 
             plan.document_hints = [
@@ -271,7 +303,8 @@ def build_plan(
     }
 
     plan.document_ids = [
-        i for i in plan.document_ids
+        i
+        for i in plan.document_ids
         if i in known_ids
     ]
 
@@ -289,7 +322,10 @@ def _merge_follow_up(
     context: ConversationContext,
     question: str,
 ) -> QueryPlan:
-    follow_up = plan.is_follow_up or _looks_like_follow_up(question)
+    follow_up = (
+        plan.is_follow_up
+        or _looks_like_follow_up(question)
+    )
 
     if not follow_up:
         mentioned = _entities_in_text(question)
@@ -317,10 +353,14 @@ def _merge_follow_up(
     elif mentioned:
         plan.entities = mentioned
     elif not plan.entities:
-        plan.entities = list(context.entities)
+        plan.entities = list(
+            context.entities
+        )
 
     if not plan.metrics:
-        plan.metrics = list(context.metrics)
+        plan.metrics = list(
+            context.metrics
+        )
 
     if any(
         token in q
@@ -330,21 +370,30 @@ def _merge_follow_up(
             "prior year",
         )
     ) and context.years:
-        plan.years = [context.years[-1] - 1]
+        plan.years = [
+            context.years[-1] - 1
+        ]
 
     elif not plan.years:
         years = _years_in_text(question)
-        plan.years = years or list(context.years)
+        plan.years = (
+            years
+            or list(context.years)
+        )
 
     if not plan.document_ids:
-        plan.document_ids = list(context.document_ids)
+        plan.document_ids = list(
+            context.document_ids
+        )
 
     if plan.intent in {
         Intent.FOLLOW_UP_QUESTION,
         Intent.AMBIGUOUS,
     } and context.last_intent:
         try:
-            plan.intent = Intent(context.last_intent)
+            plan.intent = Intent(
+                context.last_intent
+            )
         except ValueError:
             plan.intent = Intent.NUMERICAL_LOOKUP
 
@@ -358,22 +407,27 @@ def _apply_csv_normalization(
     documents: list[dict[str, Any]],
 ) -> QueryPlan:
     """
-    Normalize Gemini's plan using the actual CSV/Excel schema.
+    Normalize a Gemini-generated plan against the actual CSV/Excel schema.
 
-    This does not contain product names, dates, or dataset-specific values.
-    It only uses the schema/profile supplied by the uploaded dataset.
+    This function decides WHAT structured operation is required.
+
+    The actual calculation is performed later by DuckDB in analyze.py.
     """
 
     csv_docs = [
-        d for d in documents
+        d
+        for d in documents
         if d["file_type"] in {"csv", "excel"}
     ]
 
     if not csv_docs:
         return plan
 
-    # Do not modify conversational history/repeat plans here.
-    if getattr(plan, "conversation_intent", "normal") in {
+    if getattr(
+        plan,
+        "conversation_intent",
+        "normal",
+    ) in {
         "history",
         "repeat",
     }:
@@ -421,38 +475,15 @@ def _apply_csv_normalization(
         )
     ]
 
-    date_columns = [
-        str(c)
-        for c in (
-            profile.get("date_columns")
-            or []
-        )
-    ]
+    if not columns:
+        return plan
 
     q = question.casefold()
 
-    # If Gemini already produced real CSV operations, preserve them,
-    # but repair malformed filter/metric relationships.
-    csv_ops = [
-        op for op in plan.operations
-        if op.op in {
-            "load_csv",
-            "sum",
-            "average",
-            "min",
-            "max",
-            "count",
-            "filter",
-            "sort",
-            "rank",
-            "groupby",
-            "percentage_change",
-            "yoy",
-            "compare",
-        }
-    ]
+    # ---------------------------------------------------------
+    # Resolve metric
+    # ---------------------------------------------------------
 
-    # Determine the requested numeric metric from the actual schema.
     metric_column = _find_metric_column(
         question=question,
         columns=columns,
@@ -465,46 +496,88 @@ def _apply_csv_normalization(
             metric_column
         ]
 
-    # Detect explicit year from the question.
+    # ---------------------------------------------------------
+    # Resolve years
+    # ---------------------------------------------------------
+
     years = _years_in_text(question)
 
     if years:
         plan.years = years
 
-    # Build filters from actual schema.
+    # ---------------------------------------------------------
+    # Resolve operation type BEFORE constructing operations.
+    #
+    # This is important for YoY/percentage/ranking/grouping.
+    # ---------------------------------------------------------
+
+    operation_name = _determine_operation(
+        question=question,
+        plan=plan,
+    )
+
+    # ---------------------------------------------------------
+    # Determine entity column
+    # ---------------------------------------------------------
+
+    entity_column = _find_entity_column(
+        columns=columns,
+        entity_columns=entity_columns,
+        question=question,
+    )
+
+    # ---------------------------------------------------------
+    # Build filters
+    # ---------------------------------------------------------
+
     filters: list[PlanOp] = []
 
-    # Year filter.
-    if plan.years and year_columns:
-        year_column = year_columns[0]
-
+    # Year filter is appropriate for a single explicit year.
+    #
+    # Do NOT add this for a two-year comparison because the SQL
+    # needs both years.
+    if (
+        len(plan.years) == 1
+        and year_columns
+        and operation_name
+        not in {
+            "percentage_change",
+            "yoy",
+        }
+    ):
         filters.append(
             PlanOp(
                 op="filter",
-                column=year_column,
+                column=year_columns[0],
                 value=plan.years[0],
             )
         )
 
-    # Entity/product filter.
-    if plan.entities and entity_columns:
-        entity_column = _find_entity_column(
-            columns=columns,
-            entity_columns=entity_columns,
-            question=question,
+    # Entity filter.
+    #
+    # For compare, the SQL needs both entities, so don't reduce the
+    # dataset to only one entity.
+    if (
+        len(plan.entities) == 1
+        and entity_column
+        and operation_name != "compare"
+    ):
+        filters.append(
+            PlanOp(
+                op="filter",
+                column=entity_column,
+                value=plan.entities[0],
+            )
         )
 
-        if entity_column:
-            filters.append(
-                PlanOp(
-                    op="filter",
-                    column=entity_column,
-                    value=plan.entities[0],
-                )
-            )
-
     # Date filter.
-    date_value = _extract_date_value(question)
+    date_value = _extract_date_value(
+        question
+    )
+
+    date_columns = _find_date_columns(
+        columns
+    )
 
     if date_value and date_columns:
         filters.append(
@@ -515,94 +588,303 @@ def _apply_csv_normalization(
             )
         )
 
-    # Also use Gemini-provided filters, but repair their columns when
-    # they appear to confuse a numeric metric with an entity/date/year.
-    for existing in csv_ops:
+    # Preserve valid Gemini-generated filters.
+    for existing in plan.operations:
         if existing.op != "filter":
             continue
 
         column = existing.column
         value = existing.value
 
-        if column:
-            resolved = _resolve_column_name(
-                columns,
-                column,
-            )
-
-            if resolved:
-                column = resolved
-
-        if value is None:
+        if not column or value is None:
             continue
 
-        if column and column not in columns:
+        resolved = _resolve_column_name(
+            columns,
+            column,
+        )
+
+        if resolved is None:
+            continue
+
+        # Never allow a numeric metric to become an entity filter.
+        if (
+            resolved in numeric_columns
+            and isinstance(value, str)
+            and entity_column
+            and _value_exists(
+                profile=profile,
+                column=entity_column,
+                value=value,
+            )
+        ):
             continue
 
         filters.append(
             PlanOp(
                 op="filter",
-                column=column,
+                column=resolved,
                 value=value,
             )
         )
 
-    filters = _deduplicate_filters(filters)
-
-    # Determine the intended aggregation.
-    aggregation = _requested_aggregation(
-        question,
-        plan,
+    filters = _deduplicate_filters(
+        filters
     )
 
-    # Numeric CSV question:
-    # construct a complete structured-data operation chain.
-    if metric_column and _is_numeric_csv_question(
+    # ---------------------------------------------------------
+    # Construct operation chain
+    # ---------------------------------------------------------
+
+    if metric_column and _is_structured_numeric_question(
         question=question,
         metric_column=metric_column,
         columns=columns,
     ):
-        ops: list[PlanOp] = [
+        operations: list[PlanOp] = [
             PlanOp(
                 op="load_csv",
                 filename_hint=doc["filename"],
             )
         ]
 
-        ops.extend(filters)
+        operations.extend(filters)
 
-        ops.append(
-            PlanOp(
-                op=aggregation,
-                column=metric_column,
-                value_column=metric_column,
+        if operation_name in {
+            "percentage_change",
+            "yoy",
+        }:
+            operations.append(
+                PlanOp(
+                    op=operation_name,
+                    column=metric_column,
+                    value_column=metric_column,
+                    from_year=(
+                        min(plan.years)
+                        if len(plan.years) >= 2
+                        else None
+                    ),
+                    to_year=(
+                        max(plan.years)
+                        if len(plan.years) >= 2
+                        else None
+                    ),
+                )
             )
-        )
 
-        plan.operations = ops
+        elif operation_name == "groupby":
+            operations.append(
+                PlanOp(
+                    op="groupby",
+                    column=(
+                        entity_column
+                        or (
+                            entity_columns[0]
+                            if entity_columns
+                            else None
+                        )
+                    ),
+                    value_column=metric_column,
+                    agg="sum",
+                )
+            )
 
-        if aggregation == "sum":
-            plan.intent = Intent.SUM
-        elif aggregation == "average":
-            plan.intent = Intent.AVERAGE
-        elif aggregation == "min":
-            plan.intent = Intent.MINIMUM
-        elif aggregation == "max":
-            plan.intent = Intent.MAXIMUM
-        elif aggregation == "count":
-            plan.intent = Intent.NUMERICAL_LOOKUP
+        elif operation_name == "compare":
+            operations.append(
+                PlanOp(
+                    op="compare",
+                    column=metric_column,
+                    value_column=metric_column,
+                    target=entity_column,
+                )
+            )
+
+        elif operation_name in {
+            "rank",
+            "sort",
+        }:
+            operations.append(
+                PlanOp(
+                    op=operation_name,
+                    column=metric_column,
+                    value_column=metric_column,
+                    n=10,
+                    ascending=False,
+                )
+            )
+
         else:
-            plan.intent = Intent.CSV_AGGREGATION
+            operations.append(
+                PlanOp(
+                    op=operation_name,
+                    column=metric_column,
+                    value_column=metric_column,
+                )
+            )
 
-        plan.document_ids = [doc["id"]]
-        plan.document_hints = [doc["filename"]]
+        # If this question also requires document evidence,
+        # preserve retrieve alongside the structured analysis.
+        if _requires_document_retrieval(
+            plan
+        ) and not any(
+            op.op == "retrieve"
+            for op in operations
+        ):
+            operations.insert(
+                0,
+                PlanOp(op="retrieve"),
+            )
+
+        plan.operations = operations
+
+        plan.document_ids = [
+            doc["id"]
+        ]
+        plan.document_hints = [
+            doc["filename"]
+        ]
+
+        plan.intent = _intent_for_operation(
+            operation_name
+        )
 
         return plan
 
     return plan
 
 
-def _is_numeric_csv_question(
+def _determine_operation(
+    *,
+    question: str,
+    plan: QueryPlan,
+) -> str:
+    q = question.casefold()
+
+    # Explicit comparison first.
+    if (
+        len(plan.entities) >= 2
+        and (
+            "compare" in q
+            or "difference between" in q
+            or "versus" in q
+            or " vs " in q
+        )
+    ):
+        return "compare"
+
+    # YoY must be checked before generic "growth".
+    if (
+        "year-over-year" in q
+        or "year over year" in q
+        or "yoy" in q
+        or "previous year" in q
+        or "last year" in q
+        or "prior year" in q
+    ):
+        return "yoy"
+
+    if (
+        "percentage change" in q
+        or "percent change" in q
+        or "percentage increase" in q
+        or "percentage decrease" in q
+        or "percent increase" in q
+        or "percent decrease" in q
+    ):
+        return "percentage_change"
+
+    if (
+        "group by" in q
+        or "by department" in q
+        or "by product" in q
+        or "by company" in q
+        or "by category" in q
+        or "by division" in q
+    ):
+        return "groupby"
+
+    if (
+        "rank" in q
+        or "top " in q
+        or "highest" in q
+        or "lowest" in q
+    ):
+        return "rank"
+
+    if (
+        "sort" in q
+        or "sorted" in q
+        or "order by" in q
+    ):
+        return "sort"
+
+    if (
+        "average" in q
+        or "avg" in q
+        or "mean" in q
+    ):
+        return "average"
+
+    if (
+        "minimum" in q
+        or "lowest value" in q
+        or "smallest value" in q
+    ):
+        return "min"
+
+    if (
+        "maximum" in q
+        or "highest value" in q
+        or "largest value" in q
+    ):
+        return "max"
+
+    if (
+        "how many rows" in q
+        or "how many records" in q
+        or "number of rows" in q
+        or "number of records" in q
+    ):
+        return "count"
+
+    # Default numeric lookup is SUM.
+    return "sum"
+
+
+def _requires_document_retrieval(
+    plan: QueryPlan,
+) -> bool:
+    return any(
+        op.op == "retrieve"
+        for op in plan.operations
+    )
+
+
+def _intent_for_operation(
+    operation: str,
+) -> Intent:
+    mapping = {
+        "sum": Intent.SUM,
+        "average": Intent.AVERAGE,
+        "min": Intent.MINIMUM,
+        "max": Intent.MAXIMUM,
+        "count": Intent.NUMERICAL_LOOKUP,
+        "rank": Intent.RANKING,
+        "sort": Intent.SORTING,
+        "filter": Intent.FILTERING,
+        "groupby": Intent.CSV_AGGREGATION,
+        "percentage_change": Intent.PERCENTAGE_CHANGE,
+        "yoy": Intent.YEAR_OVER_YEAR_COMPARISON,
+        "compare": Intent.ENTITY_COMPARISON,
+    }
+
+    return mapping.get(
+        operation,
+        Intent.CSV_AGGREGATION,
+    )
+
+
+def _is_structured_numeric_question(
     *,
     question: str,
     metric_column: str,
@@ -636,10 +918,22 @@ def _is_numeric_csv_question(
         "value",
         "growth",
         "percentage",
+        "percent",
         "%",
+        "rank",
+        "top",
+        "highest",
+        "lowest",
+        "compare",
+        "difference",
+        "group",
+        "by ",
     )
 
-    return any(term in q for term in numeric_terms)
+    return any(
+        term in q
+        for term in numeric_terms
+    )
 
 
 def _find_metric_column(
@@ -657,13 +951,21 @@ def _find_metric_column(
             metric,
         )
 
-        if resolved and resolved in columns:
+        if (
+            resolved
+            and resolved in columns
+            and (
+                not numeric_columns
+                or resolved in numeric_columns
+            )
+        ):
             return resolved
 
     q = question.casefold()
 
-    # Exact/near column-name matching.
-    candidates: list[tuple[int, str]] = []
+    candidates: list[
+        tuple[int, str]
+    ] = []
 
     for column in numeric_columns:
         normalized = column.casefold()
@@ -675,15 +977,20 @@ def _find_metric_column(
 
         words = [
             word
-            for word in re.split(r"[^a-z0-9]+", normalized)
+            for word in re.split(
+                r"[^a-z0-9]+",
+                normalized,
+            )
             if word
         ]
 
         for word in words:
-            if len(word) >= 3 and word in q:
+            if (
+                len(word) >= 3
+                and word in q
+            ):
                 score += 10
 
-        # Natural-language aliases.
         if normalized in {
             "units sold",
             "units",
@@ -703,10 +1010,16 @@ def _find_metric_column(
         ):
             score += 80
 
-        if "profit" in normalized and "profit" in q:
+        if (
+            "profit" in normalized
+            and "profit" in q
+        ):
             score += 80
 
-        if "sales" in normalized and "sales" in q:
+        if (
+            "sales" in normalized
+            and "sales" in q
+        ):
             score += 60
 
         if score:
@@ -722,6 +1035,7 @@ def _find_metric_column(
             key=lambda item: item[0],
             reverse=True,
         )
+
         return candidates[0][1]
 
     return None
@@ -738,68 +1052,25 @@ def _find_entity_column(
 
     q = question.casefold()
 
-    # Prefer product columns when the question explicitly discusses
-    # a product.
     for column in entity_columns:
         normalized = column.casefold()
 
-        if "product" in normalized and "product" in q:
+        if (
+            "product" in normalized
+            and "product" in q
+        ):
             return column
 
-    # Otherwise use the first known entity column.
+    for column in entity_columns:
+        normalized = column.casefold()
+
+        if (
+            "department" in normalized
+            and "department" in q
+        ):
+            return column
+
     return entity_columns[0]
-
-
-def _requested_aggregation(
-    question: str,
-    plan: QueryPlan,
-) -> str:
-    q = question.casefold()
-
-    if any(
-        term in q
-        for term in (
-            "average",
-            "avg",
-            "mean",
-        )
-    ):
-        return "average"
-
-    if any(
-        term in q
-        for term in (
-            "minimum",
-            "minimum value",
-            "lowest",
-            "smallest",
-        )
-    ):
-        return "min"
-
-    if any(
-        term in q
-        for term in (
-            "maximum",
-            "maximum value",
-            "highest",
-            "largest",
-        )
-    ):
-        return "max"
-
-    # "how many rows/records" means count.
-    if (
-        "how many rows" in q
-        or "how many records" in q
-        or "number of records" in q
-        or "number of rows" in q
-    ):
-        return "count"
-
-    # A requested numeric field such as Units Sold should be summed
-    # when the question asks for its value for matching rows.
-    return "sum"
 
 
 def _choose_csv_document(
@@ -816,8 +1087,14 @@ def _choose_csv_document(
         hint_lower = hint.casefold()
 
         for doc in csv_docs:
-            if hint_lower in doc["filename"].casefold():
+            if (
+                hint_lower
+                in doc["filename"].casefold()
+            ):
                 return doc
+
+    if len(csv_docs) == 1:
+        return csv_docs[0]
 
     return csv_docs[0] if csv_docs else None
 
@@ -835,7 +1112,10 @@ def _get_profile(
 
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (
+        json.JSONDecodeError,
+        TypeError,
+    ):
         return {}
 
 
@@ -848,12 +1128,10 @@ def _resolve_column_name(
 
     target = name.strip().casefold()
 
-    # Exact match.
     for column in columns:
         if column.casefold() == target:
             return column
 
-    # Normalized match.
     normalized_target = re.sub(
         r"[^a-z0-9]+",
         " ",
@@ -867,14 +1145,19 @@ def _resolve_column_name(
             column.casefold(),
         ).strip()
 
-        if normalized_column == normalized_target:
+        if (
+            normalized_column
+            == normalized_target
+        ):
             return column
 
-    # Safe substring match.
     for column in columns:
         lowered = column.casefold()
 
-        if target in lowered or lowered in target:
+        if (
+            target in lowered
+            or lowered in target
+        ):
             return column
 
     return None
@@ -884,7 +1167,9 @@ def _deduplicate_filters(
     filters: list[PlanOp],
 ) -> list[PlanOp]:
     result: list[PlanOp] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[
+        tuple[str, str]
+    ] = set()
 
     for op in filters:
         if not op.column:
@@ -904,13 +1189,32 @@ def _deduplicate_filters(
     return result
 
 
+def _find_date_columns(
+    columns: list[str],
+) -> list[str]:
+    result: list[str] = []
+
+    for column in columns:
+        normalized = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            column.casefold(),
+        ).strip("_")
+
+        if (
+            normalized == "date"
+            or normalized.endswith("_date")
+            or normalized.startswith("date_")
+            or "date" in normalized
+        ):
+            result.append(column)
+
+    return result
+
+
 def _extract_date_value(
     question: str,
 ) -> str | None:
-    # Numeric dates such as:
-    # 1/10/2014
-    # 01/10/2014
-    # 1-10-2014
     match = re.search(
         r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
         question,
@@ -919,14 +1223,12 @@ def _extract_date_value(
     if match:
         return match.group(0)
 
-    # Text dates such as:
-    # October 10, 2014
-    # 10 October 2014
     match = re.search(
         r"\b(?:"
         r"january|february|march|april|may|june|july|august|"
         r"september|october|november|december"
-        r")\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b",
+        r")\s+\d{1,2}(?:st|nd|rd|th)?"
+        r"(?:,\s*|\s+)\d{4}\b",
         question,
         re.I,
     )
@@ -949,6 +1251,41 @@ def _extract_date_value(
     return None
 
 
+def _value_exists(
+    *,
+    profile: dict[str, Any],
+    column: str,
+    value: Any,
+) -> bool:
+    """
+    csv_profile intentionally does not store every dataset value.
+
+    Therefore this function only handles values when a future profile
+    explicitly provides sample/known values. It returns False otherwise,
+    meaning the filter is preserved rather than discarded.
+    """
+
+    samples = profile.get(
+        "sample_values"
+    )
+
+    if not isinstance(samples, dict):
+        return False
+
+    values = samples.get(column)
+
+    if not isinstance(values, list):
+        return False
+
+    target = str(value).strip().casefold()
+
+    return any(
+        str(item).strip().casefold()
+        == target
+        for item in values
+    )
+
+
 def _apply_heuristics(
     plan: QueryPlan,
     question: str,
@@ -957,130 +1294,24 @@ def _apply_heuristics(
     """
     Lightweight deterministic normalization.
 
-    This is only for structured operation normalization.
-    Conversation intent is handled semantically by Gemini.
+    This function does not perform calculations.
+    DuckDB performs all CSV/Excel calculations later.
     """
 
-    # History/repeat plans must not become retrieval plans.
-    if getattr(plan, "conversation_intent", "normal") in {
+    if getattr(
+        plan,
+        "conversation_intent",
+        "normal",
+    ) in {
         "history",
         "repeat",
     }:
         return plan
 
-    q = question.lower()
-
-    csv_docs = [
-        d for d in documents
-        if d["file_type"] in {"csv", "excel"}
-    ]
-
-    numeric_map = {
-        "sum": "sum",
-        "total": "sum",
-        "average": "average",
-        "avg": "average",
-        "mean": "average",
-        "minimum": "min",
-        "min ": "min",
-        "maximum": "max",
-        "max ": "max",
-        "rank": "rank",
-        "sort": "sort",
-        "filter": "filter",
-        "percentage": "percentage_change",
-        "percent": "percentage_change",
-        "year-over-year": "yoy",
-        "year over year": "yoy",
-        "yoy": "yoy",
-        "growth": "yoy",
-    }
-
-    # Only apply these heuristics when CSV exists.
-    if csv_docs and any(
-        key in q
-        for key in numeric_map
-    ):
-        op_name = next(
-            numeric_map[key]
-            for key in numeric_map
-            if key in q
-        )
-
-        # If CSV normalization already produced a proper structured plan,
-        # do not destroy it.
-        has_load = any(
-            op.op == "load_csv"
-            for op in plan.operations
-        )
-
-        has_metric_op = any(
-            op.op in {
-                "sum",
-                "average",
-                "min",
-                "max",
-                "count",
-                "rank",
-                "sort",
-                "percentage_change",
-                "yoy",
-                "compare",
-            }
-            for op in plan.operations
-        )
-
-        if not has_load and not has_metric_op:
-            hint = csv_docs[0]["filename"]
-
-            operations = [
-                PlanOp(
-                    op="load_csv",
-                    filename_hint=hint,
-                )
-            ]
-
-            if plan.metrics:
-                metric = plan.metrics[0]
-
-                operations.append(
-                    PlanOp(
-                        op=op_name,
-                        column=metric,
-                    )
-                )
-            else:
-                operations.append(
-                    PlanOp(
-                        op=op_name,
-                    )
-                )
-
-            plan.operations = operations
-
-        if plan.intent in {
-            Intent.FACTUAL_LOOKUP,
-            Intent.FOLLOW_UP_QUESTION,
-        }:
-            mapping = {
-                "sum": Intent.SUM,
-                "average": Intent.AVERAGE,
-                "min": Intent.MINIMUM,
-                "max": Intent.MAXIMUM,
-                "rank": Intent.RANKING,
-                "sort": Intent.SORTING,
-                "filter": Intent.FILTERING,
-                "percentage_change": Intent.PERCENTAGE_CHANGE,
-                "yoy": Intent.YEAR_OVER_YEAR_COMPARISON,
-            }
-
-            plan.intent = mapping.get(
-                op_name,
-                Intent.CSV_AGGREGATION,
-            )
-
     if not plan.years:
-        plan.years = _years_in_text(question)
+        plan.years = _years_in_text(
+            question
+        )
 
     if not plan.operations:
         plan.operations = [
@@ -1107,14 +1338,17 @@ def _looks_like_follow_up(
     ):
         return True
 
-    if len(q.split()) <= 10 and q.startswith(
-        (
-            "what about",
-            "how about",
-            "and ",
-            "same for",
-            "now ",
-            "and what",
+    if (
+        len(q.split()) <= 10
+        and q.startswith(
+            (
+                "what about",
+                "how about",
+                "and ",
+                "same for",
+                "now ",
+                "and what",
+            )
         )
     ):
         return True
