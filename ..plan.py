@@ -71,43 +71,48 @@ percentage_change,
 yoy,
 compare.
 
-IMPORTANT STRUCTURED-DATA RULES:
+IMPORTANT CSV/EXCEL RULES:
 
 1. CSV and Excel files are structured tabular data.
+   Use structured analysis operations for questions that ask for values from
+   CSV/Excel files.
 
-2. For CSV/Excel numerical questions, use structured analysis operations.
-   Do NOT use retrieve-only for a question that requires calculation
-   from CSV/Excel rows.
+2. The structured analysis operations are executed by DuckDB.
+   Do NOT plan around Pandas execution.
 
-3. The analysis engine executes these operations using DuckDB SQL.
-   Do NOT assume Pandas is used for calculation.
+3. Do NOT use retrieve-only for a CSV/Excel numerical question.
 
 4. For an exact numeric lookup in a CSV/Excel file, use:
    load_csv
    + filter operation(s)
    + an aggregation/value operation on the requested numeric column.
 
-5. For example:
+5. When the user asks for the value of a numeric column for specific rows,
+   use "sum" as the final operation if the filters identify the intended row(s).
+   For a single matching row, sum returns that row's numeric value.
+
+6. Examples:
 
    Question:
    "How many units were sold on 1/10/2014 for the product Carretera?"
 
-   If the dataset contains Product, Date, and Units Sold:
+   If the catalog contains Product, Date, and Units Sold columns, plan:
    load_csv
    filter Product = Carretera
    filter Date = 1/10/2014
    sum Units Sold
 
-6. For:
+   Question:
    "What was the total revenue in 2013?"
 
-   If the dataset contains Year and Revenue:
+   If the catalog contains Year and Revenue columns, plan:
    load_csv
    filter Year = 2013
    sum Revenue
 
 7. The requested metric must NEVER be used as the filter value.
 
+   For example:
    "units sold for Carretera"
    means:
    metric = Units Sold
@@ -118,62 +123,63 @@ IMPORTANT STRUCTURED-DATA RULES:
 
 8. Use column names from the supplied document catalog whenever possible.
 
-9. Never invent documents, columns, years, entities, or values.
+9. For dates, preserve the user's date value in the filter.
+   The analysis layer will handle the SQL/date representation.
 
-10. For dates, preserve the user's date value in the filter.
-
-11. For a question asking:
-    "how many units",
-    "number of units",
-    "units sold",
-    identify the numeric Units Sold column if it exists.
-
+10. For a question asking "how many units", "number of units", or "units sold",
+    identify the actual numeric Units Sold column if it exists.
     Do NOT use count unless the user is asking how many rows/records exist.
 
-12. "total revenue", "total sales", etc. mean SUM of the corresponding
+11. "total revenue", "total sales", etc. mean sum of the corresponding
     numeric column.
 
-13. "average revenue" means AVG/average of the Revenue column.
+12. "average revenue" means average of the Revenue column.
 
-14. "minimum revenue" means MIN of the Revenue column.
+13. "minimum revenue" means min of the Revenue column.
 
-15. "maximum revenue" means MAX of the Revenue column.
+14. "maximum revenue" means max of the Revenue column.
 
-16. If the question contains a year and the dataset has a Year column,
-    create a filter for that year when the question asks about that specific
-    year.
+15. If the question contains a year and the dataset has a Year column,
+    create a filter operation for that Year.
 
-17. If the question contains a product/entity and the dataset has a matching
-    entity/product column, identify the entity and allow the analysis layer
-    to filter it.
+16. If the question contains a product/entity and the dataset has a matching
+    product/entity column, create a filter operation for that value.
 
-18. For ranking questions, use rank or sort and provide the requested
-    metric/column.
+17. If the question contains a date and the dataset has a Date column,
+    create a filter operation for that date.
 
-19. For grouping questions such as:
-    "sales by department"
-    use groupby with the appropriate entity column and numeric value column.
+18. For ranking questions, use rank and/or sort operations.
 
-20. For percentage-change questions, use percentage_change.
+19. For sorting questions, use sort.
 
-21. For year-over-year questions, use yoy.
+20. For grouping questions, use groupby.
 
-22. For comparing two entities, use compare.
+21. For percentage-change questions, use percentage_change.
 
-23. For questions involving multiple documents or both document evidence
-    and CSV calculations, include retrieve as well as the appropriate
-    structured-data operations.
+22. For year-over-year questions, use yoy.
 
-24. Never perform arithmetic yourself. The DuckDB analysis layer calculates
-    numerical results.
+23. For comparing entities, use compare and/or groupby.
 
-25. If the question is a normal document question, use retrieve.
+24. Never invent documents, columns, years, entities, or values.
 
-26. If it is a follow-up, set is_follow_up true and resolve missing
-    information using the conversation context.
+25. For non-CSV/Excel document questions, retrieve relevant evidence normally.
 
-27. document_hints must contain filenames from the supplied document catalog
-    when a particular document is relevant.
+26. If it is a follow-up, set is_follow_up true and resolve missing information
+    using the conversation context.
+
+27. If a question requires both CSV calculation and document evidence,
+    include both the appropriate CSV operations and retrieve.
+
+28. Never perform arithmetic yourself. The structured analysis layer calculates
+    numerical results using DuckDB SQL.
+
+29. document_hints must contain filenames from the supplied catalog when relevant.
+
+30. If a CSV/Excel question requires an exact numeric result, make sure the
+    plan contains load_csv and a concrete numeric operation.
+
+31. Use the supplied schema/profile to identify numeric, entity, year, and date
+    columns. Do not invent schema information.
 """
 
 
@@ -205,12 +211,10 @@ def build_plan(
                 item["year_columns"] = profile.get("year_columns") or []
                 item["entity_columns"] = profile.get("entity_columns") or []
                 item["numeric_columns"] = profile.get("numeric_columns") or []
+                item["date_columns"] = profile.get("date_columns") or []
 
             except (json.JSONDecodeError, TypeError):
-                log.warning(
-                    "invalid_csv_profile document_id=%s",
-                    doc.get("id"),
-                )
+                pass
 
         catalog.append(item)
 
@@ -256,9 +260,9 @@ def build_plan(
     }
 
     if (
-        (context.entities and new_entities)
-        or context.last_answer == MISSING_ANSWER
-    ):
+        context.entities
+        and new_entities
+    ) or context.last_answer == MISSING_ANSWER:
         previous_docs = [
             d
             for d in documents
@@ -350,8 +354,10 @@ def _merge_follow_up(
                 ]
             )
         )
+
     elif mentioned:
         plan.entities = mentioned
+
     elif not plan.entities:
         plan.entities = list(
             context.entities
@@ -407,17 +413,19 @@ def _apply_csv_normalization(
     documents: list[dict[str, Any]],
 ) -> QueryPlan:
     """
-    Normalize a Gemini-generated plan against the actual CSV/Excel schema.
+    Normalize Gemini's plan using the actual CSV/Excel schema.
 
-    This function decides WHAT structured operation is required.
-
-    The actual calculation is performed later by DuckDB in analyze.py.
+    This function only constructs the structured analysis plan.
+    Actual SQL generation/execution is handled by app.analyze.
     """
 
     csv_docs = [
         d
         for d in documents
-        if d["file_type"] in {"csv", "excel"}
+        if d["file_type"] in {
+            "csv",
+            "excel",
+        }
     ]
 
     if not csv_docs:
@@ -475,14 +483,43 @@ def _apply_csv_normalization(
         )
     ]
 
-    if not columns:
-        return plan
+    date_columns = [
+        str(c)
+        for c in (
+            profile.get("date_columns")
+            or []
+        )
+    ]
+
+    # The current ingest.py does not populate date_columns.
+    # Infer likely date columns from names/dtypes when necessary.
+    if not date_columns:
+        date_columns = _infer_date_columns(
+            columns=columns,
+            profile=profile,
+        )
 
     q = question.casefold()
 
-    # ---------------------------------------------------------
-    # Resolve metric
-    # ---------------------------------------------------------
+    csv_ops = [
+        op
+        for op in plan.operations
+        if op.op in {
+            "load_csv",
+            "sum",
+            "average",
+            "min",
+            "max",
+            "count",
+            "filter",
+            "sort",
+            "rank",
+            "groupby",
+            "percentage_change",
+            "yoy",
+            "compare",
+        }
+    ]
 
     metric_column = _find_metric_column(
         question=question,
@@ -496,90 +533,66 @@ def _apply_csv_normalization(
             metric_column
         ]
 
-    # ---------------------------------------------------------
-    # Resolve years
-    # ---------------------------------------------------------
-
     years = _years_in_text(question)
 
     if years:
         plan.years = years
 
-    # ---------------------------------------------------------
-    # Resolve operation type BEFORE constructing operations.
-    #
-    # This is important for YoY/percentage/ranking/grouping.
-    # ---------------------------------------------------------
-
-    operation_name = _determine_operation(
-        question=question,
-        plan=plan,
-    )
-
-    # ---------------------------------------------------------
-    # Determine entity column
-    # ---------------------------------------------------------
-
-    entity_column = _find_entity_column(
-        columns=columns,
-        entity_columns=entity_columns,
-        question=question,
-    )
-
-    # ---------------------------------------------------------
-    # Build filters
-    # ---------------------------------------------------------
-
     filters: list[PlanOp] = []
 
-    # Year filter is appropriate for a single explicit year.
-    #
-    # Do NOT add this for a two-year comparison because the SQL
-    # needs both years.
+    # --------------------------------------------------------
+    # Year filter
+    # --------------------------------------------------------
+
     if (
-        len(plan.years) == 1
+        plan.years
         and year_columns
-        and operation_name
-        not in {
-            "percentage_change",
-            "yoy",
-        }
     ):
+        year_column = year_columns[0]
+
         filters.append(
             PlanOp(
                 op="filter",
-                column=year_columns[0],
+                column=year_column,
                 value=plan.years[0],
             )
         )
 
-    # Entity filter.
-    #
-    # For compare, the SQL needs both entities, so don't reduce the
-    # dataset to only one entity.
+    # --------------------------------------------------------
+    # Entity filter
+    # --------------------------------------------------------
+
     if (
-        len(plan.entities) == 1
-        and entity_column
-        and operation_name != "compare"
+        plan.entities
+        and entity_columns
     ):
-        filters.append(
-            PlanOp(
-                op="filter",
-                column=entity_column,
-                value=plan.entities[0],
-            )
+        entity_column = _find_entity_column(
+            columns=columns,
+            entity_columns=entity_columns,
+            question=question,
         )
 
-    # Date filter.
+        if entity_column:
+            filters.append(
+                PlanOp(
+                    op="filter",
+                    column=entity_column,
+                    value=plan.entities[0],
+                )
+            )
+
+    # --------------------------------------------------------
+    # Date filter
+    # --------------------------------------------------------
+
     date_value = _extract_date_value(
         question
     )
 
-    date_columns = _find_date_columns(
-        columns
-    )
-
-    if date_value and date_columns:
+    if (
+        date_value
+        and date_columns
+    ):
         filters.append(
             PlanOp(
                 op="filter",
@@ -588,42 +601,39 @@ def _apply_csv_normalization(
             )
         )
 
-    # Preserve valid Gemini-generated filters.
-    for existing in plan.operations:
+    # --------------------------------------------------------
+    # Existing Gemini filters
+    # --------------------------------------------------------
+
+    for existing in csv_ops:
         if existing.op != "filter":
             continue
 
         column = existing.column
         value = existing.value
 
-        if not column or value is None:
-            continue
-
-        resolved = _resolve_column_name(
-            columns,
-            column,
-        )
-
-        if resolved is None:
-            continue
-
-        # Never allow a numeric metric to become an entity filter.
-        if (
-            resolved in numeric_columns
-            and isinstance(value, str)
-            and entity_column
-            and _value_exists(
-                profile=profile,
-                column=entity_column,
-                value=value,
+        if column:
+            resolved = _resolve_column_name(
+                columns,
+                column,
             )
+
+            if resolved:
+                column = resolved
+
+        if value is None:
+            continue
+
+        if (
+            column
+            and column not in columns
         ):
             continue
 
         filters.append(
             PlanOp(
                 op="filter",
-                column=resolved,
+                column=column,
                 value=value,
             )
         )
@@ -632,111 +642,51 @@ def _apply_csv_normalization(
         filters
     )
 
-    # ---------------------------------------------------------
-    # Construct operation chain
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Preserve operations that represent complex analytical
+    # questions.
+    #
+    # These should reach analyze.py so Gemini can generate the
+    # appropriate DuckDB SQL.
+    # --------------------------------------------------------
 
-    if metric_column and _is_structured_numeric_question(
-        question=question,
-        metric_column=metric_column,
-        columns=columns,
-    ):
-        operations: list[PlanOp] = [
+    complex_ops = {
+        "percentage_change",
+        "yoy",
+        "compare",
+        "groupby",
+        "rank",
+        "sort",
+    }
+
+    existing_complex_ops = [
+        op
+        for op in csv_ops
+        if op.op in complex_ops
+    ]
+
+    if existing_complex_ops:
+        ops: list[PlanOp] = [
             PlanOp(
                 op="load_csv",
                 filename_hint=doc["filename"],
             )
         ]
 
-        operations.extend(filters)
+        ops.extend(filters)
 
-        if operation_name in {
-            "percentage_change",
-            "yoy",
-        }:
-            operations.append(
-                PlanOp(
-                    op=operation_name,
-                    column=metric_column,
-                    value_column=metric_column,
-                    from_year=(
-                        min(plan.years)
-                        if len(plan.years) >= 2
-                        else None
-                    ),
-                    to_year=(
-                        max(plan.years)
-                        if len(plan.years) >= 2
-                        else None
-                    ),
-                )
+        # Preserve Gemini's analytical operation.
+        for operation in existing_complex_ops:
+            repaired = _repair_operation(
+                operation=operation,
+                columns=columns,
+                numeric_columns=numeric_columns,
+                year_columns=year_columns,
             )
 
-        elif operation_name == "groupby":
-            operations.append(
-                PlanOp(
-                    op="groupby",
-                    column=(
-                        entity_column
-                        or (
-                            entity_columns[0]
-                            if entity_columns
-                            else None
-                        )
-                    ),
-                    value_column=metric_column,
-                    agg="sum",
-                )
-            )
+            ops.append(repaired)
 
-        elif operation_name == "compare":
-            operations.append(
-                PlanOp(
-                    op="compare",
-                    column=metric_column,
-                    value_column=metric_column,
-                    target=entity_column,
-                )
-            )
-
-        elif operation_name in {
-            "rank",
-            "sort",
-        }:
-            operations.append(
-                PlanOp(
-                    op=operation_name,
-                    column=metric_column,
-                    value_column=metric_column,
-                    n=10,
-                    ascending=False,
-                )
-            )
-
-        else:
-            operations.append(
-                PlanOp(
-                    op=operation_name,
-                    column=metric_column,
-                    value_column=metric_column,
-                )
-            )
-
-        # If this question also requires document evidence,
-        # preserve retrieve alongside the structured analysis.
-        if _requires_document_retrieval(
-            plan
-        ) and not any(
-            op.op == "retrieve"
-            for op in operations
-        ):
-            operations.insert(
-                0,
-                PlanOp(op="retrieve"),
-            )
-
-        plan.operations = operations
-
+        plan.operations = ops
         plan.document_ids = [
             doc["id"]
         ]
@@ -744,147 +694,132 @@ def _apply_csv_normalization(
             doc["filename"]
         ]
 
-        plan.intent = _intent_for_operation(
-            operation_name
+        return plan
+
+    # --------------------------------------------------------
+    # Normal numeric question
+    # --------------------------------------------------------
+
+    if (
+        metric_column
+        and _is_numeric_csv_question(
+            question=question,
+            metric_column=metric_column,
+            columns=columns,
         )
+    ):
+        aggregation = _requested_aggregation(
+            question,
+            plan,
+        )
+
+        ops = [
+            PlanOp(
+                op="load_csv",
+                filename_hint=doc["filename"],
+            )
+        ]
+
+        ops.extend(filters)
+
+        ops.append(
+            PlanOp(
+                op=aggregation,
+                column=metric_column,
+                value_column=metric_column,
+            )
+        )
+
+        plan.operations = ops
+
+        if aggregation == "sum":
+            plan.intent = Intent.SUM
+
+        elif aggregation == "average":
+            plan.intent = Intent.AVERAGE
+
+        elif aggregation == "min":
+            plan.intent = Intent.MINIMUM
+
+        elif aggregation == "max":
+            plan.intent = Intent.MAXIMUM
+
+        elif aggregation == "count":
+            plan.intent = Intent.NUMERICAL_LOOKUP
+
+        else:
+            plan.intent = Intent.CSV_AGGREGATION
+
+        plan.document_ids = [
+            doc["id"]
+        ]
+
+        plan.document_hints = [
+            doc["filename"]
+        ]
 
         return plan
 
     return plan
 
 
-def _determine_operation(
+def _repair_operation(
     *,
-    question: str,
-    plan: QueryPlan,
-) -> str:
-    q = question.casefold()
+    operation: PlanOp,
+    columns: list[str],
+    numeric_columns: list[str],
+    year_columns: list[str],
+) -> PlanOp:
+    column = operation.column
 
-    # Explicit comparison first.
-    if (
-        len(plan.entities) >= 2
-        and (
-            "compare" in q
-            or "difference between" in q
-            or "versus" in q
-            or " vs " in q
+    if column:
+        resolved = _resolve_column_name(
+            columns,
+            column,
         )
-    ):
-        return "compare"
 
-    # YoY must be checked before generic "growth".
-    if (
-        "year-over-year" in q
-        or "year over year" in q
-        or "yoy" in q
-        or "previous year" in q
-        or "last year" in q
-        or "prior year" in q
-    ):
-        return "yoy"
+        if resolved:
+            column = resolved
 
-    if (
-        "percentage change" in q
-        or "percent change" in q
-        or "percentage increase" in q
-        or "percentage decrease" in q
-        or "percent increase" in q
-        or "percent decrease" in q
-    ):
-        return "percentage_change"
+    value_column = operation.value_column
 
-    if (
-        "group by" in q
-        or "by department" in q
-        or "by product" in q
-        or "by company" in q
-        or "by category" in q
-        or "by division" in q
-    ):
-        return "groupby"
+    if value_column:
+        resolved_value = _resolve_column_name(
+            numeric_columns or columns,
+            value_column,
+        )
 
-    if (
-        "rank" in q
-        or "top " in q
-        or "highest" in q
-        or "lowest" in q
-    ):
-        return "rank"
+        if resolved_value:
+            value_column = resolved_value
 
-    if (
-        "sort" in q
-        or "sorted" in q
-        or "order by" in q
-    ):
-        return "sort"
+    year_column = operation.year_column
 
-    if (
-        "average" in q
-        or "avg" in q
-        or "mean" in q
-    ):
-        return "average"
+    if year_column:
+        resolved_year = _resolve_column_name(
+            year_columns or columns,
+            year_column,
+        )
 
-    if (
-        "minimum" in q
-        or "lowest value" in q
-        or "smallest value" in q
-    ):
-        return "min"
+        if resolved_year:
+            year_column = resolved_year
 
-    if (
-        "maximum" in q
-        or "highest value" in q
-        or "largest value" in q
-    ):
-        return "max"
-
-    if (
-        "how many rows" in q
-        or "how many records" in q
-        or "number of rows" in q
-        or "number of records" in q
-    ):
-        return "count"
-
-    # Default numeric lookup is SUM.
-    return "sum"
-
-
-def _requires_document_retrieval(
-    plan: QueryPlan,
-) -> bool:
-    return any(
-        op.op == "retrieve"
-        for op in plan.operations
+    return PlanOp(
+        op=operation.op,
+        target=operation.target,
+        filename_hint=operation.filename_hint,
+        column=column,
+        value=operation.value,
+        value_column=value_column,
+        year_column=year_column,
+        from_year=operation.from_year,
+        to_year=operation.to_year,
+        ascending=operation.ascending,
+        n=operation.n,
+        agg=operation.agg,
     )
 
 
-def _intent_for_operation(
-    operation: str,
-) -> Intent:
-    mapping = {
-        "sum": Intent.SUM,
-        "average": Intent.AVERAGE,
-        "min": Intent.MINIMUM,
-        "max": Intent.MAXIMUM,
-        "count": Intent.NUMERICAL_LOOKUP,
-        "rank": Intent.RANKING,
-        "sort": Intent.SORTING,
-        "filter": Intent.FILTERING,
-        "groupby": Intent.CSV_AGGREGATION,
-        "percentage_change": Intent.PERCENTAGE_CHANGE,
-        "yoy": Intent.YEAR_OVER_YEAR_COMPARISON,
-        "compare": Intent.ENTITY_COMPARISON,
-    }
-
-    return mapping.get(
-        operation,
-        Intent.CSV_AGGREGATION,
-    )
-
-
-def _is_structured_numeric_question(
+def _is_numeric_csv_question(
     *,
     question: str,
     metric_column: str,
@@ -916,18 +851,6 @@ def _is_structured_numeric_question(
         "expense",
         "amount",
         "value",
-        "growth",
-        "percentage",
-        "percent",
-        "%",
-        "rank",
-        "top",
-        "highest",
-        "lowest",
-        "compare",
-        "difference",
-        "group",
-        "by ",
     )
 
     return any(
@@ -943,8 +866,6 @@ def _find_metric_column(
     numeric_columns: list[str],
     existing_metrics: list[str],
 ) -> str | None:
-    # First trust an existing planner metric if it resolves to a real
-    # numeric column.
     for metric in existing_metrics:
         resolved = _resolve_column_name(
             numeric_columns or columns,
@@ -954,18 +875,12 @@ def _find_metric_column(
         if (
             resolved
             and resolved in columns
-            and (
-                not numeric_columns
-                or resolved in numeric_columns
-            )
         ):
             return resolved
 
     q = question.casefold()
 
-    candidates: list[
-        tuple[int, str]
-    ] = []
+    candidates: list[tuple[int, str]] = []
 
     for column in numeric_columns:
         normalized = column.casefold()
@@ -1004,9 +919,12 @@ def _find_metric_column(
         ):
             score += 80
 
-        if "revenue" in normalized and (
-            "revenue" in q
-            or "sales revenue" in q
+        if (
+            "revenue" in normalized
+            and (
+                "revenue" in q
+                or "sales revenue" in q
+            )
         ):
             score += 80
 
@@ -1061,16 +979,56 @@ def _find_entity_column(
         ):
             return column
 
-    for column in entity_columns:
-        normalized = column.casefold()
-
-        if (
-            "department" in normalized
-            and "department" in q
-        ):
-            return column
-
     return entity_columns[0]
+
+
+def _requested_aggregation(
+    question: str,
+    plan: QueryPlan,
+) -> str:
+    q = question.casefold()
+
+    if any(
+        term in q
+        for term in (
+            "average",
+            "avg",
+            "mean",
+        )
+    ):
+        return "average"
+
+    if any(
+        term in q
+        for term in (
+            "minimum",
+            "minimum value",
+            "lowest",
+            "smallest",
+        )
+    ):
+        return "min"
+
+    if any(
+        term in q
+        for term in (
+            "maximum",
+            "maximum value",
+            "highest",
+            "largest",
+        )
+    ):
+        return "max"
+
+    if (
+        "how many rows" in q
+        or "how many records" in q
+        or "number of records" in q
+        or "number of rows" in q
+    ):
+        return "count"
+
+    return "sum"
 
 
 def _choose_csv_document(
@@ -1093,16 +1051,19 @@ def _choose_csv_document(
             ):
                 return doc
 
-    if len(csv_docs) == 1:
-        return csv_docs[0]
-
-    return csv_docs[0] if csv_docs else None
+    return (
+        csv_docs[0]
+        if csv_docs
+        else None
+    )
 
 
 def _get_profile(
     doc: dict[str, Any],
 ) -> dict[str, Any]:
-    raw = doc.get("csv_profile")
+    raw = doc.get(
+        "csv_profile"
+    )
 
     if not raw:
         return {}
@@ -1111,12 +1072,69 @@ def _get_profile(
         return raw
 
     try:
-        return json.loads(raw)
+        value = json.loads(raw)
+
+        if isinstance(value, dict):
+            return value
+
     except (
         json.JSONDecodeError,
         TypeError,
     ):
-        return {}
+        pass
+
+    return {}
+
+
+def _infer_date_columns(
+    *,
+    columns: list[str],
+    profile: dict[str, Any],
+) -> list[str]:
+    """
+    The current ingest.py does not store date_columns in csv_profile.
+
+    Infer likely date columns from column names and dtypes so the planner
+    can still construct a date filter without requiring an ingest change.
+    """
+
+    dtypes = profile.get(
+        "dtypes"
+    ) or {}
+
+    result: list[str] = []
+
+    date_name_terms = (
+        "date",
+        "datetime",
+        "timestamp",
+        "period",
+    )
+
+    for column in columns:
+        lowered = column.casefold()
+
+        if any(
+            term in lowered
+            for term in date_name_terms
+        ):
+            result.append(column)
+            continue
+
+        dtype = str(
+            dtypes.get(
+                column,
+                "",
+            )
+        ).casefold()
+
+        if (
+            "datetime" in dtype
+            or "date" in dtype
+        ):
+            result.append(column)
+
+    return result
 
 
 def _resolve_column_name(
@@ -1167,9 +1185,7 @@ def _deduplicate_filters(
     filters: list[PlanOp],
 ) -> list[PlanOp]:
     result: list[PlanOp] = []
-    seen: set[
-        tuple[str, str]
-    ] = set()
+    seen: set[tuple[str, str]] = set()
 
     for op in filters:
         if not op.column:
@@ -1185,29 +1201,6 @@ def _deduplicate_filters(
 
         seen.add(key)
         result.append(op)
-
-    return result
-
-
-def _find_date_columns(
-    columns: list[str],
-) -> list[str]:
-    result: list[str] = []
-
-    for column in columns:
-        normalized = re.sub(
-            r"[^a-z0-9]+",
-            "_",
-            column.casefold(),
-        ).strip("_")
-
-        if (
-            normalized == "date"
-            or normalized.endswith("_date")
-            or normalized.startswith("date_")
-            or "date" in normalized
-        ):
-            result.append(column)
 
     return result
 
@@ -1251,41 +1244,6 @@ def _extract_date_value(
     return None
 
 
-def _value_exists(
-    *,
-    profile: dict[str, Any],
-    column: str,
-    value: Any,
-) -> bool:
-    """
-    csv_profile intentionally does not store every dataset value.
-
-    Therefore this function only handles values when a future profile
-    explicitly provides sample/known values. It returns False otherwise,
-    meaning the filter is preserved rather than discarded.
-    """
-
-    samples = profile.get(
-        "sample_values"
-    )
-
-    if not isinstance(samples, dict):
-        return False
-
-    values = samples.get(column)
-
-    if not isinstance(values, list):
-        return False
-
-    target = str(value).strip().casefold()
-
-    return any(
-        str(item).strip().casefold()
-        == target
-        for item in values
-    )
-
-
 def _apply_heuristics(
     plan: QueryPlan,
     question: str,
@@ -1294,8 +1252,8 @@ def _apply_heuristics(
     """
     Lightweight deterministic normalization.
 
-    This function does not perform calculations.
-    DuckDB performs all CSV/Excel calculations later.
+    The actual numerical work is NOT performed here.
+    DuckDB performs the calculation after analyze.py generates SQL.
     """
 
     if getattr(
@@ -1308,6 +1266,124 @@ def _apply_heuristics(
     }:
         return plan
 
+    q = question.lower()
+
+    csv_docs = [
+        d
+        for d in documents
+        if d["file_type"] in {
+            "csv",
+            "excel",
+        }
+    ]
+
+    numeric_map = {
+        "sum": "sum",
+        "total": "sum",
+        "average": "average",
+        "avg": "average",
+        "mean": "average",
+        "minimum": "min",
+        "min ": "min",
+        "maximum": "max",
+        "max ": "max",
+        "rank": "rank",
+        "sort": "sort",
+        "filter": "filter",
+        "percentage": "percentage_change",
+        "percent": "percentage_change",
+        "year-over-year": "yoy",
+        "year over year": "yoy",
+        "yoy": "yoy",
+        "growth": "yoy",
+    }
+
+    if (
+        csv_docs
+        and any(
+            key in q
+            for key in numeric_map
+        )
+    ):
+        op_name = next(
+            numeric_map[key]
+            for key in numeric_map
+            if key in q
+        )
+
+        has_load = any(
+            op.op == "load_csv"
+            for op in plan.operations
+        )
+
+        has_metric_op = any(
+            op.op in {
+                "sum",
+                "average",
+                "min",
+                "max",
+                "count",
+                "rank",
+                "sort",
+                "percentage_change",
+                "yoy",
+                "compare",
+            }
+            for op in plan.operations
+        )
+
+        if (
+            not has_load
+            and not has_metric_op
+        ):
+            hint = csv_docs[0][
+                "filename"
+            ]
+
+            operations = [
+                PlanOp(
+                    op="load_csv",
+                    filename_hint=hint,
+                )
+            ]
+
+            if plan.metrics:
+                operations.append(
+                    PlanOp(
+                        op=op_name,
+                        column=plan.metrics[0],
+                    )
+                )
+            else:
+                operations.append(
+                    PlanOp(
+                        op=op_name,
+                    )
+                )
+
+            plan.operations = operations
+
+        if plan.intent in {
+            Intent.FACTUAL_LOOKUP,
+            Intent.FOLLOW_UP_QUESTION,
+        }:
+            mapping = {
+                "sum": Intent.SUM,
+                "average": Intent.AVERAGE,
+                "min": Intent.MINIMUM,
+                "max": Intent.MAXIMUM,
+                "rank": Intent.RANKING,
+                "sort": Intent.SORTING,
+                "filter": Intent.FILTERING,
+                "percentage_change": Intent.PERCENTAGE_CHANGE,
+                "yoy": Intent.YEAR_OVER_YEAR_COMPARISON,
+            }
+
+            plan.intent = mapping.get(
+                op_name,
+                Intent.CSV_AGGREGATION,
+            )
+
     if not plan.years:
         plan.years = _years_in_text(
             question
@@ -1315,7 +1391,9 @@ def _apply_heuristics(
 
     if not plan.operations:
         plan.operations = [
-            PlanOp(op="retrieve")
+            PlanOp(
+                op="retrieve"
+            )
         ]
 
     return plan
