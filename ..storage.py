@@ -1,224 +1,576 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import logging
 import sqlite3
-import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import chromadb
-from chromadb.api.models.Collection import Collection
 
 from app.config import Settings
-from app.errors import NotFoundError, StorageError
-from app.models import ConversationContext, Evidence
-
-log = logging.getLogger(__name__)
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS documents (
-    id TEXT PRIMARY KEY,
-    filename TEXT NOT NULL,
-    stored_name TEXT NOT NULL UNIQUE,
-    file_type TEXT NOT NULL,
-    file_hash TEXT NOT NULL UNIQUE,
-    status TEXT NOT NULL,
-    chunk_count INTEGER NOT NULL DEFAULT 0,
-    page_count INTEGER,
-    csv_profile TEXT,
-    error_message TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY,
-    context_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    status TEXT,
-    sources_json TEXT,
-    execution_flow_json TEXT,
-    query_plan_json TEXT,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_conversation
-    ON messages(conversation_id, created_at);
-"""
-
-
-DOCUMENT_COLUMNS = frozenset(
-    {
-        "id",
-        "filename",
-        "stored_name",
-        "file_type",
-        "file_hash",
-        "status",
-        "chunk_count",
-        "page_count",
-        "csv_profile",
-        "error_message",
-        "created_at",
-        "updated_at",
-    }
-)
-MESSAGE_COLUMNS = frozenset(
-    {
-        "id",
-        "conversation_id",
-        "role",
-        "content",
-        "status",
-        "sources_json",
-        "execution_flow_json",
-        "query_plan_json",
-        "created_at",
-    }
-)
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+from app.errors import ConflictError, NotFoundError, StorageError
 
 
 class Storage:
+    """
+    Persistence layer for the document-analysis system.
+
+    SQLite stores:
+        - document metadata
+        - conversations
+        - chat messages
+
+    Chroma stores:
+        - embedded document chunks
+    """
+
+    COLLECTION_NAME = "doc_chunks"
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._conn: sqlite3.Connection | None = None
-        self._chroma: chromadb.PersistentClient | None = None
-        self.collection: Collection | None = None
-        self._lock = threading.Lock()
+        self._chroma: Any | None = None
+        self._collection: Any | None = None
+
+    # ============================================================
+    # INITIALIZATION
+    # ============================================================
 
     def init(self) -> None:
         try:
-            self.settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-            self.settings.chroma_path.mkdir(parents=True, exist_ok=True)
-            self.settings.upload_dir.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self.settings.sqlite_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA foreign_keys = ON")
-            self._conn.executescript(SCHEMA)
-            self._conn.commit()
-            self._chroma = chromadb.PersistentClient(path=str(self.settings.chroma_path))
-            self.collection = self._chroma.get_or_create_collection(
-                name="doc_chunks",
-                metadata={"hnsw:space": "cosine"},
+            self.settings.ensure_directories()
+
+            self._conn = sqlite3.connect(
+                self.settings.sqlite_path,
+                check_same_thread=False,
             )
-            log.info("storage_initialized sqlite=%s chroma=%s", self.settings.sqlite_path, self.settings.chroma_path)
+            self._conn.row_factory = sqlite3.Row
+
+            self._conn.execute("PRAGMA foreign_keys = ON")
+
+            self._create_tables()
+
+            self._chroma = chromadb.PersistentClient(
+                path=str(self.settings.chroma_path)
+            )
+
+            self._collection = self._chroma.get_or_create_collection(
+                name=self.COLLECTION_NAME,
+                metadata={
+                    "hnsw:space": "cosine",
+                },
+            )
+
         except Exception as exc:
-            log.exception("storage_init_failed")
-            raise StorageError("Document storage could not be initialized.") from exc
+            self.close()
+
+            if isinstance(exc, StorageError):
+                raise
+
+            raise StorageError(
+                "Failed to initialize application storage."
+            ) from exc
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+            self._conn = None
+
+        self._collection = None
+        self._chroma = None
 
     @property
     def conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            raise StorageError("Storage is not initialized.")
+            raise StorageError(
+                "Storage has not been initialized."
+            )
+
         return self._conn
 
-    def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
-
-    def insert_document(self, record: dict[str, Any]) -> None:
-        cols = _allowed_columns(record, DOCUMENT_COLUMNS)
-        placeholders = ", ".join("?" for _ in cols)
-        with self._lock:
-            self.conn.execute(
-                f"INSERT INTO documents ({', '.join(cols)}) VALUES ({placeholders})",
-                [record[c] for c in cols],
+    @property
+    def collection(self) -> Any:
+        if self._collection is None:
+            raise StorageError(
+                "Vector storage has not been initialized."
             )
+
+        return self._collection
+
+    # ============================================================
+    # DATABASE SCHEMA
+    # ============================================================
+
+    def _create_tables(self) -> None:
+        conn = self.conn
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                stored_name TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_hash TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                page_count INTEGER NOT NULL DEFAULT 0,
+                csv_profile TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_documents_status
+                ON documents(status);
+
+            CREATE INDEX IF NOT EXISTS idx_documents_filename
+                ON documents(filename);
+
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT,
+                sources_json TEXT,
+                execution_flow_json TEXT,
+                query_plan_json TEXT,
+                created_at TEXT NOT NULL,
+
+                FOREIGN KEY (conversation_id)
+                    REFERENCES conversations(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation
+                ON messages(conversation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_messages_created
+                ON messages(created_at);
+            """
+        )
+
+        conn.commit()
+
+    # ============================================================
+    # DOCUMENTS
+    # ============================================================
+
+    def insert_document(
+        self,
+        *,
+        document_id: str,
+        filename: str,
+        stored_name: str,
+        file_type: str,
+        file_hash: str,
+        status: str = "processing",
+        chunk_count: int = 0,
+        page_count: int = 0,
+        csv_profile: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+
+        now = _utc_now()
+
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO documents (
+                    id,
+                    filename,
+                    stored_name,
+                    file_type,
+                    file_hash,
+                    status,
+                    chunk_count,
+                    page_count,
+                    csv_profile,
+                    error_message,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    filename,
+                    stored_name,
+                    file_type,
+                    file_hash,
+                    status,
+                    chunk_count,
+                    page_count,
+                    json.dumps(csv_profile)
+                    if csv_profile is not None
+                    else None,
+                    error_message,
+                    now,
+                    now,
+                ),
+            )
+
             self.conn.commit()
 
-    def update_document(self, document_id: str, **fields: Any) -> None:
-        fields["updated_at"] = utcnow()
-        cols = _allowed_columns(fields, DOCUMENT_COLUMNS)
-        assignments = ", ".join(f"{k} = ?" for k in cols)
-        with self._lock:
-            self.conn.execute(
-                f"UPDATE documents SET {assignments} WHERE id = ?",
-                [*[fields[c] for c in cols], document_id],
-            )
-            self.conn.commit()
+        except sqlite3.IntegrityError as exc:
+            self.conn.rollback()
 
-    def get_document(self, document_id: str) -> dict[str, Any]:
-        with self._lock:
-            row = self.conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+            if "file_hash" in str(exc).lower():
+                raise ConflictError(
+                    "This document has already been uploaded."
+                ) from exc
+
+            raise StorageError(
+                "Could not save document metadata."
+            ) from exc
+
+        return self.get_document(document_id)
+
+    def update_document(
+        self,
+        document_id: str,
+        *,
+        status: str | None = None,
+        chunk_count: int | None = None,
+        page_count: int | None = None,
+        csv_profile: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+
+        existing = self.get_document(document_id)
+
+        new_status = (
+            status
+            if status is not None
+            else existing["status"]
+        )
+
+        new_chunk_count = (
+            chunk_count
+            if chunk_count is not None
+            else existing["chunk_count"]
+        )
+
+        new_page_count = (
+            page_count
+            if page_count is not None
+            else existing["page_count"]
+        )
+
+        new_profile = (
+            json.dumps(csv_profile)
+            if csv_profile is not None
+            else existing["csv_profile"]
+        )
+
+        new_error = (
+            error_message
+            if error_message is not None
+            else existing["error_message"]
+        )
+
+        self.conn.execute(
+            """
+            UPDATE documents
+            SET
+                status = ?,
+                chunk_count = ?,
+                page_count = ?,
+                csv_profile = ?,
+                error_message = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                new_status,
+                new_chunk_count,
+                new_page_count,
+                new_profile,
+                new_error,
+                _utc_now(),
+                document_id,
+            ),
+        )
+
+        self.conn.commit()
+
+        return self.get_document(document_id)
+
+    def get_document(
+        self,
+        document_id: str,
+    ) -> dict[str, Any]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+
         if row is None:
-            raise NotFoundError("Document was not found.")
-        return dict(row)
+            raise NotFoundError(
+                f"Document '{document_id}' was not found."
+            )
 
-    def get_document_by_hash(self, file_hash: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self.conn.execute("SELECT * FROM documents WHERE file_hash = ?", (file_hash,)).fetchone()
-        return dict(row) if row else None
+        return self._document_row(row)
 
-    def list_documents(self, ready_only: bool = False) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM documents"
+    def get(
+        self,
+        document_id: str,
+    ) -> dict[str, Any]:
+        return self.get_document(document_id)
+
+    def get_document_by_hash(
+        self,
+        file_hash: str,
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM documents
+            WHERE file_hash = ?
+            """,
+            (file_hash,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        return self._document_row(row)
+
+    def list_documents(
+        self,
+        ready_only: bool = True,
+    ) -> list[dict[str, Any]]:
+
         if ready_only:
-            sql += " WHERE status = 'ready'"
-        sql += " ORDER BY created_at DESC"
-        with self._lock:
-            return [dict(r) for r in self.conn.execute(sql).fetchall()]
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM documents
+                WHERE status = 'ready'
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM documents
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
 
-    def delete_document(self, document_id: str) -> dict[str, Any]:
-        doc = self.get_document(document_id)
+        return [
+            self._document_row(row)
+            for row in rows
+        ]
+
+    def delete_document(
+        self,
+        document_id: str,
+    ) -> None:
+
+        document = self.get_document(document_id)
+
+        self.conn.execute(
+            """
+            DELETE FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        )
+
+        self.conn.commit()
+
         try:
-            if self.collection is not None:
-                self.collection.delete(where={"document_id": document_id})
+            self.collection.delete(
+                where={
+                    "document_id": document_id,
+                }
+            )
         except Exception as exc:
-            log.exception("chroma_delete_failed document_id=%s", document_id)
-            raise StorageError("Failed to remove document embeddings.") from exc
-        stored = self.upload_path(doc["stored_name"])
-        if stored.exists():
-            stored.unlink()
-        with self._lock:
-            self.conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
-            self.conn.commit()
-        log.info("document_deleted document_id=%s", document_id)
-        return doc
+            # The SQLite metadata has already been removed.
+            # Surface vector-store failure so it is not silently hidden.
+            raise StorageError(
+                f"Failed to remove vector data for "
+                f"document '{document_id}'."
+            ) from exc
 
-    def purge_ingest(self, document_id: str) -> None:
+        stored_name = document.get("stored_name")
+
+        if stored_name:
+            path = self.settings.upload_dir / stored_name
+
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise StorageError(
+                    f"Failed to remove stored document '{stored_name}'."
+                ) from exc
+
+    def purge_ingest(
+        self,
+        document_id: str,
+    ) -> None:
+        """
+        Remove all traces of a document after an ingestion failure.
+        """
+
         try:
-            if self.collection is not None:
-                self.collection.delete(where={"document_id": document_id})
+            self.collection.delete(
+                where={
+                    "document_id": document_id,
+                }
+            )
         except Exception:
-            log.exception("ingest_cleanup_chroma_failed document_id=%s", document_id)
-        with self._lock:
-            self.conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
-            self.conn.commit()
+            pass
 
-    def upload_path(self, stored_name: str) -> Path:
-        base = self.settings.upload_dir.resolve()
-        path = (base / Path(stored_name).name).resolve()
-        if path != base and base not in path.parents:
-            raise StorageError("Invalid stored file path.")
+        try:
+            document = self.get_document(document_id)
+        except NotFoundError:
+            return
+
+        stored_name = document.get("stored_name")
+
+        self.conn.execute(
+            """
+            DELETE FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        )
+
+        self.conn.commit()
+
+        if stored_name:
+            try:
+                (
+                    self.settings.upload_dir / stored_name
+                ).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # ============================================================
+    # FILE STORAGE
+    # ============================================================
+
+    def upload_path(
+        self,
+        source_path: Path,
+        original_filename: str,
+    ) -> tuple[str, str]:
+        if not source_path.exists():
+            raise NotFoundError(
+                "The uploaded file could not be found."
+            )
+
+        suffix = source_path.suffix.lower()
+
+        stored_name = (
+            f"{uuid.uuid4().hex}{suffix}"
+        )
+
+        destination = (
+            self.settings.upload_dir / stored_name
+        )
+
+        try:
+            destination.write_bytes(
+                source_path.read_bytes()
+            )
+        except OSError as exc:
+            raise StorageError(
+                "Failed to store the uploaded file."
+            ) from exc
+
+        file_hash = _sha256(destination)
+
+        return stored_name, file_hash
+
+    def document_file(
+        self,
+        document_id: str,
+    ) -> Path:
+        document = self.get_document(document_id)
+
+        path = (
+            self.settings.upload_dir
+            / document["stored_name"]
+        )
+
+        if not path.exists():
+            raise NotFoundError(
+                f"The stored file for document "
+                f"'{document_id}' was not found."
+            )
+
         return path
 
-    def document_file(self, document_id: str) -> Path:
-        doc = self.get_document(document_id)
-        return self.upload_path(doc["stored_name"])
+    # ============================================================
+    # CHROMA
+    # ============================================================
 
     def upsert_chunks(
         self,
-        ids: list[str],
-        documents: list[str],
+        *,
+        document_id: str,
+        chunks: list[dict[str, Any]],
         embeddings: list[list[float]],
-        metadatas: list[dict[str, Any]],
     ) -> None:
-        if self.collection is None:
-            raise StorageError("Vector store is not initialized.")
+
+        if len(chunks) != len(embeddings):
+            raise StorageError(
+                "The number of chunks does not match "
+                "the number of embeddings."
+            )
+
+        if not chunks:
+            return
+
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict[str, Any]] = []
+
+        for index, chunk in enumerate(chunks):
+            chunk_id = str(
+                chunk.get("chunk_id")
+                or f"{document_id}:{index}"
+            )
+
+            text = str(
+                chunk.get("text", "")
+            )
+
+            metadata = dict(
+                chunk.get("metadata") or {}
+            )
+
+            metadata["document_id"] = document_id
+
+            ids.append(chunk_id)
+            documents.append(text)
+            metadatas.append(
+                _clean_chroma_metadata(metadata)
+            )
+
         try:
             self.collection.upsert(
                 ids=ids,
@@ -226,122 +578,443 @@ class Storage:
                 embeddings=embeddings,
                 metadatas=metadatas,
             )
-            log.info("chromadb_storage chunks=%s", len(ids))
         except Exception as exc:
-            log.exception("chromadb_upsert_failed")
-            raise StorageError("Failed to store document embeddings.") from exc
+            raise StorageError(
+                "Failed to store document embeddings."
+            ) from exc
 
     def query_chunks(
         self,
-        query_embedding: list[float],
-        n_results: int,
-        where: dict[str, Any] | None = None,
-    ) -> list[Evidence]:
-        if self.collection is None:
-            raise StorageError("Vector store is not initialized.")
+        *,
+        embedding: list[float],
+        document_ids: list[str] | None = None,
+        top_k: int = 8,
+    ) -> list[dict[str, Any]]:
+
+        where: dict[str, Any] | None = None
+
+        if document_ids:
+            if len(document_ids) == 1:
+                where = {
+                    "document_id": document_ids[0],
+                }
+            else:
+                where = {
+                    "$or": [
+                        {"document_id": document_id}
+                        for document_id in document_ids
+                    ]
+                }
+
         try:
-            kwargs: dict[str, Any] = {
-                "query_embeddings": [query_embedding],
-                "n_results": max(n_results, 1),
-                "include": ["documents", "metadatas", "distances"],
-            }
-            if where:
-                kwargs["where"] = where
-            result = self.collection.query(**kwargs)
+            result = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=top_k,
+                where=where,
+                include=[
+                    "documents",
+                    "metadatas",
+                    "distances",
+                ],
+            )
         except Exception as exc:
-            log.exception("chromadb_query_failed")
-            raise StorageError("Failed to search document embeddings.") from exc
+            raise StorageError(
+                "Failed to query document embeddings."
+            ) from exc
 
-        evidence: list[Evidence] = []
-        ids = (result.get("ids") or [[]])[0]
-        docs = (result.get("documents") or [[]])[0]
-        metas = (result.get("metadatas") or [[]])[0]
-        distances = (result.get("distances") or [[]])[0]
-        for chunk_id, text, meta, distance in zip(ids, docs, metas, distances, strict=False):
-            meta = meta or {}
-            similarity = 1.0 - float(distance)
-            evidence.append(
-                Evidence(
-                    document_id=str(meta.get("document_id", "")),
-                    filename=str(meta.get("filename", "")),
-                    document_type=str(meta.get("document_type", "")),
-                    chunk_id=str(meta.get("chunk_id", chunk_id.split(":")[-1])),
-                    text=text or "",
-                    similarity=similarity,
-                    page_number=int(meta.get("page_number") or 0),
-                    section=str(meta.get("section") or ""),
-                    source_reference=str(meta.get("source_reference") or ""),
-                    start_line=int(meta.get("start_line") or 0),
-                    end_line=int(meta.get("end_line") or 0),
-                    row_start=int(meta.get("row_start") or 0),
-                    row_end=int(meta.get("row_end") or 0),
-                    columns=str(meta.get("columns") or ""),
-                    entities=str(meta.get("entities") or ""),
-                    year=int(meta.get("year") or 0),
-                )
+        documents = (
+            result.get("documents") or [[]]
+        )[0]
+
+        metadatas = (
+            result.get("metadatas") or [[]]
+        )[0]
+
+        distances = (
+            result.get("distances") or [[]]
+        )[0]
+
+        ids = (
+            result.get("ids") or [[]]
+        )[0]
+
+        matches: list[dict[str, Any]] = []
+
+        for index, text in enumerate(documents):
+            metadata = (
+                metadatas[index]
+                if index < len(metadatas)
+                else {}
             )
-        return evidence
 
-    def create_conversation(self, conversation_id: str) -> dict[str, Any]:
-        now = utcnow()
-        context = ConversationContext().model_dump_json()
-        with self._lock:
-            self.conn.execute(
-                "INSERT INTO conversations (id, context_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (conversation_id, context, now, now),
+            distance = (
+                distances[index]
+                if index < len(distances)
+                else None
             )
-            self.conn.commit()
-        return {"id": conversation_id, "context_json": context, "created_at": now, "updated_at": now}
 
-    def get_conversation(self, conversation_id: str) -> dict[str, Any]:
-        with self._lock:
-            row = self.conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+            chunk_id = (
+                ids[index]
+                if index < len(ids)
+                else None
+            )
+
+            similarity = None
+
+            if distance is not None:
+                similarity = 1.0 - float(distance)
+
+            matches.append(
+                {
+                    "chunk_id": chunk_id,
+                    "document_id": metadata.get(
+                        "document_id"
+                    ),
+                    "text": text,
+                    "metadata": metadata,
+                    "distance": distance,
+                    "similarity": similarity,
+                }
+            )
+
+        return matches
+
+    # ============================================================
+    # CONVERSATIONS
+    # ============================================================
+
+    def create_conversation(
+        self,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any]:
+
+        conversation_id = (
+            conversation_id or str(uuid.uuid4())
+        )
+
+        now = _utc_now()
+
+        context = {}
+
+        self.conn.execute(
+            """
+            INSERT INTO conversations (
+                id,
+                context_json,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                json.dumps(context),
+                now,
+                now,
+            ),
+        )
+
+        self.conn.commit()
+
+        return self.get_conversation(
+            conversation_id
+        )
+
+    def get_conversation(
+        self,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM conversations
+            WHERE id = ?
+            """,
+            (conversation_id,),
+        ).fetchone()
+
         if row is None:
-            raise NotFoundError("Conversation was not found.")
+            raise NotFoundError(
+                f"Conversation '{conversation_id}' was not found."
+            )
+
         return dict(row)
 
-    def update_conversation_context(self, conversation_id: str, context: ConversationContext) -> None:
-        with self._lock:
-            self.conn.execute(
-                "UPDATE conversations SET context_json = ?, updated_at = ? WHERE id = ?",
-                (context.model_dump_json(), utcnow(), conversation_id),
-            )
-            self.conn.commit()
+    def update_conversation_context(
+        self,
+        conversation_id: str,
+        context: Any,
+    ) -> None:
 
-    def add_message(self, record: dict[str, Any]) -> None:
-        cols = _allowed_columns(record, MESSAGE_COLUMNS)
-        placeholders = ", ".join("?" for _ in cols)
-        with self._lock:
-            self.conn.execute(
-                f"INSERT INTO messages ({', '.join(cols)}) VALUES ({placeholders})",
-                [record[c] for c in cols],
-            )
-            self.conn.commit()
-
-    def list_messages(self, conversation_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
-                (conversation_id,),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def delete_conversation(self, conversation_id: str) -> None:
         self.get_conversation(conversation_id)
-        with self._lock:
-            self.conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-            self.conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-            self.conn.commit()
 
-    def parse_csv_profile(self, raw: str | None) -> dict[str, Any] | None:
-        if not raw:
-            return None
-        return json.loads(raw)
+        if hasattr(context, "model_dump"):
+            payload = context.model_dump(
+                mode="json",
+                by_alias=True,
+            )
+        elif isinstance(context, dict):
+            payload = context
+        else:
+            raise StorageError(
+                "Conversation context must be a dictionary "
+                "or a Pydantic model."
+            )
+
+        self.conn.execute(
+            """
+            UPDATE conversations
+            SET
+                context_json = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(payload),
+                _utc_now(),
+                conversation_id,
+            ),
+        )
+
+        self.conn.commit()
+
+    # ============================================================
+    # MESSAGES
+    # ============================================================
+
+    def insert_message(
+        self,
+        *,
+        conversation_id: str,
+        role: str,
+        content: str,
+        status: str | None = None,
+        sources: list[dict[str, Any]] | None = None,
+        execution_flow: list[str] | None = None,
+        query_plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+
+        self.get_conversation(conversation_id)
+
+        message_id = str(uuid.uuid4())
+
+        self.conn.execute(
+            """
+            INSERT INTO messages (
+                id,
+                conversation_id,
+                role,
+                content,
+                status,
+                sources_json,
+                execution_flow_json,
+                query_plan_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                conversation_id,
+                role,
+                content,
+                status,
+                json.dumps(sources or []),
+                json.dumps(execution_flow or []),
+                json.dumps(query_plan)
+                if query_plan is not None
+                else None,
+                _utc_now(),
+            ),
+        )
+
+        self.conn.execute(
+            """
+            UPDATE conversations
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                _utc_now(),
+                conversation_id,
+            ),
+        )
+
+        self.conn.commit()
+
+        return self.get_message(message_id)
+
+    def get_message(
+        self,
+        message_id: str,
+    ) -> dict[str, Any]:
+
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM messages
+            WHERE id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+
+        if row is None:
+            raise NotFoundError(
+                f"Message '{message_id}' was not found."
+            )
+
+        return self._message_row(row)
+
+    def list_messages(
+        self,
+        conversation_id: str,
+    ) -> list[dict[str, Any]]:
+
+        self.get_conversation(conversation_id)
+
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY created_at ASC
+            """,
+            (conversation_id,),
+        ).fetchall()
+
+        return [
+            self._message_row(row)
+            for row in rows
+        ]
+
+    # ============================================================
+    # HELPERS
+    # ============================================================
+
+    @staticmethod
+    def _document_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+
+        result = dict(row)
+
+        if result.get("csv_profile"):
+            try:
+                result["csv_profile"] = json.loads(
+                    result["csv_profile"]
+                )
+            except (json.JSONDecodeError, TypeError):
+                result["csv_profile"] = {}
+
+        return result
+
+    @staticmethod
+    def _message_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+
+        result = dict(row)
+
+        for key in (
+            "sources_json",
+            "execution_flow_json",
+            "query_plan_json",
+        ):
+            value = result.get(key)
+
+            if value is None:
+                continue
+
+            try:
+                result[key.replace("_json", "")] = (
+                    json.loads(value)
+                )
+            except (json.JSONDecodeError, TypeError):
+                result[key.replace("_json", "")] = (
+                    [] if key != "query_plan_json"
+                    else None
+                )
+
+        return result
+
+    @staticmethod
+    def parse_csv_profile(
+        value: Any,
+    ) -> dict[str, Any]:
+
+        if value is None:
+            return {}
+
+        if isinstance(value, dict):
+            return value
+
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        return {}
 
 
-def _allowed_columns(record: dict[str, Any], allowed: frozenset[str]) -> list[str]:
-    cols = [key for key in record if key in allowed]
-    if not cols:
-        raise StorageError("Invalid storage fields.")
-    return cols
+# ================================================================
+# MODULE HELPERS
+# ================================================================
 
+
+def _utc_now() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    try:
+        with path.open("rb") as file:
+            while True:
+                block = file.read(1024 * 1024)
+
+                if not block:
+                    break
+
+                digest.update(block)
+
+    except OSError as exc:
+        raise StorageError(
+            "Could not calculate the file hash."
+        ) from exc
+
+    return digest.hexdigest()
+
+
+def _clean_chroma_metadata(
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+
+    cleaned: dict[str, Any] = {}
+
+    for key, value in metadata.items():
+
+        if value is None:
+            continue
+
+        if isinstance(value, (str, int, float, bool)):
+            cleaned[key] = value
+            continue
+
+        if isinstance(value, list):
+            cleaned[key] = ", ".join(
+                str(item)
+                for item in value
+            )
+            continue
+
+        cleaned[key] = str(value)
+
+    return cleaned
