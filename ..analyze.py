@@ -4,591 +4,1075 @@ import json
 import logging
 from typing import Any
 
-from app.dataset import LoadedDataset, load_datasets, schemas_for_prompt
-from app.errors import AnalysisError, GeminiError
-from app.gemini import GeminiService
-from app.models import (
-    AnalysisResult,
-    ExecutionMode,
-    GeneratedQuery,
-    QueryPlan,
-    StructuredResult,
-)
-from app.sql_executor import execute_structured_query
+import pandas as pd
+
+from app.errors import AnalysisError, NotFoundError
+from app.models import AnalysisResult, PlanOp, QueryPlan
 from app.storage import Storage
 
 log = logging.getLogger(__name__)
 
-
-DEFAULT_MAX_REPAIR_ATTEMPTS = 2
-DEFAULT_MAX_RESULT_ROWS = 200
-
-
-ANALYSIS_SYSTEM = """
-You are the structured-data analysis engine for a document question-answering
-system.
-
-Your task is to translate the user's analytical question into ONE read-only
-DuckDB SQL query over the datasets provided to you.
-
-You are not answering the user directly.
-You are producing a query that will be executed and verified by the system.
-
-The datasets are already loaded into DuckDB as in-memory tables. You may ONLY
-query the table names provided in DATASETS.
-
-RULES
-
-1. Return JSON only.
-
-2. Return exactly this general structure:
-
-{
-  "sql": "SELECT ...",
-  "explanation": "brief description of what the query computes",
-  "tables_used": ["dataset_1"],
-  "columns_used": ["Column A", "Column B"]
+ANALYSIS_OPS = {
+    "load_csv",
+    "sum",
+    "average",
+    "min",
+    "max",
+    "count",
+    "sort",
+    "rank",
+    "filter",
+    "groupby",
+    "percentage_change",
+    "yoy",
+    "compare",
 }
-
-3. Generate exactly ONE read-only analytical query.
-
-4. The query must begin with SELECT or WITH.
-
-5. Never generate:
-   INSERT
-   UPDATE
-   DELETE
-   CREATE
-   DROP
-   ALTER
-   COPY
-   ATTACH
-   DETACH
-   INSTALL
-   LOAD
-   PRAGMA
-   CALL
-   EXPORT
-   IMPORT
-   SET
-   or any other mutating/admin statement.
-
-6. Never access files, URLs, extensions, databases, or external resources.
-
-7. Use only the supplied in-memory table names.
-
-8. Use the exact column names from the supplied schemas. Quote identifiers with
-   double quotes whenever appropriate, especially when they contain spaces,
-   punctuation, reserved words, or mixed casing.
-
-9. Perform calculations in SQL. Do not calculate numerical answers yourself.
-
-10. Infer the analytical operations required from the meaning of the question.
-    You are NOT restricted to predefined operations.
-
-You may use whatever read-only DuckDB SQL is necessary, including:
-   filtering
-   aggregation
-   GROUP BY
-   HAVING
-   ordering
-   ranking
-   window functions
-   joins
-   CTEs
-   conditional aggregation
-   CASE expressions
-   arithmetic
-   ratios
-   percentages
-   percentiles
-   medians
-   standard deviation
-   variance
-   correlations
-   date calculations
-   string operations
-   distinct counts
-   deduplication analysis
-   null analysis
-   trend analysis
-   comparisons
-   multi-table analysis
-   multi-step derived calculations
-
-11. Resolve natural-language references using schema names and sample values.
-
-Example:
-If a column called "Team" has sample values ["Engineering", "Sales"], and the
-user asks about Engineering, use that column even though it is not literally
-called "Department".
-
-12. Do not assume a column exists because the question mentions it. Use only
-columns shown in the schema.
-
-13. If the question requests a direct value or small answer, return only the
-columns/rows needed to answer it.
-
-14. If the question asks for a list/table, return the requested rows.
-
-15. If the question asks for a summary or broad analysis, compute useful
-descriptive results that directly support the requested summary.
-
-16. Protect arithmetic from divide-by-zero when necessary, usually with
-NULLIF(..., 0).
-
-17. Treat NULLs deliberately.
-
-18. For text matching, use case-insensitive comparisons when the user's wording
-does not imply case sensitivity. DuckDB ILIKE may be used.
-
-19. Do not invent missing values, rows, columns, categories, dates, or metrics.
-
-20. When multiple datasets are provided, use only those needed to answer the
-question. You may join or compare datasets when the question requires it.
-
-21. If multiple datasets have similar schemas, do not assume rows correspond
-unless there is a defensible join key or the question only requires independent
-aggregates/comparisons.
-
-22. "tables_used" must contain the actual dataset_N table names referenced by
-your SQL.
-
-23. "columns_used" should contain the important source columns used by the
-analysis.
-
-Your output will be validated and executed by another component.
-"""
-
-
-REPAIR_SYSTEM = """
-You repair read-only DuckDB analytical SQL.
-
-A previous SQL query was generated for a user's question, but validation or
-execution failed.
-
-You will receive:
-- the original analytical question,
-- available dataset schemas,
-- the previous SQL,
-- the validation/execution error.
-
-Return JSON only:
-
-{
-  "sql": "corrected SELECT or WITH query",
-  "explanation": "brief description of the corrected analysis",
-  "tables_used": ["dataset_1"],
-  "columns_used": ["Column A"]
-}
-
-RULES
-
-- Correct the query based on the actual schemas and error.
-- Generate exactly one read-only SELECT/WITH query.
-- Use only supplied in-memory tables and exact schema columns.
-- Never access files, URLs, extensions, or external databases.
-- Never generate mutating/admin SQL.
-- Do not answer the user's question yourself.
-- Do not fabricate columns or data.
-- Do not merely repeat the failed query unless it is actually correct.
-"""
 
 
 def needs_analysis(plan: QueryPlan) -> bool:
-    """
-    Structured and hybrid plans require execution against CSV/Excel data.
-    """
-
-    return plan.mode in {
-        ExecutionMode.STRUCTURED,
-        ExecutionMode.HYBRID,
-    }
+    return any(
+        op.op in ANALYSIS_OPS and op.op != "retrieve"
+        for op in plan.operations
+    )
 
 
 def run_analysis(
-    *,
-    question: str,
     plan: QueryPlan,
     store: Storage,
-    gemini: GeminiService,
-    max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS,
-    max_result_rows: int = DEFAULT_MAX_RESULT_ROWS,
 ) -> list[AnalysisResult]:
-    """
-    Execute arbitrary structured-data analysis.
+    frame: pd.DataFrame | None = None
+    source_file: str | None = None
+    results: list[AnalysisResult] = []
 
-    This function intentionally contains no question-specific analytical
-    implementation.
+    for op in plan.operations:
+        if op.op == "retrieve":
+            continue
 
-    Gemini determines the SQL required from:
-        question + real dataset schemas
-
-    DuckDB performs the computation.
-
-    Failed generated queries can be repaired automatically using the database
-    error and schema.
-    """
-
-    if not needs_analysis(plan):
-        return []
-
-    analytical_question = (
-        plan.structured_question
-        or question
-    ).strip()
-
-    if not analytical_question:
-        analytical_question = question.strip()
-
-    datasets = load_datasets(
-        plan=plan,
-        store=store,
-    )
-
-    schema_payload = schemas_for_prompt(datasets)
-
-    generated = _generate_query(
-        question=analytical_question,
-        schemas=schema_payload,
-        gemini=gemini,
-    )
-
-    structured_result = _execute_with_repair(
-        question=analytical_question,
-        generated=generated,
-        datasets=datasets,
-        schemas=schema_payload,
-        gemini=gemini,
-        max_repair_attempts=max_repair_attempts,
-        max_result_rows=max_result_rows,
-    )
-
-    return [
-        _to_analysis_result(
-            result=structured_result,
-            datasets=datasets,
-        )
-    ]
-
-
-def _generate_query(
-    *,
-    question: str,
-    schemas: list[dict[str, Any]],
-    gemini: GeminiService,
-) -> GeneratedQuery:
-    user_prompt = _generation_prompt(
-        question=question,
-        schemas=schemas,
-    )
-
-    try:
-        payload = gemini.generate_json(
-            system=ANALYSIS_SYSTEM,
-            user=user_prompt,
-        )
-
-        generated = GeneratedQuery.model_validate(
-            payload
-        )
-
-    except AnalysisError:
-        raise
-
-    except GeminiError as exc:
-        raise AnalysisError(
-            "The structured analysis query could not be generated."
-        ) from exc
-
-    except Exception as exc:
-        log.exception(
-            "structured_query_generation_invalid"
-        )
-
-        raise AnalysisError(
-            "The structured analysis query was invalid."
-        ) from exc
-
-    log.info(
-        "structured_query_generated tables=%s columns=%s",
-        generated.tables_used,
-        generated.columns_used,
-    )
-
-    return generated
-
-
-def _execute_with_repair(
-    *,
-    question: str,
-    generated: GeneratedQuery,
-    datasets: list[LoadedDataset],
-    schemas: list[dict[str, Any]],
-    gemini: GeminiService,
-    max_repair_attempts: int,
-    max_result_rows: int,
-) -> StructuredResult:
-    """
-    Execute generated SQL and repair it when validation/binding/execution
-    fails.
-
-    Example repairable failures:
-        - wrong column spelling
-        - incorrect quoting
-        - invalid aggregation
-        - incorrect date conversion
-        - ambiguous column after a join
-        - unsupported SQL syntax
-
-    Safety failures are also sent through repair, but every repaired query is
-    independently revalidated by sql_executor.py before execution.
-    """
-
-    max_repair_attempts = max(
-        0,
-        int(max_repair_attempts),
-    )
-
-    current = generated
-    last_error: AnalysisError | None = None
-
-    for attempt in range(
-        max_repair_attempts + 1
-    ):
-        try:
-            result = execute_structured_query(
-                sql=current.sql,
-                datasets=datasets,
-                max_result_rows=max_result_rows,
-                explanation=current.explanation,
+        if op.op == "load_csv":
+            frame, source_file = _load_csv(
+                store,
+                op,
+                plan,
             )
 
-            if attempt:
-                log.info(
-                    "structured_query_repaired attempts=%s",
-                    attempt,
+            results.append(
+                AnalysisResult(
+                    operation="load_csv",
+                    source_file=source_file,
+                    rows_used=len(frame),
+                    columns_used=list(frame.columns),
+                    inputs={"filename": source_file},
+                )
+            )
+            continue
+
+        if frame is None:
+            csv_docs = [
+                d
+                for d in store.list_documents(ready_only=True)
+                if d["file_type"] in {"csv", "excel"}
+            ]
+
+            if not csv_docs:
+                raise AnalysisError(
+                    "No CSV or Excel dataset is available for this calculation."
                 )
 
-            return result
-
-        except AnalysisError as exc:
-            last_error = exc
-
-            log.warning(
-                "structured_query_attempt_failed "
-                "attempt=%s max_repairs=%s error=%s",
-                attempt + 1,
-                max_repair_attempts,
-                str(exc),
+            frame, source_file = _load_csv(
+                store,
+                PlanOp(
+                    op="load_csv",
+                    filename_hint=(
+                        csv_docs[0]["filename"]
+                    ),
+                ),
+                plan,
             )
 
-            if attempt >= max_repair_attempts:
-                break
+        frame, result = _apply_op(
+            frame,
+            op,
+            plan,
+            source_file or "",
+        )
 
-            current = _repair_query(
-                question=question,
-                schemas=schemas,
-                previous=current,
-                error=str(exc),
-                gemini=gemini,
-            )
+        results.append(result)
 
-    if last_error is not None:
+        log.info(
+            "csv_analysis op=%s file=%s",
+            op.op,
+            source_file,
+        )
+
+    return results
+
+
+def _load_csv(
+    store: Storage,
+    op: PlanOp,
+    plan: QueryPlan,
+) -> tuple[pd.DataFrame, str]:
+    docs = [
+        d
+        for d in store.list_documents(ready_only=True)
+        if d["file_type"] in {"csv", "excel"}
+    ]
+
+    if not docs:
         raise AnalysisError(
-            "The requested structured analysis could not be completed "
-            "against the available dataset."
-        ) from last_error
+            "No CSV or Excel dataset is available for this calculation."
+        )
 
-    raise AnalysisError(
-        "The requested structured analysis could not be completed."
-    )
+    hint = (
+        op.filename_hint
+        or (
+            plan.document_hints[0]
+            if plan.document_hints
+            else ""
+        )
+    ).lower()
 
+    chosen = docs[0]
 
-def _repair_query(
-    *,
-    question: str,
-    schemas: list[dict[str, Any]],
-    previous: GeneratedQuery,
-    error: str,
-    gemini: GeminiService,
-) -> GeneratedQuery:
-    user_prompt = _repair_prompt(
-        question=question,
-        schemas=schemas,
-        previous=previous,
-        error=error,
-    )
+    for doc in docs:
+        if hint and hint in doc["filename"].lower():
+            chosen = doc
+            break
+
+        if doc["id"] in plan.document_ids:
+            chosen = doc
+            break
 
     try:
-        payload = gemini.generate_json(
-            system=REPAIR_SYSTEM,
-            user=user_prompt,
-        )
+        path = store.document_file(chosen["id"])
 
-        repaired = GeneratedQuery.model_validate(
-            payload
-        )
+        if chosen["file_type"] == "excel":
+            frame = pd.read_excel(
+                path,
+                sheet_name=0,
+            )
+        else:
+            frame = pd.read_csv(path)
 
-    except GeminiError as exc:
-        raise AnalysisError(
-            "The structured analysis query could not be repaired."
-        ) from exc
+    except NotFoundError:
+        raise
 
     except Exception as exc:
-        log.exception(
-            "structured_query_repair_invalid"
-        )
-
         raise AnalysisError(
-            "The structured analysis query repair was invalid."
+            "The CSV or Excel dataset could not be loaded."
         ) from exc
 
-    return repaired
+    frame.columns = [
+        str(column).strip()
+        for column in frame.columns
+    ]
+
+    return frame, chosen["filename"]
 
 
-def _generation_prompt(
-    *,
-    question: str,
-    schemas: list[dict[str, Any]],
-) -> str:
-    return "\n\n".join(
-        [
-            "ANALYTICAL QUESTION:",
-            question,
-            "DATASETS:",
-            json.dumps(
-                schemas,
-                ensure_ascii=False,
-                indent=2,
-                default=str,
+def _apply_op(
+    frame: pd.DataFrame,
+    op: PlanOp,
+    plan: QueryPlan,
+    source_file: str,
+) -> tuple[pd.DataFrame, AnalysisResult]:
+
+    # ---------------------------------------------------------
+    # FILTER
+    # ---------------------------------------------------------
+
+    if op.op == "filter":
+        column = _resolve_filter_column(
+            frame,
+            op,
+            plan,
+        )
+
+        value = _resolve_filter_value(
+            frame,
+            column,
+            op,
+            plan,
+        )
+
+        working = _filter_frame(
+            frame,
+            column,
+            value,
+        )
+
+        if working.empty:
+            raise AnalysisError(
+                f"No rows matched {column}={value}."
+            )
+
+        return working, AnalysisResult(
+            operation="filter",
+            source_file=source_file,
+            rows_used=len(working),
+            columns_used=[column],
+            inputs={
+                "column": column,
+                "value": value,
+            },
+        )
+
+    # ---------------------------------------------------------
+    # AGGREGATIONS
+    # ---------------------------------------------------------
+
+    if op.op in {
+        "sum",
+        "average",
+        "min",
+        "max",
+        "count",
+    }:
+        filtered = _apply_plan_filters(
+            frame,
+            plan,
+        )
+
+        if filtered.empty:
+            raise AnalysisError(
+                "No rows matched the requested filters."
+            )
+
+        if op.op == "count":
+            column = ""
+            series = None
+        else:
+            column = _require_column(
+                filtered,
+                op.column or op.value_column,
+                plan,
+            )
+
+            series = pd.to_numeric(
+                filtered[column],
+                errors="coerce",
+            )
+
+            if series.dropna().empty:
+                raise AnalysisError(
+                    f"Column '{column}' has no numeric values."
+                )
+
+        if op.op == "sum":
+            value = float(series.sum())
+            formula = f"sum({column})"
+
+        elif op.op == "average":
+            value = float(series.mean())
+            formula = f"mean({column})"
+
+        elif op.op == "min":
+            value = float(series.min())
+            formula = f"min({column})"
+
+        elif op.op == "max":
+            value = float(series.max())
+            formula = f"max({column})"
+
+        else:
+            value = int(len(filtered))
+            formula = "count(rows)"
+
+        return filtered, AnalysisResult(
+            operation=op.op,
+            value=_clean_number(value),
+            formula=formula,
+            source_file=source_file,
+            rows_used=len(filtered),
+            columns_used=[column] if column else [],
+            inputs={
+                "column": column,
+            },
+        )
+
+    # ---------------------------------------------------------
+    # SORT / RANK
+    # ---------------------------------------------------------
+
+    if op.op in {"sort", "rank"}:
+        working = _apply_plan_filters(
+            frame,
+            plan,
+        )
+
+        column = _require_column(
+            working,
+            op.column or op.value_column,
+            plan,
+        )
+
+        n = op.n or 10
+
+        numeric = pd.to_numeric(
+            working[column],
+            errors="coerce",
+        )
+
+        working = (
+            working
+            .assign(_sort=numeric)
+            .sort_values(
+                "_sort",
+                ascending=op.ascending,
+                na_position="last",
+            )
+            .drop(columns=["_sort"])
+        )
+
+        table = json.loads(
+            working
+            .head(n)
+            .to_json(orient="records")
+        )
+
+        return working, AnalysisResult(
+            operation=op.op,
+            table=table,
+            source_file=source_file,
+            rows_used=len(working.head(n)),
+            columns_used=list(working.columns),
+            inputs={
+                "column": column,
+                "n": n,
+                "ascending": op.ascending,
+            },
+        )
+
+    # ---------------------------------------------------------
+    # GROUP BY
+    # ---------------------------------------------------------
+
+    if op.op == "groupby":
+        working = _apply_plan_filters(
+            frame,
+            plan,
+        )
+
+        column = _require_column(
+            working,
+            op.column,
+            plan,
+        )
+
+        value_column = _require_column(
+            working,
+            op.value_column
+            or (
+                plan.metrics[0]
+                if plan.metrics
+                else None
             ),
-            (
-                "Generate the single read-only DuckDB SQL query required "
-                "to answer the analytical question."
-            ),
+            plan,
+        )
+
+        agg = (
+            op.agg or "sum"
+        ).lower()
+
+        if agg not in {
+            "sum",
+            "mean",
+            "min",
+            "max",
+            "count",
+        }:
+            raise AnalysisError(
+                "Unsupported aggregation."
+            )
+
+        grouped = working.groupby(
+            column,
+            dropna=False,
+        )[value_column]
+
+        if agg == "count":
+            out = grouped.count().reset_index(
+                name=value_column
+            )
+        else:
+            out = getattr(grouped, agg)().reset_index()
+
+        table = json.loads(
+            out.to_json(
+                orient="records"
+            )
+        )
+
+        return working, AnalysisResult(
+            operation="groupby",
+            table=table,
+            source_file=source_file,
+            rows_used=len(out),
+            columns_used=[
+                column,
+                value_column,
+            ],
+            inputs={
+                "by": column,
+                "agg": agg,
+                "value_column": value_column,
+            },
+        )
+
+    # ---------------------------------------------------------
+    # PERCENTAGE CHANGE / YOY
+    # ---------------------------------------------------------
+
+    if op.op in {
+        "percentage_change",
+        "yoy",
+    }:
+        filtered = _apply_plan_filters(
+            frame,
+            plan,
+        )
+
+        year_col = _year_column(
+            filtered,
+            op,
+        )
+
+        value_col = _require_column(
+            filtered,
+            op.value_column or op.column,
+            plan,
+        )
+
+        years = [
+            op.from_year,
+            op.to_year,
         ]
+
+        if (
+            years[0] is None
+            or years[1] is None
+        ):
+            if len(plan.years) >= 2:
+                years = [
+                    min(plan.years),
+                    max(plan.years),
+                ]
+            else:
+                raise AnalysisError(
+                    "Year-over-year comparison requires two years."
+                )
+
+        old_year = int(years[0])
+        new_year = int(years[1])
+
+        old_v = _year_value(
+            filtered,
+            year_col,
+            value_col,
+            old_year,
+        )
+
+        new_v = _year_value(
+            filtered,
+            year_col,
+            value_col,
+            new_year,
+        )
+
+        if old_v == 0:
+            raise AnalysisError(
+                "Cannot compute percentage change from a zero baseline."
+            )
+
+        pct = (
+            (new_v - old_v)
+            / old_v
+        ) * 100
+
+        formula = (
+            f"(({new_v} - {old_v}) "
+            f"/ {old_v}) * 100"
+        )
+
+        return filtered, AnalysisResult(
+            operation=op.op,
+            value=_clean_number(pct),
+            formula=formula,
+            source_file=source_file,
+            rows_used=2,
+            columns_used=[
+                year_col,
+                value_col,
+            ],
+            inputs={
+                "from": old_year,
+                "to": new_year,
+                "old": old_v,
+                "new": new_v,
+            },
+        )
+
+    # ---------------------------------------------------------
+    # COMPARE
+    # ---------------------------------------------------------
+
+    if op.op == "compare":
+        filtered = _apply_plan_filters(
+            frame,
+            plan,
+        )
+
+        column = _require_column(
+            filtered,
+            op.value_column or op.column,
+            plan,
+        )
+
+        entity_col = (
+            op.target
+            or _guess_entity_column(filtered)
+        )
+
+        if (
+            not entity_col
+            or len(plan.entities) < 2
+        ):
+            raise AnalysisError(
+                "Entity comparison requires two entities."
+            )
+
+        values = {}
+
+        for entity in plan.entities[:2]:
+            subset = _filter_frame(
+                filtered,
+                entity_col,
+                entity,
+            )
+
+            series = pd.to_numeric(
+                subset[column],
+                errors="coerce",
+            ).dropna()
+
+            if series.empty:
+                raise AnalysisError(
+                    f"No numeric values found for {entity}."
+                )
+
+            values[entity] = _clean_number(
+                float(
+                    series.sum()
+                    if len(series) > 1
+                    else series.iloc[0]
+                )
+            )
+
+        return filtered, AnalysisResult(
+            operation="compare",
+            value=values,
+            source_file=source_file,
+            rows_used=len(filtered),
+            columns_used=[
+                entity_col,
+                column,
+            ],
+            inputs={
+                "entities": plan.entities[:2],
+            },
+        )
+
+    raise AnalysisError(
+        f"Unsupported analysis operation '{op.op}'."
     )
 
 
-def _repair_prompt(
-    *,
-    question: str,
-    schemas: list[dict[str, Any]],
-    previous: GeneratedQuery,
-    error: str,
+# =============================================================
+# PLAN FILTERS
+# =============================================================
+
+
+def _apply_plan_filters(
+    frame: pd.DataFrame,
+    plan: QueryPlan,
+) -> pd.DataFrame:
+    working = frame
+
+    # ---------------------------------------------------------
+    # Apply explicit filters generated by the planner.
+    # ---------------------------------------------------------
+
+    for column_name, value in plan.filters.items():
+        column = _resolve_column(
+            working,
+            str(column_name),
+        )
+
+        if column is None:
+            continue
+
+        working = _filter_frame(
+            working,
+            column,
+            value,
+        )
+
+    # ---------------------------------------------------------
+    # Entity filter.
+    #
+    # This is useful when Gemini identifies:
+    #
+    #   entities = ["Carretera"]
+    #
+    # but does not explicitly create:
+    #
+    #   filters = {"Product": "Carretera"}
+    # ---------------------------------------------------------
+
+    entity_col = _guess_entity_column(
+        working
+    )
+
+    if (
+        entity_col
+        and len(plan.entities) == 1
+        and not _has_explicit_filter_for_column(
+            plan,
+            entity_col,
+        )
+    ):
+        working = _filter_frame(
+            working,
+            entity_col,
+            plan.entities[0],
+        )
+
+    # ---------------------------------------------------------
+    # Year filter.
+    # ---------------------------------------------------------
+
+    if len(plan.years) == 1:
+        year_col = _find_year_column(
+            working
+        )
+
+        if year_col:
+            years = pd.to_numeric(
+                working[year_col],
+                errors="coerce",
+            )
+
+            working = working[
+                years == plan.years[0]
+            ]
+
+    return working
+
+
+def _has_explicit_filter_for_column(
+    plan: QueryPlan,
+    column: str,
+) -> bool:
+    for key in plan.filters:
+        if key.lower() == column.lower():
+            return True
+
+    return False
+
+
+# =============================================================
+# FILTER RESOLUTION
+# =============================================================
+
+
+def _resolve_filter_column(
+    frame: pd.DataFrame,
+    op: PlanOp,
+    plan: QueryPlan,
 ) -> str:
-    previous_payload = {
-        "sql": previous.sql,
-        "explanation": previous.explanation,
-        "tables_used": previous.tables_used,
-        "columns_used": previous.columns_used,
+    """
+    Resolve the actual column to filter.
+
+    If Gemini accidentally produces:
+
+        column = "Units Sold"
+        value = "Carretera"
+
+    we recognize that "Units Sold" is probably the requested
+    metric and "Carretera" is an entity value.
+
+    We then use the dataset's entity column instead.
+    """
+
+    requested = op.column
+
+    if requested:
+        resolved = _resolve_column(
+            frame,
+            requested,
+        )
+
+        if resolved:
+            # If the requested column is numeric but the value
+            # is textual and matches an entity, it is probably
+            # an incorrectly constructed filter.
+            if (
+                op.value is not None
+                and _looks_numeric_column(frame, resolved)
+                and _looks_like_entity_value(
+                    frame,
+                    op.value,
+                    plan,
+                )
+            ):
+                entity_col = _guess_entity_column(
+                    frame
+                )
+
+                if entity_col:
+                    return entity_col
+
+            return resolved
+
+    entity_col = _guess_entity_column(
+        frame
+    )
+
+    if (
+        entity_col
+        and op.value is not None
+        and _looks_like_entity_value(
+            frame,
+            op.value,
+            plan,
+        )
+    ):
+        return entity_col
+
+    if plan.entities:
+        if entity_col:
+            return entity_col
+
+    raise AnalysisError(
+        "A filter column could not be determined."
+    )
+
+
+def _resolve_filter_value(
+    frame: pd.DataFrame,
+    column: str,
+    op: PlanOp,
+    plan: QueryPlan,
+) -> Any:
+    if op.value is not None:
+        value = op.value
+
+        # If the planner accidentally put the entity into
+        # the metric filter, use the entity as the value.
+        if (
+            _looks_numeric_column(
+                frame,
+                column,
+            )
+            and _looks_like_entity_value(
+                frame,
+                value,
+                plan,
+            )
+        ):
+            if plan.entities:
+                return plan.entities[0]
+
+        return value
+
+    if plan.entities:
+        return plan.entities[0]
+
+    raise AnalysisError(
+        "A filter value was not provided."
+    )
+
+
+# =============================================================
+# ENTITY / COLUMN HELPERS
+# =============================================================
+
+
+def _guess_entity_column(
+    frame: pd.DataFrame,
+) -> str | None:
+    preferred = {
+        "product",
+        "product name",
+        "department",
+        "entity",
+        "name",
+        "team",
+        "division",
+        "company",
     }
 
-    return "\n\n".join(
-        [
-            "ORIGINAL ANALYTICAL QUESTION:",
-            question,
-            "AVAILABLE DATASETS:",
-            json.dumps(
-                schemas,
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            ),
-            "PREVIOUS GENERATED QUERY:",
-            json.dumps(
-                previous_payload,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            "VALIDATION OR EXECUTION ERROR:",
-            error,
-            (
-                "Generate a corrected single read-only DuckDB query. "
-                "Use only the supplied tables and columns."
-            ),
-        ]
+    for column in frame.columns:
+        if column.lower().strip() in preferred:
+            return column
+
+    for column in frame.columns:
+        name = column.lower()
+
+        if (
+            "product" in name
+            or "department" in name
+            or "entity" in name
+        ):
+            return column
+
+    return None
+
+
+def _looks_numeric_column(
+    frame: pd.DataFrame,
+    column: str,
+) -> bool:
+    numeric = pd.to_numeric(
+        frame[column],
+        errors="coerce",
     )
 
+    return numeric.notna().sum() > 0
 
-def _to_analysis_result(
-    *,
-    result: StructuredResult,
-    datasets: list[LoadedDataset],
-) -> AnalysisResult:
-    """
-    Convert verified DuckDB output into the generic evidence model consumed
-    by chat/evidence layers.
-    """
 
-    value = _single_value(result)
+def _looks_like_entity_value(
+    frame: pd.DataFrame,
+    value: Any,
+    plan: QueryPlan,
+) -> bool:
+    if not isinstance(value, str):
+        return False
 
-    primary_document_id = ""
-    primary_filename = ""
+    value = value.strip()
 
-    if len(datasets) == 1:
-        primary_document_id = datasets[0].document_id
-        primary_filename = datasets[0].filename
+    if not value:
+        return False
 
-    return AnalysisResult(
-        operation="dynamic_sql",
-        value=value,
-        table=result.rows,
-        columns=result.columns,
-        formula=None,
-        query=result.sql,
-        filename=primary_filename,
-        document_id=primary_document_id,
-        source_filenames=result.source_filenames,
-        source_document_ids=result.source_document_ids,
-        rows_used=result.row_count,
-        truncated=result.truncated,
-        explanation=_analysis_explanation(result),
+    if value in plan.entities:
+        return True
+
+    entity_col = _guess_entity_column(
+        frame
     )
 
+    if not entity_col:
+        return False
 
-def _single_value(
-    result: StructuredResult,
-) -> Any | None:
-    """
-    Preserve convenient scalar results for conversation context.
+    values = (
+        frame[entity_col]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
 
-    Example:
-        SELECT SUM("Revenue") AS total_revenue
-        → value = 1234567
-
-    Multi-row/multi-column results remain in AnalysisResult.table.
-    """
-
-    if len(result.rows) != 1:
-        return None
-
-    if len(result.columns) != 1:
-        return None
-
-    column = result.columns[0]
-
-    return result.rows[0].get(column)
+    return value.lower() in set(values)
 
 
-def _analysis_explanation(
-    result: StructuredResult,
+# =============================================================
+# GENERAL COLUMN HELPERS
+# =============================================================
+
+
+def _filter_frame(
+    frame: pd.DataFrame,
+    column: str,
+    value: Any,
+) -> pd.DataFrame:
+    series = (
+        frame[column]
+        .astype(str)
+        .str.strip()
+    )
+
+    target = str(value).strip()
+
+    # Normal textual/date comparison.
+    exact = series.str.lower() == target.lower()
+
+    if exact.any():
+        return frame[exact]
+
+    # Date normalization.
+    try:
+        target_date = pd.to_datetime(
+            target,
+            errors="raise",
+        ).normalize()
+
+        dates = pd.to_datetime(
+            frame[column],
+            errors="coerce",
+        ).dt.normalize()
+
+        date_matches = dates == target_date
+
+        if date_matches.any():
+            return frame[date_matches]
+
+    except Exception:
+        pass
+
+    return frame[exact]
+
+
+def _require_column(
+    frame: pd.DataFrame,
+    name: str | None,
+    plan: QueryPlan,
 ) -> str:
-    pieces: list[str] = []
-
-    if result.explanation:
-        pieces.append(
-            result.explanation.strip()
+    if not name:
+        name = (
+            plan.metrics[0]
+            if plan.metrics
+            else None
         )
 
-    if result.result_text:
-        pieces.append(
-            result.result_text.strip()
+    if not name:
+        numeric = [
+            column
+            for column in frame.columns
+            if pd.api.types.is_numeric_dtype(
+                frame[column]
+            )
+        ]
+
+        if len(numeric) == 1:
+            return numeric[0]
+
+        raise AnalysisError(
+            "A target column was not specified."
         )
 
-    return "\n\n".join(
-        piece
-        for piece in pieces
-        if piece
+    resolved = _resolve_column(
+        frame,
+        name,
     )
+
+    if resolved is None:
+        raise AnalysisError(
+            f"Column '{name}' was not found in the dataset."
+        )
+
+    return resolved
+
+
+def _resolve_column(
+    frame: pd.DataFrame,
+    name: str,
+) -> str | None:
+    lookup = {
+        column.lower(): column
+        for column in frame.columns
+    }
+
+    name_lower = name.lower().strip()
+
+    if name_lower in lookup:
+        return lookup[name_lower]
+
+    for column in frame.columns:
+        column_lower = column.lower()
+
+        if (
+            name_lower in column_lower
+            or column_lower in name_lower
+        ):
+            return column
+
+    return None
+
+
+def _find_year_column(
+    frame: pd.DataFrame,
+) -> str | None:
+    for column in frame.columns:
+        if column.lower().strip() in {
+            "year",
+            "yr",
+            "fiscal_year",
+            "fy",
+        }:
+            return column
+
+    return None
+
+
+def _year_column(
+    frame: pd.DataFrame,
+    op: PlanOp,
+) -> str:
+    if op.year_column:
+        resolved = _resolve_column(
+            frame,
+            op.year_column,
+        )
+
+        if resolved:
+            return resolved
+
+    column = _find_year_column(frame)
+
+    if column:
+        return column
+
+    raise AnalysisError(
+        "A year column was not found in the dataset."
+    )
+
+
+def _year_value(
+    frame: pd.DataFrame,
+    year_col: str,
+    value_col: str,
+    year: int,
+) -> float:
+    years = pd.to_numeric(
+        frame[year_col],
+        errors="coerce",
+    )
+
+    subset = frame[
+        years == year
+    ]
+
+    if subset.empty:
+        raise AnalysisError(
+            f"No rows were found for year {year}."
+        )
+
+    series = pd.to_numeric(
+        subset[value_col],
+        errors="coerce",
+    ).dropna()
+
+    if series.empty:
+        raise AnalysisError(
+            f"No numeric values were found for year {year}."
+        )
+
+    return float(
+        series.sum()
+        if len(series) > 1
+        else series.iloc[0]
+    )
+
+
+def _clean_number(
+    value: float | int,
+) -> float | int:
+    if (
+        isinstance(value, float)
+        and value.is_integer()
+    ):
+        return int(value)
+
+    if isinstance(value, float):
+        return round(value, 6)
+
+    return value
