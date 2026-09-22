@@ -1,88 +1,75 @@
 
-async def execute_csv_step(
-    question: str,
-    document_ids: list[str],
-    document_map: dict[str, Document],
-    execution_flow: list[str],
-) -> tuple[
-    list[Evidence],
-    list[Source],
-]:
+def format_evidence(
+    evidence: list[dict[str, Any]],
+) -> str:
     """
-    Execute DuckDB analysis for CSV/Excel documents.
-
-    Each selected tabular document is queried independently.
-    This keeps the generated SQL scoped to a known source.
+    Convert retrieved document evidence into text that can be
+    supplied to the final LLM.
     """
 
-    evidence: list[Evidence] = []
-    sources: list[Source] = []
+    if not evidence:
+        return ""
 
-    for document_id in document_ids:
+    sections: list[str] = []
 
-        document = document_map.get(
-            document_id
+    for index, item in enumerate(evidence, start=1):
+        source_type = item.get(
+            "source_type",
+            "unknown",
         )
 
-        if document is None:
-            continue
-
-        execution_flow.append(
-            f"Analyzing {document.filename} "
-            "with DuckDB."
+        filename = item.get(
+            "filename",
+            "Unknown document",
         )
 
-        try:
-            result = await answer_csv_question(
-                question=question,
-                document=document,
-            )
-
-        except Exception:
-            log.exception(
-                "CSV analysis failed for %s",
-                document.filename,
-            )
-
-            execution_flow.append(
-                f"DuckDB analysis failed for "
-                f"{document.filename}."
-            )
-
-            raise RuntimeError(
-                f"Could not analyze {document.filename}."
-            )
-
-        execution_flow.append(
-            f"Executed a DuckDB query against "
-            f"{document.filename}."
+        document_id = item.get(
+            "document_id",
+            "Unknown document ID",
         )
 
-        result_dict = result.model_dump(
-            mode="json"
+        content = item.get(
+            "content",
+            "",
         )
 
-        evidence.append(
-            Evidence(
-                source_type="csv",
-                document_id=document.id,
-                filename=document.filename,
-                content=format_csv_result(
-                    result_dict
-                ),
-                metadata={
-                    "sql": result.sql,
-                    "columns": result.columns,
-                    "row_count": result.row_count,
-                },
+        metadata = item.get(
+            "metadata",
+            {},
+        )
+
+        section_lines = [
+            f"Evidence {index}",
+            f"Source type: {source_type}",
+            f"Document ID: {document_id}",
+            f"Filename: {filename}",
+        ]
+
+        page = metadata.get("page")
+
+        if page is not None:
+            section_lines.append(
+                f"Page: {page}"
             )
-        )
 
-        sources.append(
-            build_csv_source(
-                document,
-                result_dict,
+        section = metadata.get("section")
+
+        if section:
+            section_lines.append(
+                f"Section: {section}"
             )
+
+        section_lines.extend(
+            [
+                "Content:",
+                str(content),
+            ]
         )
 
-    return evidence, sources
+        sections.append(
+            "\n".join(section_lines)
+        )
+
+    return "\n\n--------------------\n\n".join(
+        sections
+    )
