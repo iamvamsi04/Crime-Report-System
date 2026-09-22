@@ -1,133 +1,88 @@
-async def answer_csv_question(
+
+async def execute_csv_step(
     question: str,
-    document: Document,
-) -> CSVQueryResult:
-    """Generate and execute a SQL query for a tabular question."""
-
-    profile = get_profile(
-        document.id
-    )
-
-    if profile is None:
-        raise ValueError(
-            "CSV profile is unavailable."
-        )
-
-    sql = await generate_sql(
-        question=question,
-        profile=profile,
-    )
-
-    result = execute_duckdb_query(
-        document=document,
-        sql=sql,
-    )
-
-    log.info(
-        "DuckDB query executed for %s: %s",
-        document.filename,
-        sql,
-    )
-
-    return result
-
-
-
-def execute_duckdb_query(
-    document: Document,
-    sql: str,
-) -> CSVQueryResult:
+    document_ids: list[str],
+    document_map: dict[str, Document],
+    execution_flow: list[str],
+) -> tuple[
+    list[Evidence],
+    list[Source],
+]:
     """
-    Execute a validated query against a normalized DataFrame.
+    Execute DuckDB analysis for CSV/Excel documents.
 
-    The same DataFrame is used for profiling and DuckDB execution.
-    This guarantees that the column names are identical in both places.
+    Each selected tabular document is queried independently.
+    This keeps the generated SQL scoped to a known source.
     """
 
-    path = Path(document.path)
+    evidence: list[Evidence] = []
+    sources: list[Source] = []
 
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Data file not found: {path}"
+    for document_id in document_ids:
+
+        document = document_map.get(
+            document_id
         )
 
-    profile = get_profile(
-        document.id
-    )
+        if document is None:
+            continue
 
-    if profile is None:
-        raise ValueError(
-            "CSV profile is unavailable."
+        execution_flow.append(
+            f"Analyzing {document.filename} "
+            "with DuckDB."
         )
 
-    sql = normalize_sql_identifiers(
-    sql=sql,
-    profile=profile,
-)
+        try:
+            result = await answer_csv_question(
+                question=question,
+                document=document,
+            )
 
-    validate_sql(
-        sql=sql,
-        profile=profile,
-    )
+        except Exception:
+            log.exception(
+                "CSV analysis failed for %s",
+                document.filename,
+            )
 
-    dataframe = load_dataframe(
-        path=path,
-        file_type=document.file_type,
-    )
+            execution_flow.append(
+                f"DuckDB analysis failed for "
+                f"{document.filename}."
+            )
 
-    connection = duckdb.connect(
-        database=":memory:"
-    )
+            raise RuntimeError(
+                f"Could not analyze {document.filename}."
+            )
 
-    try:
-
-        connection.register(
-            "dataframe",
-            dataframe,
+        execution_flow.append(
+            f"Executed a DuckDB query against "
+            f"{document.filename}."
         )
 
-        connection.execute(
-            """
-            CREATE VIEW data AS
-            SELECT *
-            FROM dataframe
-            """
+        result_dict = result.model_dump(
+            mode="json"
         )
 
-        result = connection.execute(
-            sql
+        evidence.append(
+            Evidence(
+                source_type="csv",
+                document_id=document.id,
+                filename=document.filename,
+                content=format_csv_result(
+                    result_dict
+                ),
+                metadata={
+                    "sql": result.sql,
+                    "columns": result.columns,
+                    "row_count": result.row_count,
+                },
+            )
         )
 
-        rows = result.fetchmany(
-            MAX_RESULT_ROWS
+        sources.append(
+            build_csv_source(
+                document,
+                result_dict,
+            )
         )
 
-        columns = [
-            description[0]
-            for description in result.description
-        ]
-
-        normalized_rows = [
-            {
-                column: normalize_value(value)
-                for column, value in zip(
-                    columns,
-                    row,
-                )
-            }
-            for row in rows
-        ]
-
-        return CSVQueryResult(
-            document_id=document.id,
-            filename=document.filename,
-            sql=sql,
-            columns=columns,
-            rows=normalized_rows,
-            row_count=len(
-                normalized_rows
-            ),
-        )
-
-    finally:
-        connection.close()
+    return evidence, sources
