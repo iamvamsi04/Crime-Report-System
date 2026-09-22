@@ -1,109 +1,133 @@
-
-async def generate_sql(
+async def answer_csv_question(
     question: str,
-    profile: CSVProfile,
-) -> str:
-    """Generate a read-only DuckDB query from the CSV profile."""
+    document: Document,
+) -> CSVQueryResult:
+    """Generate and execute a SQL query for a tabular question."""
 
-    profile_json = json.dumps(
-        profile.model_dump(mode="json"),
-        indent=2,
-        ensure_ascii=False,
+    profile = get_profile(
+        document.id
     )
 
-    prompt = f"""
-You generate DuckDB SQL for answering questions
-about one uploaded tabular file.
-
-You are given:
-1. The user's question.
-2. A profile describing the available columns.
-
-Your job is to generate ONE read-only DuckDB SQL query.
-
-Rules:
-- Query only the table named `data`.
-- Use ONLY columns that exist in the supplied profile.
-- Column names must match the profile exactly.
-- Do NOT add spaces before or after column names.
-- Do NOT invent columns.
-- Do NOT modify data.
-- Do NOT create tables.
-- Do NOT access external files.
-- Do NOT use INSERT, UPDATE, DELETE, DROP, ALTER,
-  COPY, EXPORT, IMPORT, ATTACH, DETACH,
-  INSTALL, LOAD, SET, RESET, or CALL.
-- Use DuckDB SQL syntax.
-- For calculations, perform the calculation in SQL.
-- For "highest", "lowest", "best", etc., explicitly
-  order and limit the result when appropriate.
-- Return only SQL.
-- Do not include markdown fences.
-- The query must answer the user's question directly.
-
-IMPORTANT ENTITY INTERPRETATION RULE:
-
-When the user mentions a specific value or entity without
-explicitly naming the column, use the representative
-column values in the profile to determine which column
-contains that value.
-
-For example, if the question is:
-
-    total units sold for Montana
-
-and the profile shows:
-
-    Product -> Montana
-    Country -> Canada, France, Germany
-    Segment -> Midmarket, Government, Small Business, Enterprise, Channel Partners
-
-then interpret Montana as a Product and use:
-
-    WHERE "Product" = ' Montana '
-
-Do NOT assume that an entity is a Country, Product,
-Department, Region, or any other category merely from
-the wording.
-
-
-IMPORTANT:
-The column names in the profile have already been
-normalized by removing unnecessary leading/trailing
-whitespace.
-
-CSV PROFILE:
-{profile_json}
-
-USER QUESTION:
-{question}
-"""
-
-    response = await generate_structured_response(
-        prompt=prompt,
-        schema={
-            "type": "object",
-            "properties": {
-                "sql": {
-                    "type": "string"
-                }
-            },
-            "required": ["sql"],
-        },
-    )
-
-    sql = response.get("sql")
-
-    if not isinstance(sql, str):
+    if profile is None:
         raise ValueError(
-            "The LLM did not return valid SQL."
+            "CSV profile is unavailable."
         )
 
-    sql = clean_sql(sql)
+    sql = await generate_sql(
+        question=question,
+        profile=profile,
+    )
+
+    result = execute_duckdb_query(
+        document=document,
+        sql=sql,
+    )
+
+    log.info(
+        "DuckDB query executed for %s: %s",
+        document.filename,
+        sql,
+    )
+
+    return result
+
+
+
+def execute_duckdb_query(
+    document: Document,
+    sql: str,
+) -> CSVQueryResult:
+    """
+    Execute a validated query against a normalized DataFrame.
+
+    The same DataFrame is used for profiling and DuckDB execution.
+    This guarantees that the column names are identical in both places.
+    """
+
+    path = Path(document.path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Data file not found: {path}"
+        )
+
+    profile = get_profile(
+        document.id
+    )
+
+    if profile is None:
+        raise ValueError(
+            "CSV profile is unavailable."
+        )
+
+    sql = normalize_sql_identifiers(
+    sql=sql,
+    profile=profile,
+)
 
     validate_sql(
         sql=sql,
         profile=profile,
     )
 
-    return sql
+    dataframe = load_dataframe(
+        path=path,
+        file_type=document.file_type,
+    )
+
+    connection = duckdb.connect(
+        database=":memory:"
+    )
+
+    try:
+
+        connection.register(
+            "dataframe",
+            dataframe,
+        )
+
+        connection.execute(
+            """
+            CREATE VIEW data AS
+            SELECT *
+            FROM dataframe
+            """
+        )
+
+        result = connection.execute(
+            sql
+        )
+
+        rows = result.fetchmany(
+            MAX_RESULT_ROWS
+        )
+
+        columns = [
+            description[0]
+            for description in result.description
+        ]
+
+        normalized_rows = [
+            {
+                column: normalize_value(value)
+                for column, value in zip(
+                    columns,
+                    row,
+                )
+            }
+            for row in rows
+        ]
+
+        return CSVQueryResult(
+            document_id=document.id,
+            filename=document.filename,
+            sql=sql,
+            columns=columns,
+            rows=normalized_rows,
+            row_count=len(
+                normalized_rows
+            ),
+        )
+
+    finally:
+        connection.close()
