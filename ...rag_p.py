@@ -1,655 +1,830 @@
 from __future__ import annotations
 
-import json
 import logging
-import re
+import time
 from pathlib import Path
 from typing import Any
 
-import duckdb
-import pandas as pd
+import chromadb
+import pymupdf
+from google import genai
+from google.genai import types
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from app import database
-from app.llm import generate_structured_response
-from app.models import (
-    CSVColumn,
-    CSVProfile,
-    CSVQueryResult,
-    Document,
+from app.config import (
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    EMBEDDING_MODEL,
+    RAG_MIN_SIMILARITY,
+    RAG_TOP_K,
+    VECTOR_STORE_DIR,
 )
+from app.models import Document, RetrievedChunk
+
 
 log = logging.getLogger(__name__)
 
-MAX_RESULT_ROWS = 1000
 
-FORBIDDEN_SQL = {
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "DROP",
-    "ALTER",
-    "CREATE",
-    "COPY",
-    "EXPORT",
-    "IMPORT",
-    "ATTACH",
-    "DETACH",
-    "INSTALL",
-    "LOAD",
-    "SET",
-    "RESET",
-    "CALL",
-}
 
 
-async def profile_csv_document(document: Document) -> None:
-    """Read a tabular document and save its normalized schema profile."""
 
-    if document.file_type not in {"csv", "excel"}:
-        raise ValueError(
-            "Only CSV and Excel files can be profiled."
-        )
+BATCH_SIZE = 50
 
-    path = Path(document.path)
+MIN_SECONDS_BETWEEN_REQUESTS = 0.7
 
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Data file not found: {path}"
-        )
+MAX_RETRIES = 6
+INITIAL_RETRY_DELAY = 2.0
+MAX_RETRY_DELAY = 30.0
 
-    dataframe = load_dataframe(
-        path=path,
-        file_type=document.file_type,
-    )
 
-    if dataframe.empty:
-        raise ValueError(
-            "The uploaded data file contains no rows."
-        )
+_client = genai.Client()
 
-    dataframe = normalize_dataframe_columns(
-        dataframe
-    )
 
-    profile = build_csv_profile(
-        document=document,
-        dataframe=dataframe,
-    )
 
-    database.save_csv_profile(
-        document_id=document.id,
-        profile=profile.model_dump(mode="json"),
-    )
-
-
-def load_dataframe(
-    path: Path,
-    file_type: str,
-) -> pd.DataFrame:
-    """Load CSV or Excel data into a pandas DataFrame."""
-
-    if file_type == "csv":
-        dataframe = pd.read_csv(path)
-
-    elif file_type == "excel":
-        dataframe = pd.read_excel(
-            path,
-            sheet_name=0,
-        )
-
-    else:
-        raise ValueError(
-            f"Unsupported tabular file type: {file_type}"
-        )
-
-    return normalize_dataframe_columns(
-        dataframe
-    )
-
-
-def normalize_column_name(name: Any) -> str:
-    """
-    Normalize a column name so that whitespace differences
-    in the original file cannot break SQL generation.
-    """
-
-    normalized = str(name).strip()
-
-    # Collapse repeated whitespace inside a column name.
-    normalized = re.sub(
-        r"\s+",
-        " ",
-        normalized,
-    )
-
-    return normalized
-
-
-def normalize_dataframe_columns(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Normalize all DataFrame column names.
-
-    Example:
-        '  Units Sold ' -> 'Units Sold'
-        '  Sales '      -> 'Sales'
-    """
-
-    dataframe = dataframe.copy()
-
-    normalized_columns = [
-        normalize_column_name(column)
-        for column in dataframe.columns
-    ]
-
-    if len(normalized_columns) != len(
-        set(normalized_columns)
-    ):
-        raise ValueError(
-            "The data file contains duplicate column names "
-            "after whitespace normalization."
-        )
-
-    dataframe.columns = normalized_columns
-
-    return dataframe
-
-
-def build_csv_profile(
-    document: Document,
-    dataframe: pd.DataFrame,
-) -> CSVProfile:
-    """Create a schema profile from a normalized DataFrame."""
-
-    columns: list[CSVColumn] = []
-
-    for column in dataframe.columns:
-        series = dataframe[column]
-
-        sample_values = (
-            series
-            .dropna()
-            .head(5)
-            .tolist()
-        )
-
-        normalized_samples = [
-            normalize_value(value)
-            for value in sample_values
-        ]
-
-        columns.append(
-            CSVColumn(
-                name=str(column),
-                data_type=str(series.dtype),
-                nullable=bool(series.isna().any()),
-                sample_values=normalized_samples,
-            )
-        )
-
-    return CSVProfile(
-        document_id=document.id,
-        filename=document.filename,
-        row_count=len(dataframe),
-        column_count=len(dataframe.columns),
-        columns=columns,
-        description=(
-            "Profile generated from the uploaded "
-            "tabular document."
-        ),
-    )
-
-
-def normalize_value(value: Any) -> Any:
-    """Convert pandas/numpy values into JSON-safe values."""
-
-    if pd.isna(value):
-        return None
-
-    if isinstance(
-        value,
-        (str, int, float, bool),
-    ):
-        return value
-
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-
-    return str(value)
-
-
-def get_profile(
-    document_id: str,
-) -> CSVProfile | None:
-    """Retrieve and validate a saved CSV profile."""
-
-    raw_profile = database.get_csv_profile(
-        document_id
-    )
-
-    if raw_profile is None:
-        return None
-
-    try:
-        return CSVProfile.model_validate(
-            raw_profile
-        )
-    except Exception:
-        log.exception(
-            "Invalid CSV profile for document %s",
-            document_id,
-        )
-        return None
-
-
-async def generate_sql(
-    question: str,
-    profile: CSVProfile,
-) -> str:
-    """Generate a read-only DuckDB query from the CSV profile."""
-
-    profile_json = json.dumps(
-        profile.model_dump(mode="json"),
-        indent=2,
-        ensure_ascii=False,
-    )
-
-    prompt = f"""
-You generate DuckDB SQL for answering questions
-about one uploaded tabular file.
-
-You are given:
-1. The user's question.
-2. A profile describing the available columns.
-
-Your job is to generate ONE read-only DuckDB SQL query.
-
-Rules:
-- Query only the table named `data`.
-- Use ONLY columns that exist in the supplied profile.
-- Column names must match the profile exactly.
-- Do NOT add spaces before or after column names.
-- Do NOT invent columns.
-- Do NOT modify data.
-- Do NOT create tables.
-- Do NOT access external files.
-- Do NOT use INSERT, UPDATE, DELETE, DROP, ALTER,
-  COPY, EXPORT, IMPORT, ATTACH, DETACH,
-  INSTALL, LOAD, SET, RESET, or CALL.
-- Use DuckDB SQL syntax.
-- For calculations, perform the calculation in SQL.
-- For "highest", "lowest", "best", etc., explicitly
-  order and limit the result when appropriate.
-- Return only SQL.
-- Do not include markdown fences.
-- The query must answer the user's question directly.
-
-IMPORTANT ENTITY INTERPRETATION RULE:
-
-When the user mentions a specific value or entity without
-explicitly naming the column, use the representative
-column values in the profile to determine which column
-contains that value.
-
-For example, if the question is:
-
-    total units sold for Montana
-
-and the profile shows:
-
-    Product -> Montana
-    Country -> Canada, France, Germany
-    Segment -> Midmarket, Government, Small Business, Enterprise, Channel Partners
-
-then interpret Montana as a Product and use:
-
-    WHERE "Product" = ' Montana '
-
-Do NOT assume that an entity is a Country, Product,
-Department, Region, or any other category merely from
-the wording.
-
-
-IMPORTANT:
-The column names in the profile have already been
-normalized by removing unnecessary leading/trailing
-whitespace.
-
-CSV PROFILE:
-{profile_json}
-
-USER QUESTION:
-{question}
-"""
-
-    response = await generate_structured_response(
-        prompt=prompt,
-        schema={
-            "type": "object",
-            "properties": {
-                "sql": {
-                    "type": "string"
-                }
-            },
-            "required": ["sql"],
-        },
-    )
-
-    sql = response.get("sql")
-
-    if not isinstance(sql, str):
-        raise ValueError(
-            "The LLM did not return valid SQL."
-        )
-
-    sql = clean_sql(sql)
-
-    validate_sql(
-        sql=sql,
-        profile=profile,
-    )
-
-    return sql
-
-
-def clean_sql(sql: str) -> str:
-    """Remove markdown fences and trailing semicolons."""
-
-    sql = sql.strip()
-
-    if sql.startswith("```"):
-        sql = re.sub(
-            r"^```(?:sql)?\s*",
-            "",
-            sql,
-            flags=re.IGNORECASE,
-        )
-
-        sql = re.sub(
-            r"\s*```$",
-            "",
-            sql,
-        )
-
-    sql = sql.strip()
-
-    if sql.endswith(";"):
-        sql = sql[:-1].strip()
-
-    return sql
-
-
-def validate_sql(
-    sql: str,
-    profile: CSVProfile,
-) -> None:
-    """Validate that generated SQL is safe and references known columns."""
-
-    if not sql:
-        raise ValueError(
-            "Generated SQL is empty."
-        )
-
-    normalized = re.sub(
-        r"\s+",
-        " ",
-        sql.strip(),
-    )
-
-    if ";" in normalized:
-        raise ValueError(
-            "Multiple SQL statements are not allowed."
-        )
-
-    first_keyword_match = re.match(
-        r"^\s*([A-Za-z]+)",
-        normalized,
-    )
-
-    if not first_keyword_match:
-        raise ValueError(
-            "Could not determine the SQL statement type."
-        )
-
-    first_keyword = (
-        first_keyword_match
-        .group(1)
-        .upper()
-    )
-
-    if first_keyword not in {
-        "SELECT",
-        "WITH",
-    }:
-        raise ValueError(
-            "Only SELECT or WITH queries are allowed."
-        )
-
-    upper_sql = normalized.upper()
-
-    for keyword in FORBIDDEN_SQL:
-        if re.search(
-            rf"\b{re.escape(keyword)}\b",
-            upper_sql,
-        ):
-            raise ValueError(
-                f"Forbidden SQL operation detected: {keyword}"
-            )
-
-    if not re.search(
-        r"\bdata\b",
-        normalized,
-        flags=re.IGNORECASE,
-    ):
-        raise ValueError(
-            "Generated SQL must query the `data` table."
-        )
-
-    validate_columns(
-        sql=sql,
-        profile=profile,
-    )
-
-
-def validate_columns(
-    sql: str,
-    profile: CSVProfile,
-) -> None:
-    """
-    Validate quoted column identifiers against the normalized profile.
-
-    The table name `data` is also allowed.
-    """
-
-    available_columns = {
-        normalize_column_name(column.name).lower()
-        for column in profile.columns
-    }
-
-    quoted_identifiers = re.findall(
-        r'"([^"]+)"',
-        sql,
-    )
-
-    for identifier in quoted_identifiers:
-        normalized_identifier = (
-            normalize_column_name(identifier)
-        )
-
-        if normalized_identifier.lower() == "data":
-            continue
-
-        if (
-            normalized_identifier.lower()
-            not in available_columns
-        ):
-            raise ValueError(
-                f"Unknown column referenced: {identifier}"
-            )
-
-
-def execute_duckdb_query(
-    document: Document,
-    sql: str,
-) -> CSVQueryResult:
-    """
-    Execute a validated query against a normalized DataFrame.
-
-    The same DataFrame is used for profiling and DuckDB execution.
-    This guarantees that the column names are identical in both places.
-    """
-
-    path = Path(document.path)
-
-
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Data file not found: {path}"
-        )
-
-    profile = get_profile(
-        document.id
-    )
-
-    if profile is None:
-        raise ValueError(
-            "CSV profile is unavailable."
-        )
-
-    sql = normalize_sql_identifiers(
-    sql=sql,
-    profile=profile,
+_chroma_client = chromadb.PersistentClient(
+    path=str(VECTOR_STORE_DIR)
 )
 
-    validate_sql(
-        sql=sql,
-        profile=profile,
+_collection = _chroma_client.get_or_create_collection(
+    name="document_embeddings",
+    metadata={
+        "hnsw:space": "cosine",
+    },
+)
+
+
+
+_last_embedding_request_time = 0.0
+
+
+def _wait_before_embedding_request() -> None:
+    """
+    Keep embedding requests spaced out so we do not
+    continuously hit the Gemini RPM limit.
+    """
+
+    global _last_embedding_request_time
+
+    now = time.monotonic()
+
+    elapsed = (
+        now - _last_embedding_request_time
     )
 
-    dataframe = load_dataframe(
-        path=path,
-        file_type=document.file_type,
+    remaining = (
+        MIN_SECONDS_BETWEEN_REQUESTS - elapsed
     )
 
-    connection = duckdb.connect(
-        database=":memory:"
+    if remaining > 0:
+        time.sleep(remaining)
+
+    _last_embedding_request_time = (
+        time.monotonic()
     )
 
-    try:
 
-        connection.register(
-            "dataframe",
-            dataframe,
+
+def extract_pdf_pages(
+    path: Path,
+) -> list[dict[str, Any]]:
+    pages: list[dict[str, Any]] = []
+
+    with pymupdf.open(path) as pdf:
+        for page_number, page in enumerate(
+            pdf,
+            start=1,
+        ):
+            text = page.get_text(
+                "text"
+            ).strip()
+
+            if not text:
+                continue
+
+            pages.append(
+                {
+                    "text": text,
+                    "page": page_number,
+                    "section": None,
+                }
+            )
+
+    return pages
+
+
+def extract_txt(
+    path: Path,
+) -> list[dict[str, Any]]:
+    text = path.read_text(
+        encoding="utf-8",
+        errors="replace",
+    ).strip()
+
+    if not text:
+        return []
+
+    return [
+        {
+            "text": text,
+            "page": None,
+            "section": None,
+        }
+    ]
+
+
+def extract_document_text(
+    document: Document,
+) -> list[dict[str, Any]]:
+    path = Path(document.path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Document file not found: {path}"
         )
 
-        connection.execute(
-            """
-            CREATE VIEW data AS
-            SELECT *
-            FROM dataframe
-            """
+    if document.file_type == "pdf":
+        return extract_pdf_pages(path)
+
+    if document.file_type == "txt":
+        return extract_txt(path)
+
+    raise ValueError(
+        f"RAG does not support "
+        f"{document.file_type} files."
+    )
+
+
+
+def create_chunks(
+    pages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            " ",
+            "",
+        ],
+    )
+
+    chunks: list[dict[str, Any]] = []
+
+    for page_data in pages:
+        text = page_data["text"]
+
+        page_chunks = splitter.split_text(
+            text
         )
 
-        result = connection.execute(
-            sql
-        )
+        for chunk_index, chunk in enumerate(
+            page_chunks
+        ):
+            chunk = chunk.strip()
 
-        rows = result.fetchmany(
-            MAX_RESULT_ROWS
-        )
+            if not chunk:
+                continue
 
-        columns = [
-            description[0]
-            for description in result.description
+            chunks.append(
+                {
+                    "content": chunk,
+                    "page": page_data.get(
+                        "page"
+                    ),
+                    "section": page_data.get(
+                        "section"
+                    ),
+                    "chunk_index": chunk_index,
+                }
+            )
+
+    return chunks
+
+
+
+def _prepare_document_content(
+    text: str,
+    title: str | None = None,
+) -> types.Content:
+    """
+    Gemini Embedding 2 retrieval document format.
+
+    Using a Content object ensures each input receives
+    its own embedding when multiple contents are supplied.
+    """
+
+    if not title:
+        title = "none"
+
+    formatted_text = (
+        f"title: {title} | "
+        f"text: {text}"
+    )
+
+    return types.Content(
+        parts=[
+            types.Part.from_text(
+                text=formatted_text
+            )
         ]
+    )
 
-        normalized_rows = [
-            {
-                column: normalize_value(value)
-                for column, value in zip(
-                    columns,
-                    row,
+
+def _prepare_query_content(
+    query: str,
+) -> types.Content:
+    """
+    Gemini Embedding 2 retrieval query format.
+    """
+
+    formatted_query = (
+        "task: question answering | "
+        f"query: {query}"
+    )
+
+    return types.Content(
+        parts=[
+            types.Part.from_text(
+                text=formatted_query
+            )
+        ]
+    )
+
+
+def _is_resource_exhausted(
+    error: Exception,
+) -> bool:
+    """
+    Detect Gemini rate/quota exhaustion errors.
+    """
+
+    message = str(error).upper()
+
+    return (
+        "RESOURCE_EXHAUSTED" in message
+        or "429" in message
+        or "TOO MANY REQUESTS" in message
+        or "RATE LIMIT" in message
+    )
+
+
+def _embed_batch(
+    contents: list[types.Content],
+) -> list[list[float]]:
+    """
+    Embed one batch with retry/backoff.
+
+    Gemini Embedding 2 returns a separate embedding
+    for each Content object in the contents list.
+    """
+
+    retry_delay = INITIAL_RETRY_DELAY
+
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
+        try:
+            _wait_before_embedding_request()
+
+            response = _client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=contents,
+            )
+
+            embeddings: list[list[float]] = []
+
+            for embedding in (
+                response.embeddings or []
+            ):
+                embeddings.append(
+                    list(embedding.values)
                 )
-            }
-            for row in rows
+
+            if len(embeddings) != len(
+                contents
+            ):
+                raise RuntimeError(
+                    "Gemini returned "
+                    f"{len(embeddings)} embeddings "
+                    f"for {len(contents)} inputs."
+                )
+
+            return embeddings
+
+        except Exception as exc:
+            if not _is_resource_exhausted(
+                exc
+            ):
+                raise
+
+            if attempt >= MAX_RETRIES:
+                log.error(
+                    "Gemini embedding failed after "
+                    "%s attempts.",
+                    MAX_RETRIES,
+                )
+                raise
+
+            log.warning(
+                "Gemini RESOURCE_EXHAUSTED "
+                "(attempt %s/%s). "
+                "Retrying in %.1f seconds...",
+                attempt,
+                MAX_RETRIES,
+                retry_delay,
+            )
+
+            time.sleep(retry_delay)
+
+            retry_delay = min(
+                retry_delay * 2,
+                MAX_RETRY_DELAY,
+            )
+
+    raise RuntimeError(
+        "Embedding request failed."
+    )
+
+
+def generate_embeddings(
+    texts: list[str],
+    task_type: str,
+    title: str | None = None,
+) -> list[list[float]]:
+    """
+    Generate one Gemini Embedding 2 vector per text.
+
+    task_type is retained in the function signature so
+    existing callers continue to work.
+
+    Gemini Embedding 2 does not use the old
+    task_type parameter. Retrieval instructions are
+    encoded directly into the input content instead.
+    """
+
+    if not texts:
+        return []
+
+    embeddings: list[list[float]] = []
+
+    total_batches = (
+        len(texts) + BATCH_SIZE - 1
+    ) // BATCH_SIZE
+
+    log.info(
+        "Embedding %s texts using %s "
+        "in %s batches.",
+        len(texts),
+        EMBEDDING_MODEL,
+        total_batches,
+    )
+
+    for batch_number, start in enumerate(
+        range(
+            0,
+            len(texts),
+            BATCH_SIZE,
+        ),
+        start=1,
+    ):
+        batch = texts[
+            start : start + BATCH_SIZE
         ]
 
-        return CSVQueryResult(
-            document_id=document.id,
-            filename=document.filename,
-            sql=sql,
-            columns=columns,
-            rows=normalized_rows,
-            row_count=len(
-                normalized_rows
+        log.info(
+            "Embedding batch %s/%s "
+            "(texts %s-%s).",
+            batch_number,
+            total_batches,
+            start + 1,
+            min(
+                start + BATCH_SIZE,
+                len(texts),
             ),
         )
 
-    finally:
-        connection.close()
-def normalize_sql_identifiers(
-    sql: str,
-    profile: CSVProfile,
-) -> str:
-    """
-    Replace whitespace-variant quoted column names with
-    their normalized profile names.
+        if task_type == (
+            "RETRIEVAL_DOCUMENT"
+        ):
+            contents = [
+                _prepare_document_content(
+                    text,
+                    title=title,
+                )
+                for text in batch
+            ]
 
-    Example:
-        " Units Sold " -> "Units Sold"
-        " Product "    -> "Product"
-    """
+        elif task_type == (
+            "RETRIEVAL_QUERY"
+        ):
+            contents = [
+                _prepare_query_content(
+                    text
+                )
+                for text in batch
+            ]
 
-    normalized_sql = sql
+        else:
+            contents = [
+                types.Content(
+                    parts=[
+                        types.Part.from_text(
+                            text=text
+                        )
+                    ]
+                )
+                for text in batch
+            ]
 
-    for column in profile.columns:
-        original_name = column.name
-        normalized_name = normalize_column_name(
-            original_name
+        batch_embeddings = _embed_batch(
+            contents
         )
 
-        if original_name != normalized_name:
-            normalized_sql = normalized_sql.replace(
-                f'"{original_name}"',
-                f'"{normalized_name}"',
+        embeddings.extend(
+            batch_embeddings
+        )
+
+        log.info(
+            "Completed embedding batch "
+            "%s/%s.",
+            batch_number,
+            total_batches,
+        )
+
+    return embeddings
+
+
+
+async def ingest_text_document(
+    document: Document,
+) -> None:
+    if document.file_type not in {
+        "pdf",
+        "txt",
+    }:
+        raise ValueError(
+            "Only PDF and TXT files can be "
+            "ingested into RAG."
+        )
+
+    pages = extract_document_text(
+        document
+    )
+
+    if not pages:
+        raise ValueError(
+            "The document contains no readable text."
+        )
+
+    chunks = create_chunks(
+        pages
+    )
+
+    if not chunks:
+        raise ValueError(
+            "No usable text chunks were created."
+        )
+
+    log.info(
+        "Document %s (%s) produced %s chunks.",
+        document.id,
+        document.filename,
+        len(chunks),
+    )
+
+    total_batches = (
+        len(chunks) + BATCH_SIZE - 1
+    ) // BATCH_SIZE
+
+    log.info(
+        "Document will be processed in "
+        "%s embedding batches.",
+        total_batches,
+    )
+
+
+    all_ids: list[str] = []
+    all_metadatas: list[
+        dict[str, Any]
+    ] = []
+
+    for index, chunk in enumerate(
+        chunks
+    ):
+        chunk_id = (
+            f"{document.id}:{index}"
+        )
+
+        all_ids.append(chunk_id)
+
+        metadata = {
+            "document_id": document.id,
+            "filename": document.filename,
+            "file_type": document.file_type,
+            "chunk_id": chunk_id,
+        }
+
+        if chunk["page"] is not None:
+            metadata["page"] = chunk[
+                "page"
+            ]
+
+        if chunk["section"] is not None:
+            metadata["section"] = chunk[
+                "section"
+            ]
+
+        all_metadatas.append(
+            metadata
+        )
+
+
+    for start in range(
+        0,
+        len(chunks),
+        BATCH_SIZE,
+    ):
+        end = min(
+            start + BATCH_SIZE,
+            len(chunks),
+        )
+
+        batch_chunks = chunks[
+            start:end
+        ]
+
+        batch_ids = all_ids[
+            start:end
+        ]
+
+        batch_metadatas = (
+            all_metadatas[
+                start:end
+            ]
+        )
+
+
+        existing = _collection.get(
+            ids=batch_ids,
+            include=[],
+        )
+
+        existing_ids = set(
+            existing.get("ids") or []
+        )
+
+        missing_indexes: list[int] = []
+
+        for local_index, chunk_id in enumerate(
+            batch_ids
+        ):
+            if chunk_id not in existing_ids:
+                missing_indexes.append(
+                    local_index
+                )
+
+        if not missing_indexes:
+            log.info(
+                "Batch %s-%s already exists "
+                "in Chroma. Skipping.",
+                start + 1,
+                end,
+            )
+            continue
+
+        texts_to_embed = [
+            batch_chunks[index][
+                "content"
+            ]
+            for index in missing_indexes
+        ]
+
+        ids_to_add = [
+            batch_ids[index]
+            for index in missing_indexes
+        ]
+
+        metadatas_to_add = [
+            batch_metadatas[index]
+            for index in missing_indexes
+        ]
+
+        log.info(
+            "Processing chunks %s-%s "
+            "(%s new chunks).",
+            start + 1,
+            end,
+            len(texts_to_embed),
+        )
+
+        embeddings = generate_embeddings(
+            texts_to_embed,
+            task_type="RETRIEVAL_DOCUMENT",
+            title=document.filename,
+        )
+
+        if len(embeddings) != len(
+            texts_to_embed
+        ):
+            raise RuntimeError(
+                "Embedding count does not match "
+                "chunk count."
             )
 
-    return normalized_sql
 
-async def answer_csv_question(
-    question: str,
-    document: Document,
-) -> CSVQueryResult:
-    """Generate and execute a SQL query for a tabular question."""
-
-    profile = get_profile(
-        document.id
-    )
-
-    if profile is None:
-        raise ValueError(
-            "CSV profile is unavailable."
+        _collection.add(
+            ids=ids_to_add,
+            embeddings=embeddings,
+            documents=texts_to_embed,
+            metadatas=metadatas_to_add,
         )
 
-    sql = await generate_sql(
-        question=question,
-        profile=profile,
+        log.info(
+            "Stored chunks %s-%s in Chroma.",
+            start + 1,
+            end,
+        )
+
+    log.info(
+        "Finished indexing document %s "
+        "(%s).",
+        document.id,
+        document.filename,
     )
 
-    result = execute_duckdb_query(
-        document=document,
-        sql=sql,
+
+
+def embed_query(
+    query: str,
+) -> list[float]:
+    contents = [
+        _prepare_query_content(
+            query
+        )
+    ]
+
+    embeddings = _embed_batch(
+        contents
+    )
+
+    if not embeddings:
+        raise RuntimeError(
+            "Failed to generate query embedding."
+        )
+
+    return embeddings[0]
+
+
+
+def retrieve(
+    query: str,
+    document_ids: list[str] | None = None,
+    top_k: int = RAG_TOP_K,
+) -> list[RetrievedChunk]:
+    query_embedding = embed_query(
+        query
+    )
+
+    where: dict[str, Any] | None = None
+
+    if document_ids:
+        if len(document_ids) == 1:
+            where = {
+                "document_id": document_ids[0]
+            }
+        else:
+            where = {
+                "$or": [
+                    {
+                        "document_id": document_id
+                    }
+                    for document_id in document_ids
+                ]
+            }
+
+    results = _collection.query(
+        query_embeddings=[
+            query_embedding
+        ],
+        n_results=top_k,
+        where=where,
+        include=[
+            "documents",
+            "metadatas",
+            "distances",
+        ],
+    )
+
+    documents = (
+        results.get("documents")
+        or [[]]
+    )[0]
+
+    metadatas = (
+        results.get("metadatas")
+        or [[]]
+    )[0]
+
+    distances = (
+        results.get("distances")
+        or [[]]
+    )[0]
+
+    retrieved: list[RetrievedChunk] = []
+
+    for content, metadata, distance in zip(
+        documents,
+        metadatas,
+        distances,
+    ):
+        # Chroma cosine distance:
+        # similarity = 1 - distance
+        similarity = 1.0 - float(
+            distance
+        )
+
+        if (
+            similarity
+            < RAG_MIN_SIMILARITY
+        ):
+            continue
+
+        retrieved.append(
+            RetrievedChunk(
+                document_id=str(
+                    metadata.get(
+                        "document_id",
+                        "",
+                    )
+                ),
+                filename=str(
+                    metadata.get(
+                        "filename",
+                        "Unknown",
+                    )
+                ),
+                content=str(content),
+                score=similarity,
+                page=_optional_int(
+                    metadata.get("page")
+                ),
+                section=_optional_string(
+                    metadata.get(
+                        "section"
+                    )
+                ),
+                chunk_id=_optional_string(
+                    metadata.get(
+                        "chunk_id"
+                    )
+                ),
+            )
+        )
+
+    return retrieved
+
+
+
+def delete_document_vectors(
+    document_id: str,
+) -> None:
+    _collection.delete(
+        where={
+            "document_id": document_id
+        }
     )
 
     log.info(
-        "DuckDB query executed for %s: %s",
-        document.filename,
-        sql,
+        "Deleted vectors for document %s",
+        document_id,
     )
 
-    return result
+
+
+def _optional_int(
+    value: Any,
+) -> int | None:
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _optional_string(
+    value: Any,
+) -> str | None:
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    return value or None
