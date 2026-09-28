@@ -1,461 +1,595 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
-import chromadb
-import  pymupdf
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from google import genai
-
-from app.config import (
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
-    EMBEDDING_MODEL,
-    RAG_MIN_SIMILARITY,
-    RAG_TOP_K,
-    VECTOR_STORE_DIR,
+from app import conversation
+from app import documents as document_service
+from app.csv_analysis import answer_csv_question
+from app.llm import (
+    format_csv_result,
+    generate_grounded_answer,
 )
-from app.models import Document, RetrievedChunk
+from app.models import (
+    ChatResponse,
+    Document,
+    Evidence,
+    RetrievedChunk,
+    Source,
+)
+from app.planner import (
+    create_plan,
+    describe_plan,
+)
+from app.rag import retrieve
 
 log = logging.getLogger(__name__)
 
 
 
 
+async def process_chat(
+    question: str,
+    conversation_id: str | None = None,
+) -> ChatResponse:
+    """
+    Process one user question from beginning to end.
 
-_client = genai.Client()
+    This function is the main application orchestration
+    layer. It does not itself perform document parsing,
+    vector search, SQL generation, or LLM prompting.
+    """
 
+    question = question.strip()
 
-
-
-
-_chroma_client = chromadb.PersistentClient(
-    path=str(VECTOR_STORE_DIR)
-)
-
-_collection = _chroma_client.get_or_create_collection(
-    name="document_embeddings",
-    metadata={
-        "hnsw:space": "cosine",
-    },
-)
-
-
-
-
-def extract_pdf_pages(
-    path: Path,
-) -> list[dict[str, Any]]:
-    pages: list[dict[str, Any]] = []
-
-    with  pymupdf.open(path) as pdf:
-        for page_number, page in enumerate(
-            pdf,
-            start=1,
-        ):
-            text = page.get_text("text").strip()
-
-            if not text:
-                continue
-
-            pages.append(
-                {
-                    "text": text,
-                    "page": page_number,
-                    "section": None,
-                }
-            )
-
-    return pages
-
-
-def extract_txt(
-    path: Path,
-) -> list[dict[str, Any]]:
-    text = path.read_text(
-        encoding="utf-8",
-        errors="replace",
-    ).strip()
-
-    if not text:
-        return []
-
-    return [
-        {
-            "text": text,
-            "page": None,
-            "section": None,
-        }
-    ]
-
-
-def extract_document_text(
-    document: Document,
-) -> list[dict[str, Any]]:
-    path = Path(document.path)
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Document file not found: {path}"
-        )
-
-    if document.file_type == "pdf":
-        return extract_pdf_pages(path)
-
-    if document.file_type == "txt":
-        return extract_txt(path)
-
-    raise ValueError(
-        f"RAG does not support "
-        f"{document.file_type} files."
-    )
-
-
-
-
-def create_chunks(
-    pages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=[
-            "\n\n",
-            "\n",
-            ". ",
-            " ",
-            "",
-        ],
-    )
-
-    chunks: list[dict[str, Any]] = []
-
-    for page_data in pages:
-        text = page_data["text"]
-
-        page_chunks = splitter.split_text(
-            text
-        )
-
-        for chunk_index, chunk in enumerate(
-            page_chunks
-        ):
-            chunk = chunk.strip()
-
-            if not chunk:
-                continue
-
-            chunks.append(
-                {
-                    "content": chunk,
-                    "page": page_data.get("page"),
-                    "section": page_data.get(
-                        "section"
-                    ),
-                    "chunk_index": chunk_index,
-                }
-            )
-
-    return chunks
-
-
-
-
-
-def generate_embeddings(
-    texts: list[str],
-    task_type: str,
-) -> list[list[float]]:
-    if not texts:
-        return []
-
-    embeddings: list[list[float]] = []
-
-    batch_size = 50
-
-    for start in range(
-        0,
-        len(texts),
-        batch_size,
-    ):
-        batch = texts[
-            start : start + batch_size
-        ]
-
-        response = _client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=batch,
-            config={
-                "task_type": task_type,
-            },
-        )
-
-        for embedding in response.embeddings:
-            embeddings.append(
-                list(embedding.values)
-            )
-
-    return embeddings
-
-
-
-
-
-async def ingest_text_document(
-    document: Document,
-) -> None:
-    if document.file_type not in {
-        "pdf",
-        "txt",
-    }:
+    if not question:
         raise ValueError(
-            "Only PDF and TXT files can be "
-            "ingested into RAG."
+            "Question cannot be empty."
         )
 
-    pages = extract_document_text(
+    conversation_id = (
+        conversation.get_or_create_conversation(
+            conversation_id
+        )
+    )
+
+    previous_context = (
+        conversation.build_context_for_llm(
+            conversation_id,
+            max_messages=4,
+        )
+    )
+
+    execution_flow: list[str] = []
+
+
+    evidence: list[Evidence] = []
+    sources: list[Source] = []
+
+    execution_flow.append(
+        "Received the question and loaded the "
+        "conversation context."
+    )
+
+    available_documents = (
+        document_service.list_documents()
+    )
+
+    ready_documents = [
         document
-    )
-
-    if not pages:
-        raise ValueError(
-            "The document contains no readable text."
-        )
-
-    chunks = create_chunks(
-        pages
-    )
-
-    if not chunks:
-        raise ValueError(
-            "No usable text chunks were created."
-        )
-
-    texts = [
-        chunk["content"]
-        for chunk in chunks
+        for document in available_documents
+        if document.status == "ready"
     ]
 
-    embeddings = generate_embeddings(
-        texts,
-        task_type="RETRIEVAL_DOCUMENT",
-    )
-
-    if len(embeddings) != len(chunks):
-        raise RuntimeError(
-            "Embedding count does not match "
-            "chunk count."
-        )
-
-    ids: list[str] = []
-    metadatas: list[dict[str, Any]] = []
-
-    for index, chunk in enumerate(
-        chunks
-    ):
-        chunk_id = (
-            f"{document.id}:{index}"
-        )
-
-        ids.append(chunk_id)
-
-        metadata = {
-            "document_id": document.id,
-            "filename": document.filename,
-            "file_type": document.file_type,
-            "chunk_id": chunk_id,
-        }
-
-        if chunk["page"] is not None:
-            metadata["page"] = chunk["page"]
-
-        if chunk["section"] is not None:
-            metadata["section"] = (
-                chunk["section"]
-            )
-
-        metadatas.append(metadata)
-
-    # Remove old vectors first so re-ingestion
-    # does not leave stale chunks behind.
-    delete_document_vectors(
-        document.id
-    )
-
-    _collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=texts,
-        metadatas=metadatas,
+    execution_flow.append(
+        f"Found {len(ready_documents)} ready document(s)."
     )
 
     log.info(
-        "Indexed %s chunks for %s",
-        len(chunks),
-        document.filename,
-    )
-
-
-
-
-
-def embed_query(
-    query: str,
-) -> list[float]:
-    embeddings = generate_embeddings(
-        [query],
-        task_type="RETRIEVAL_QUERY",
-    )
-
-    if not embeddings:
-        raise RuntimeError(
-            "Failed to generate query embedding."
-        )
-
-    return embeddings[0]
-
-
-
-
-def retrieve(
-    query: str,
-    document_ids: list[str] | None = None,
-    top_k: int = RAG_TOP_K,
-) -> list[RetrievedChunk]:
-    query_embedding = embed_query(
-        query
-    )
-
-    where: dict[str, Any] | None = None
-
-    if document_ids:
-        if len(document_ids) == 1:
-            where = {
-                "document_id": document_ids[0]
+        "Planner input documents: %s",
+        [
+            {
+                "id": document.id,
+                "filename": document.filename,
+                "file_type": document.file_type,
             }
-        else:
-            where = {
-                "$or": [
-                    {
-                        "document_id": document_id
-                    }
-                    for document_id in document_ids
-                ]
-            }
-
-    results = _collection.query(
-        query_embeddings=[
-            query_embedding
-        ],
-        n_results=top_k,
-        where=where,
-        include=[
-            "documents",
-            "metadatas",
-            "distances",
+            for document in available_documents
         ],
     )
 
-    documents = (
-        results.get("documents") or [[]]
-    )[0]
+    plan = await create_plan(
+        question=question,
+        documents=ready_documents,
+        conversation_context=previous_context,
+    )
 
-    metadatas = (
-        results.get("metadatas") or [[]]
-    )[0]
+    execution_flow.extend(
+        describe_plan(
+            plan,
+            ready_documents,
+        )
+    )
 
-    distances = (
-        results.get("distances") or [[]]
-    )[0]
 
-    retrieved: list[RetrievedChunk] = []
-
-    for content, metadata, distance in zip(
-        documents,
-        metadatas,
-        distances,
-    ):
-        # Chroma cosine distance:
-        # similarity = 1 - distance
-        similarity = 1.0 - float(
-            distance
+    if not plan.steps:
+        execution_flow.append(
+            "No document-analysis steps were planned."
         )
 
-        if similarity < RAG_MIN_SIMILARITY:
-            continue
+        answer = await generate_grounded_answer(
+            question=question,
+            evidence=[],
+            conversation_id=conversation_id,
+            planner_status="no_planned_steps",
+        )
 
-        retrieved.append(
-            RetrievedChunk(
-                document_id=str(
-                    metadata.get(
-                        "document_id",
-                        "",
-                    )
-                ),
-                filename=str(
-                    metadata.get(
-                        "filename",
-                        "Unknown",
-                    )
-                ),
-                content=str(content),
-                score=similarity,
-                page=_optional_int(
-                    metadata.get("page")
-                ),
-                section=_optional_string(
-                    metadata.get("section")
-                ),
-                chunk_id=_optional_string(
-                    metadata.get("chunk_id")
-                ),
+        execution_flow.append(
+            "Generated the response using available "
+            "conversation context."
+        )
+
+        conversation.add_user_message(
+            conversation_id=conversation_id,
+            content=question,
+        )
+
+        conversation.add_assistant_message(
+            conversation_id=conversation_id,
+            content=answer,
+            sources=[],
+            execution_flow=execution_flow,
+        )
+
+        return ChatResponse(
+            conversation_id=conversation_id,
+            answer=answer,
+            sources=[],
+            execution_flow=execution_flow,
+        )
+
+
+    conversation.add_user_message(
+        conversation_id=conversation_id,
+        content=question,
+    )
+
+    document_map = {
+        document.id: document
+        for document in ready_documents
+    }
+
+    for step in plan.steps:
+
+        if step.action == "rag":
+
+            rag_evidence, rag_sources = (
+                await execute_rag_step(
+                    question=question,
+                    document_ids=step.document_ids,
+                    document_map=document_map,
+                    execution_flow=execution_flow,
+                )
             )
+
+            evidence.extend(
+                rag_evidence
+            )
+
+            sources.extend(
+                rag_sources
+            )
+
+        elif step.action == "csv_query":
+
+            csv_evidence, csv_sources = (
+                await execute_csv_step(
+                    question=question,
+                    document_ids=step.document_ids,
+                    document_map=document_map,
+                    execution_flow=execution_flow,
+                )
+            )
+
+            evidence.extend(
+                csv_evidence
+            )
+
+            sources.extend(
+                csv_sources
+            )
+
+    sources = deduplicate_sources(
+        sources
+    )
+
+
+    if not evidence:
+
+        execution_flow.append(
+            "No relevant evidence was returned by the "
+            "selected document-analysis steps."
         )
 
-    return retrieved
+        answer = await generate_grounded_answer(
+            question=question,
+            evidence=[],
+            conversation_id=conversation_id,
+            planner_status="document_analysis_planned",
+        )
+
+        execution_flow.append(
+            "Generated the response using the available "
+            "conversation context and document evidence."
+        )
+
+
+    else:
+
+        execution_flow.append(
+            "Collected evidence from the selected "
+            "document sources."
+        )
+
+        answer = await generate_grounded_answer(
+            question=question,
+            evidence=[
+                item.model_dump(
+                    mode="json"
+                )
+                for item in evidence
+            ],
+            conversation_id=conversation_id,
+            planner_status="document_analysis_planned",
+        )
+
+        execution_flow.append(
+            "Generated a grounded answer from the "
+            "retrieved document evidence."
+        )
 
 
 
+    executed_sql = [
+        str(item.metadata["sql"])
+        for item in evidence
+        if item.source_type == "csv"
+        and item.metadata.get("sql")
+    ]
 
+    conversation_content = answer
 
-def delete_document_vectors(
-    document_id: str,
-) -> None:
-    _collection.delete(
-        where={
-            "document_id": document_id
-        }
+    if executed_sql:
+        conversation_content += (
+            "\n\nExecuted SQL:\n"
+            + "\n\n".join(executed_sql)
+        )
+
+    log.info(
+        "EXECUTED SQL TO SAVE: %s",
+        executed_sql,
     )
 
     log.info(
-        "Deleted vectors for document %s",
-        document_id,
+        "CONVERSATION CONTENT TO SAVE: %s",
+        conversation_content,
+    )
+
+    conversation.add_assistant_message(
+        conversation_id=conversation_id,
+        content=conversation_content,
+        sources=sources,
+        execution_flow=execution_flow,
+    )
+
+    return ChatResponse(
+        conversation_id=conversation_id,
+        answer=answer,
+        sources=sources,
+        execution_flow=execution_flow,
     )
 
 
 
 
+async def execute_rag_step(
+    question: str,
+    document_ids: list[str],
+    document_map: dict[str, Document],
+    execution_flow: list[str],
+) -> tuple[
+    list[Evidence],
+    list[Source],
+]:
+    """
+    Execute semantic retrieval for PDF/TXT documents.
+    """
 
-def _optional_int(
-    value: Any,
-) -> int | None:
-    if value is None:
-        return None
+    valid_ids = [
+        document_id
+        for document_id in document_ids
+        if document_id in document_map
+    ]
+
+    if not valid_ids:
+        return [], []
+
+    filenames = [
+        document_map[document_id].filename
+        for document_id in valid_ids
+    ]
+
+    execution_flow.append(
+        "Searching PDF/TXT content using semantic "
+        "retrieval: "
+        + ", ".join(filenames)
+    )
 
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+        log.info(
+    "RAG retrieval: question=%r document_ids=%s",
+    question,
+    document_ids,
+)
+        chunks = retrieve(
+            query=question,
+            document_ids=valid_ids,
+        )
+
+    except Exception:
+        log.exception(
+            "RAG retrieval failed for question."
+        )
+
+        execution_flow.append(
+            "PDF/TXT retrieval failed."
+        )
+
+        raise RuntimeError(
+            "Document text retrieval failed."
+        )
+
+    if not chunks:
+        execution_flow.append(
+            "No sufficiently relevant text passages "
+            "were found."
+        )
+
+        return [], []
+
+    execution_flow.append(
+        f"Retrieved {len(chunks)} relevant text passage(s)."
+    )
+
+    evidence: list[Evidence] = []
+    sources: list[Source] = []
+
+    for chunk in chunks:
+        evidence.append(
+            build_rag_evidence(
+                chunk
+            )
+        )
+
+        sources.append(
+            build_rag_source(
+                chunk
+            )
+        )
+
+    return evidence, sources
 
 
-def _optional_string(
-    value: Any,
-) -> str | None:
-    if value is None:
-        return None
+def build_rag_evidence(
+    chunk: RetrievedChunk,
+) -> Evidence:
+    metadata: dict[str, Any] = {
+        "score": chunk.score,
+    }
 
-    value = str(value).strip()
+    if chunk.page is not None:
+        metadata["page"] = chunk.page
 
-    return value or None
+    if chunk.section:
+        metadata["section"] = chunk.section
+
+    if chunk.chunk_id:
+        metadata["chunk_id"] = chunk.chunk_id
+
+    return Evidence(
+        source_type="rag",
+        document_id=chunk.document_id,
+        filename=chunk.filename,
+        content=chunk.content,
+        metadata=metadata,
+    )
+
+
+def build_rag_source(
+    chunk: RetrievedChunk,
+) -> Source:
+    reference_parts = [
+        chunk.filename
+    ]
+
+    if chunk.page is not None:
+        reference_parts.append(
+            f"page {chunk.page}"
+        )
+
+    if chunk.section:
+        reference_parts.append(
+            f"section {chunk.section}"
+        )
+
+    return Source(
+        document_id=chunk.document_id,
+        filename=chunk.filename,
+        source_reference=" — ".join(
+            reference_parts
+        ),
+        excerpt=chunk.content[:500],
+        page=chunk.page,
+        section=chunk.section,
+    )
+
+
+
+
+async def execute_csv_step(
+    question: str,
+    document_ids: list[str],
+    document_map: dict[str, Document],
+    execution_flow: list[str],
+) -> tuple[
+    list[Evidence],
+    list[Source],
+]:
+    """
+    Execute DuckDB analysis for CSV/Excel documents.
+
+    Each selected tabular document is queried independently.
+    This keeps the generated SQL scoped to a known source.
+    """
+
+    evidence: list[Evidence] = []
+    sources: list[Source] = []
+
+    for document_id in document_ids:
+
+        document = document_map.get(
+            document_id
+        )
+
+        if document is None:
+            continue
+
+        execution_flow.append(
+            f"Analyzing {document.filename} "
+            "with DuckDB."
+        )
+
+        try:
+            result = await answer_csv_question(
+                question=question,
+                document=document,
+            )
+
+        except Exception:
+            log.exception(
+                "CSV analysis failed for %s",
+                document.filename,
+            )
+
+            execution_flow.append(
+                f"DuckDB analysis failed for "
+                f"{document.filename}."
+            )
+
+            raise RuntimeError(
+                f"Could not analyze {document.filename}."
+            )
+
+        execution_flow.append(
+            f"Executed a DuckDB query against "
+            f"{document.filename}."
+        )
+
+        result_dict = result.model_dump(
+            mode="json"
+        )
+
+        evidence.append(
+            Evidence(
+                source_type="csv",
+                document_id=document.id,
+                filename=document.filename,
+                content=format_csv_result(
+                    result_dict
+                ),
+                metadata={
+                    "sql": result.sql,
+                    "columns": result.columns,
+                    "row_count": result.row_count,
+                },
+            )
+        )
+
+        sources.append(
+            build_csv_source(
+                document,
+                result_dict,
+            )
+        )
+
+    return evidence, sources
+
+
+def build_csv_source(
+    document: Document,
+    result: dict[str, Any],
+) -> Source:
+    row_count = result.get(
+        "row_count",
+        0,
+    )
+
+    columns = result.get(
+        "columns",
+        [],
+    )
+
+    reference = (
+        f"{document.filename} — "
+        f"DuckDB query result"
+    )
+
+    excerpt = (
+        f"Query returned {row_count} row(s). "
+        f"Columns: "
+        f"{', '.join(str(column) for column in columns)}"
+    )
+
+    return Source(
+        document_id=document.id,
+        filename=document.filename,
+        source_reference=reference,
+        excerpt=excerpt,
+    )
+
+
+
+
+def deduplicate_sources(
+    sources: list[Source],
+) -> list[Source]:
+    seen: set[
+        tuple[
+            str | None,
+            str,
+            str,
+            int | None,
+        ]
+    ] = set()
+
+    unique_sources: list[Source] = []
+
+    for source in sources:
+        key = (
+            source.document_id,
+            source.filename,
+            source.source_reference,
+            source.page,
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+
+        unique_sources.append(
+            source
+        )
+
+    return unique_sources
