@@ -2,594 +2,414 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from app.csv_analysis import get_profile
 
-from app import conversation
-from app import documents as document_service
-from app.csv_analysis import answer_csv_question
-from app.llm import (
-    format_csv_result,
-    generate_grounded_answer,
-)
+from app.llm import generate_structured_response
 from app.models import (
-    ChatResponse,
     Document,
-    Evidence,
-    RetrievedChunk,
-    Source,
+    PlanStep,
+    QueryPlan,
 )
-from app.planner import (
-    create_plan,
-    describe_plan,
-)
-from app.rag import retrieve
 
 log = logging.getLogger(__name__)
 
 
 
 
-async def process_chat(
+
+def document_summary(
+    documents: list[Document],
+) -> list[dict[str, Any]]:
+    """
+    Create a compact document description for the planner.
+
+    For CSV/Excel documents, include the saved CSV profile
+    so the planner can identify relevant tabular documents
+    using column names and sample values.
+    """
+
+    summaries: list[dict[str, Any]] = []
+
+    for document in documents:
+
+        if document.status != "ready":
+            continue
+
+        summary: dict[str, Any] = {
+            "id": document.id,
+            "filename": document.filename,
+            "file_type": document.file_type,
+            "status": document.status,
+        }
+
+        if document.file_type in {
+            "csv",
+            "excel",
+        }:
+            profile = get_profile(
+                document.id
+            )
+
+            if profile is not None:
+                summary["profile"] = (
+                    profile.model_dump(
+                        mode="json"
+                    )
+                )
+            else:
+                log.warning(
+                    "No CSV profile found for document %s",
+                    document.id,
+                )
+
+        summaries.append(
+            summary
+        )
+
+    return summaries
+
+
+
+
+
+async def create_plan(
     question: str,
-    conversation_id: str | None = None,
-) -> ChatResponse:
+    documents: list[Document],
+    conversation_context: str = "",
+) -> QueryPlan:
     """
-    Process one user question from beginning to end.
+    Create an execution plan for the user's question.
 
-    This function is the main application orchestration
-    layer. It does not itself perform document parsing,
-    vector search, SQL generation, or LLM prompting.
+    The planner decides which document sources are needed,
+    but it does not retrieve evidence or execute queries.
     """
 
-    question = question.strip()
+    available_documents = document_summary(
+        documents
+    )
 
-    if not question:
-        raise ValueError(
-            "Question cannot be empty."
+    if not available_documents:
+        return QueryPlan(
+            steps=[],
+            requires_multiple_sources=False,
+            requires_calculation=False,
         )
 
-    conversation_id = (
-        conversation.get_or_create_conversation(
-            conversation_id
+    document_text = "\n".join(
+        (
+            f"- ID: {item['id']} | "
+            f"Filename: {item['filename']} | "
+            f"Type: {item['file_type']}"
         )
+        for item in available_documents
     )
 
-    previous_context = (
-        conversation.build_context_for_llm(
-            conversation_id,
-            max_messages=4,
-        )
-    )
+    prompt = f"""
+You are a document routing planner.
 
-    execution_flow: list[str] = []
+Determine which document(s) are relevant to the CURRENT USER QUESTION and which operation should be used.
+
+Do NOT answer the question.
+Do NOT generate SQL.
+Do NOT perform calculations.
+
+OPERATION ASSIGNMENT — HARD RULE
+The operation is determined ONLY by file type:
+
+PDF  → "rag"
+TXT  → "rag"
+CSV  → "csv_query"
+XLSX → "csv_query"
+XLS  → "csv_query"
+
+Never use "csv_query" for PDF/TXT.
+Never use "rag" for CSV/Excel.
+
+DOCUMENT SELECTION
+First understand what the CURRENT USER QUESTION is about.
+Then select the document whose subject is relevant.
+
+Use filenames and metadata as semantic clues.
+
+For CSV/Excel:
+- Select only when the question clearly concerns tabular data, columns, values, or calculations from that document.
+- Do not select a CSV merely because the question contains a number or generic word.
+
+For PDF/TXT:
+- Select the document whose subject matches the question.
+- If one document clearly matches, select ONLY that document.
+- If multiple documents clearly match, select those documents.
+- Do not select unrelated documents.
+- Do not select a document merely because it contains a number or word from the question.
+
+CONVERSATION
+Use conversation context only to resolve references or follow-ups.
+History-only questions require no document-analysis steps.
+Do not reuse an unrelated document from a previous question.
+
+DECISION ORDER
+1. Understand the current question.
+2. Identify its subject.
+3. Select relevant document(s).
+4. Assign operation strictly from file type.
+
+Examples:
+- "Why 150 prepositions" → english_club.pdf → rag
+- "Quiz 19 6th question" → english_club.pdf → rag
+- "Answers to Prepositions Quizzes" → english_club.pdf → rag
+- "What happened to the economy in 2014?" → 2014_economy.txt.txt → rag
+- "Why did the economy slow down in 2014?" → 2014_economy.txt.txt → rag
+- "What was the profit in 2014?" → Financials.csv → csv_query
+- "What SQL did you use?" → no document-analysis step
+- anything about prepositions → english_club.pdf → rag
+
+AVAILABLE DOCUMENTS:
+{document_text}
+
+CONVERSATION CONTEXT:
+{conversation_context}
+
+CURRENT USER QUESTION:
+{question}
+
+Return only the structured execution plan.
 
 
-    evidence: list[Evidence] = []
-    sources: list[Source] = []
+"""
 
-    execution_flow.append(
-        "Received the question and loaded the "
-        "conversation context."
-    )
-
-    available_documents = (
-        document_service.list_documents()
-    )
-
-    ready_documents = [
-        document
-        for document in available_documents
-        if document.status == "ready"
-    ]
-
-    execution_flow.append(
-        f"Found {len(ready_documents)} ready document(s)."
-    )
-
-    log.info(
-        "Planner input documents: %s",
-        [
-            {
-                "id": document.id,
-                "filename": document.filename,
-                "file_type": document.file_type,
-            }
-            for document in available_documents
+    schema = {
+        "type": "object",
+        "properties": {
+            "steps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "rag",
+                                "csv_query",
+                            ],
+                        },
+                        "document_ids": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                            },
+                        },
+                        "purpose": {
+                            "type": "string",
+                        },
+                    },
+                    "required": [
+                        "action",
+                        "document_ids",
+                        "purpose",
+                    ],
+                },
+            },
+            "requires_multiple_sources": {
+                "type": "boolean",
+            },
+            "requires_calculation": {
+                "type": "boolean",
+            },
+            
+        },
+        "required": [
+            "steps",
+            "requires_multiple_sources",
+            "requires_calculation",
         ],
-    )
-
-    plan = await create_plan(
-        question=question,
-        documents=ready_documents,
-        conversation_context=previous_context,
-    )
-
-    execution_flow.extend(
-        describe_plan(
-            plan,
-            ready_documents,
-        )
-    )
-
-
-    if not plan.steps:
-        execution_flow.append(
-            "No document-analysis steps were planned."
-        )
-
-        answer = await generate_grounded_answer(
-            question=question,
-            evidence=[],
-            conversation_id=conversation_id,
-            planner_status="no_planned_steps",
-        )
-
-        execution_flow.append(
-            "Generated the response using available "
-            "conversation context."
-        )
-
-        conversation.add_user_message(
-            conversation_id=conversation_id,
-            content=question,
-        )
-
-        conversation.add_assistant_message(
-            conversation_id=conversation_id,
-            content=answer,
-            sources=[],
-            execution_flow=execution_flow,
-        )
-
-        return ChatResponse(
-            conversation_id=conversation_id,
-            answer=answer,
-            sources=[],
-            execution_flow=execution_flow,
-        )
-
-
-    conversation.add_user_message(
-        conversation_id=conversation_id,
-        content=question,
-    )
-
-    document_map = {
-        document.id: document
-        for document in ready_documents
     }
 
-    for step in plan.steps:
-
-        if step.action == "rag":
-
-            rag_evidence, rag_sources = (
-                await execute_rag_step(
-                    question=question,
-                    document_ids=step.document_ids,
-                    document_map=document_map,
-                    execution_flow=execution_flow,
-                )
-            )
-
-            evidence.extend(
-                rag_evidence
-            )
-
-            sources.extend(
-                rag_sources
-            )
-
-        elif step.action == "csv_query":
-
-            csv_evidence, csv_sources = (
-                await execute_csv_step(
-                    question=question,
-                    document_ids=step.document_ids,
-                    document_map=document_map,
-                    execution_flow=execution_flow,
-                )
-            )
-
-            evidence.extend(
-                csv_evidence
-            )
-
-            sources.extend(
-                csv_sources
-            )
-
-    sources = deduplicate_sources(
-        sources
-    )
-
-
-    if not evidence:
-
-        execution_flow.append(
-            "No relevant evidence was returned by the "
-            "selected document-analysis steps."
-        )
-
-        answer = await generate_grounded_answer(
-            question=question,
-            evidence=[],
-            conversation_id=conversation_id,
-            planner_status="document_analysis_planned",
-        )
-
-        execution_flow.append(
-            "Generated the response using the available "
-            "conversation context and document evidence."
-        )
-
-
-    else:
-
-        execution_flow.append(
-            "Collected evidence from the selected "
-            "document sources."
-        )
-
-        answer = await generate_grounded_answer(
-            question=question,
-            evidence=[
-                item.model_dump(
-                    mode="json"
-                )
-                for item in evidence
-            ],
-            conversation_id=conversation_id,
-            planner_status="document_analysis_planned",
-        )
-
-        execution_flow.append(
-            "Generated a grounded answer from the "
-            "retrieved document evidence."
-        )
-
-
-
-    executed_sql = [
-        str(item.metadata["sql"])
-        for item in evidence
-        if item.source_type == "csv"
-        and item.metadata.get("sql")
-    ]
-
-    conversation_content = answer
-
-    if executed_sql:
-        conversation_content += (
-            "\n\nExecuted SQL:\n"
-            + "\n\n".join(executed_sql)
-        )
-
-    log.info(
-        "EXECUTED SQL TO SAVE: %s",
-        executed_sql,
-    )
-
-    log.info(
-        "CONVERSATION CONTENT TO SAVE: %s",
-        conversation_content,
-    )
-
-    conversation.add_assistant_message(
-        conversation_id=conversation_id,
-        content=conversation_content,
-        sources=sources,
-        execution_flow=execution_flow,
-    )
-
-    return ChatResponse(
-        conversation_id=conversation_id,
-        answer=answer,
-        sources=sources,
-        execution_flow=execution_flow,
-    )
-
-
-
-
-async def execute_rag_step(
-    question: str,
-    document_ids: list[str],
-    document_map: dict[str, Document],
-    execution_flow: list[str],
-) -> tuple[
-    list[Evidence],
-    list[Source],
-]:
-    """
-    Execute semantic retrieval for PDF/TXT documents.
-    """
-
-    valid_ids = [
-        document_id
-        for document_id in document_ids
-        if document_id in document_map
-    ]
-
-    if not valid_ids:
-        return [], []
-
-    filenames = [
-        document_map[document_id].filename
-        for document_id in valid_ids
-    ]
-
-    execution_flow.append(
-        "Searching PDF/TXT content using semantic "
-        "retrieval: "
-        + ", ".join(filenames)
-    )
-
     try:
-        log.info(
-    "RAG retrieval: question=%r document_ids=%s",
-    question,
-    document_ids,
-)
-        chunks = retrieve(
-            query=question,
-            document_ids=valid_ids,
+        result = await generate_structured_response(
+            prompt=prompt,
+            schema=schema,
+        )
+
+        plan = QueryPlan.model_validate(
+            result
         )
 
     except Exception:
         log.exception(
-            "RAG retrieval failed for question."
-        )
-
-        execution_flow.append(
-            "PDF/TXT retrieval failed."
+            "Failed to create execution plan."
         )
 
         raise RuntimeError(
-            "Document text retrieval failed."
+            "The system could not determine how "
+            "to process the question."
         )
 
-    if not chunks:
-        execution_flow.append(
-            "No sufficiently relevant text passages "
-            "were found."
-        )
-
-        return [], []
-
-    execution_flow.append(
-        f"Retrieved {len(chunks)} relevant text passage(s)."
+    validated_plan = validate_plan(
+        plan,
+        documents,
     )
 
-    evidence: list[Evidence] = []
-    sources: list[Source] = []
+    log.info(
+        "Execution plan created: %s",
+        validated_plan.model_dump(
+            mode="json"
+        ),
+    )
 
-    for chunk in chunks:
-        evidence.append(
-            build_rag_evidence(
-                chunk
-            )
-        )
-
-        sources.append(
-            build_rag_source(
-                chunk
-            )
-        )
-
-    return evidence, sources
+    return validated_plan
 
 
-def build_rag_evidence(
-    chunk: RetrievedChunk,
-) -> Evidence:
-    metadata: dict[str, Any] = {
-        "score": chunk.score,
+
+
+
+def validate_plan(
+    plan: QueryPlan,
+    documents: list[Document],
+) -> QueryPlan:
+    """
+    Validate and normalize the LLM-generated plan.
+
+    The LLM is not trusted to select arbitrary document IDs
+    or incompatible operations.
+    """
+
+    document_map = {
+        document.id: document
+        for document in documents
+        if document.status == "ready"
     }
 
-    if chunk.page is not None:
-        metadata["page"] = chunk.page
+    validated_steps: list[PlanStep] = []
 
-    if chunk.section:
-        metadata["section"] = chunk.section
+    for step in plan.steps:
+        valid_document_ids: list[str] = []
 
-    if chunk.chunk_id:
-        metadata["chunk_id"] = chunk.chunk_id
+        for document_id in step.document_ids:
+            document = document_map.get(
+                document_id
+            )
 
-    return Evidence(
-        source_type="rag",
-        document_id=chunk.document_id,
-        filename=chunk.filename,
-        content=chunk.content,
-        metadata=metadata,
-    )
+            if document is None:
+                log.warning(
+                    "Planner referenced unavailable "
+                    "document: %s",
+                    document_id,
+                )
+                continue
 
+            if step.action == "rag":
+                if document.file_type not in {
+                    "pdf",
+                    "txt",
+                }:
+                    log.warning(
+                        "Planner attempted RAG on "
+                        "non-text document %s",
+                        document.filename,
+                    )
+                    continue
 
-def build_rag_source(
-    chunk: RetrievedChunk,
-) -> Source:
-    reference_parts = [
-        chunk.filename
-    ]
+            elif step.action == "csv_query":
+                if document.file_type not in {
+                    "csv",
+                    "excel",
+                }:
+                    log.warning(
+                        "Planner attempted CSV query on "
+                        "non-tabular document %s",
+                        document.filename,
+                    )
+                    continue
 
-    if chunk.page is not None:
-        reference_parts.append(
-            f"page {chunk.page}"
+            valid_document_ids.append(
+                document_id
+            )
+
+        if not valid_document_ids:
+            continue
+
+        validated_steps.append(
+            PlanStep(
+                action=step.action,
+                document_ids=valid_document_ids,
+                purpose=step.purpose.strip(),
+            )
         )
 
-    if chunk.section:
-        reference_parts.append(
-            f"section {chunk.section}"
-        )
-
-    return Source(
-        document_id=chunk.document_id,
-        filename=chunk.filename,
-        source_reference=" — ".join(
-            reference_parts
+    return QueryPlan(
+        steps=validated_steps,
+        requires_multiple_sources=(
+            len(
+                {
+                    document_id
+                    for step in validated_steps
+                    for document_id in step.document_ids
+                }
+            )
+            > 1
         ),
-        excerpt=chunk.content[:500],
-        page=chunk.page,
-        section=chunk.section,
+        requires_calculation=plan.requires_calculation,
     )
 
 
 
 
-async def execute_csv_step(
-    question: str,
-    document_ids: list[str],
-    document_map: dict[str, Document],
-    execution_flow: list[str],
-) -> tuple[
-    list[Evidence],
-    list[Source],
-]:
-    """
-    Execute DuckDB analysis for CSV/Excel documents.
 
-    Each selected tabular document is queried independently.
-    This keeps the generated SQL scoped to a known source.
+def describe_plan(
+    plan: QueryPlan,
+    documents: list[Document],
+) -> list[str]:
+    """
+    Convert the internal plan into safe, user-visible
+    execution-flow messages.
+
+    This intentionally does not expose the model's
+    hidden reasoning.
     """
 
-    evidence: list[Evidence] = []
-    sources: list[Source] = []
+    document_map = {
+        document.id: document
+        for document in documents
+    }
 
-    for document_id in document_ids:
+    flow: list[str] = []
 
-        document = document_map.get(
-            document_id
+    if not plan.steps:
+        flow.append(
+            "No suitable uploaded document was identified "
+            "for this question."
         )
 
-        if document is None:
-            continue
+        return flow
 
-        execution_flow.append(
-            f"Analyzing {document.filename} "
-            "with DuckDB."
-        )
-
-        try:
-            result = await answer_csv_question(
-                question=question,
-                document=document,
-            )
-
-        except Exception:
-            log.exception(
-                "CSV analysis failed for %s",
-                document.filename,
-            )
-
-            execution_flow.append(
-                f"DuckDB analysis failed for "
-                f"{document.filename}."
-            )
-
-            raise RuntimeError(
-                f"Could not analyze {document.filename}."
-            )
-
-        execution_flow.append(
-            f"Executed a DuckDB query against "
-            f"{document.filename}."
-        )
-
-        result_dict = result.model_dump(
-            mode="json"
-        )
-
-        evidence.append(
-            Evidence(
-                source_type="csv",
-                document_id=document.id,
-                filename=document.filename,
-                content=format_csv_result(
-                    result_dict
-                ),
-                metadata={
-                    "sql": result.sql,
-                    "columns": result.columns,
-                    "row_count": result.row_count,
-                },
-            )
-        )
-
-        sources.append(
-            build_csv_source(
-                document,
-                result_dict,
-            )
-        )
-
-    return evidence, sources
-
-
-def build_csv_source(
-    document: Document,
-    result: dict[str, Any],
-) -> Source:
-    row_count = result.get(
-        "row_count",
-        0,
-    )
-
-    columns = result.get(
-        "columns",
-        [],
-    )
-
-    reference = (
-        f"{document.filename} — "
-        f"DuckDB query result"
-    )
-
-    excerpt = (
-        f"Query returned {row_count} row(s). "
-        f"Columns: "
-        f"{', '.join(str(column) for column in columns)}"
-    )
-
-    return Source(
-        document_id=document.id,
-        filename=document.filename,
-        source_reference=reference,
-        excerpt=excerpt,
-    )
-
-
-
-
-def deduplicate_sources(
-    sources: list[Source],
-) -> list[Source]:
-    seen: set[
-        tuple[
-            str | None,
-            str,
-            str,
-            int | None,
+    for step in plan.steps:
+        filenames = [
+            document_map[document_id].filename
+            for document_id in step.document_ids
+            if document_id in document_map
         ]
-    ] = set()
 
-    unique_sources: list[Source] = []
+        if step.action == "rag":
+            flow.append(
+                "Selected document text retrieval for: "
+                + ", ".join(filenames)
+            )
 
-    for source in sources:
-        key = (
-            source.document_id,
-            source.filename,
-            source.source_reference,
-            source.page,
+        elif step.action == "csv_query":
+            flow.append(
+                "Selected tabular data analysis for: "
+                + ", ".join(filenames)
+            )
+
+    if plan.requires_multiple_sources:
+        flow.append(
+            "Multiple document sources are required."
         )
 
-        if key in seen:
-            continue
-
-        seen.add(
-            key
+    if plan.requires_calculation:
+        flow.append(
+            "The question requires a calculation "
+            "from the retrieved data."
         )
 
-        unique_sources.append(
-            source
-        )
-
-    return unique_sources
+    return flow
