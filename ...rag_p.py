@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
 import chromadb
-import pymupdf
-from google import genai
-from google.genai import types
+import  pymupdf
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from google import genai
 
 from app.config import (
     CHUNK_OVERLAP,
@@ -21,23 +19,15 @@ from app.config import (
 )
 from app.models import Document, RetrievedChunk
 
-
 log = logging.getLogger(__name__)
 
 
 
 
 
-BATCH_SIZE = 50
-
-MIN_SECONDS_BETWEEN_REQUESTS = 0.7
-
-MAX_RETRIES = 6
-INITIAL_RETRY_DELAY = 2.0
-MAX_RETRY_DELAY = 30.0
-
-
 _client = genai.Client()
+
+
 
 
 
@@ -54,49 +44,18 @@ _collection = _chroma_client.get_or_create_collection(
 
 
 
-_last_embedding_request_time = 0.0
-
-
-def _wait_before_embedding_request() -> None:
-    """
-    Keep embedding requests spaced out so we do not
-    continuously hit the Gemini RPM limit.
-    """
-
-    global _last_embedding_request_time
-
-    now = time.monotonic()
-
-    elapsed = (
-        now - _last_embedding_request_time
-    )
-
-    remaining = (
-        MIN_SECONDS_BETWEEN_REQUESTS - elapsed
-    )
-
-    if remaining > 0:
-        time.sleep(remaining)
-
-    _last_embedding_request_time = (
-        time.monotonic()
-    )
-
-
 
 def extract_pdf_pages(
     path: Path,
 ) -> list[dict[str, Any]]:
     pages: list[dict[str, Any]] = []
 
-    with pymupdf.open(path) as pdf:
+    with  pymupdf.open(path) as pdf:
         for page_number, page in enumerate(
             pdf,
             start=1,
         ):
-            text = page.get_text(
-                "text"
-            ).strip()
+            text = page.get_text("text").strip()
 
             if not text:
                 continue
@@ -155,6 +114,7 @@ def extract_document_text(
 
 
 
+
 def create_chunks(
     pages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -190,9 +150,7 @@ def create_chunks(
             chunks.append(
                 {
                     "content": chunk,
-                    "page": page_data.get(
-                        "page"
-                    ),
+                    "page": page_data.get("page"),
                     "section": page_data.get(
                         "section"
                     ),
@@ -204,257 +162,44 @@ def create_chunks(
 
 
 
-def _prepare_document_content(
-    text: str,
-    title: str | None = None,
-) -> types.Content:
-    """
-    Gemini Embedding 2 retrieval document format.
-
-    Using a Content object ensures each input receives
-    its own embedding when multiple contents are supplied.
-    """
-
-    if not title:
-        title = "none"
-
-    formatted_text = (
-        f"title: {title} | "
-        f"text: {text}"
-    )
-
-    return types.Content(
-        parts=[
-            types.Part.from_text(
-                text=formatted_text
-            )
-        ]
-    )
-
-
-def _prepare_query_content(
-    query: str,
-) -> types.Content:
-    """
-    Gemini Embedding 2 retrieval query format.
-    """
-
-    formatted_query = (
-        "task: question answering | "
-        f"query: {query}"
-    )
-
-    return types.Content(
-        parts=[
-            types.Part.from_text(
-                text=formatted_query
-            )
-        ]
-    )
-
-
-def _is_resource_exhausted(
-    error: Exception,
-) -> bool:
-    """
-    Detect Gemini rate/quota exhaustion errors.
-    """
-
-    message = str(error).upper()
-
-    return (
-        "RESOURCE_EXHAUSTED" in message
-        or "429" in message
-        or "TOO MANY REQUESTS" in message
-        or "RATE LIMIT" in message
-    )
-
-
-def _embed_batch(
-    contents: list[types.Content],
-) -> list[list[float]]:
-    """
-    Embed one batch with retry/backoff.
-
-    Gemini Embedding 2 returns a separate embedding
-    for each Content object in the contents list.
-    """
-
-    retry_delay = INITIAL_RETRY_DELAY
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1,
-    ):
-        try:
-            _wait_before_embedding_request()
-
-            response = _client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=contents,
-            )
-
-            embeddings: list[list[float]] = []
-
-            for embedding in (
-                response.embeddings or []
-            ):
-                embeddings.append(
-                    list(embedding.values)
-                )
-
-            if len(embeddings) != len(
-                contents
-            ):
-                raise RuntimeError(
-                    "Gemini returned "
-                    f"{len(embeddings)} embeddings "
-                    f"for {len(contents)} inputs."
-                )
-
-            return embeddings
-
-        except Exception as exc:
-            if not _is_resource_exhausted(
-                exc
-            ):
-                raise
-
-            if attempt >= MAX_RETRIES:
-                log.error(
-                    "Gemini embedding failed after "
-                    "%s attempts.",
-                    MAX_RETRIES,
-                )
-                raise
-
-            log.warning(
-                "Gemini RESOURCE_EXHAUSTED "
-                "(attempt %s/%s). "
-                "Retrying in %.1f seconds...",
-                attempt,
-                MAX_RETRIES,
-                retry_delay,
-            )
-
-            time.sleep(retry_delay)
-
-            retry_delay = min(
-                retry_delay * 2,
-                MAX_RETRY_DELAY,
-            )
-
-    raise RuntimeError(
-        "Embedding request failed."
-    )
 
 
 def generate_embeddings(
     texts: list[str],
     task_type: str,
-    title: str | None = None,
 ) -> list[list[float]]:
-    """
-    Generate one Gemini Embedding 2 vector per text.
-
-    task_type is retained in the function signature so
-    existing callers continue to work.
-
-    Gemini Embedding 2 does not use the old
-    task_type parameter. Retrieval instructions are
-    encoded directly into the input content instead.
-    """
-
     if not texts:
         return []
 
     embeddings: list[list[float]] = []
 
-    total_batches = (
-        len(texts) + BATCH_SIZE - 1
-    ) // BATCH_SIZE
+    batch_size = 50
 
-    log.info(
-        "Embedding %s texts using %s "
-        "in %s batches.",
+    for start in range(
+        0,
         len(texts),
-        EMBEDDING_MODEL,
-        total_batches,
-    )
-
-    for batch_number, start in enumerate(
-        range(
-            0,
-            len(texts),
-            BATCH_SIZE,
-        ),
-        start=1,
+        batch_size,
     ):
         batch = texts[
-            start : start + BATCH_SIZE
+            start : start + batch_size
         ]
 
-        log.info(
-            "Embedding batch %s/%s "
-            "(texts %s-%s).",
-            batch_number,
-            total_batches,
-            start + 1,
-            min(
-                start + BATCH_SIZE,
-                len(texts),
-            ),
+        response = _client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=batch,
+            config={
+                "task_type": task_type,
+            },
         )
 
-        if task_type == (
-            "RETRIEVAL_DOCUMENT"
-        ):
-            contents = [
-                _prepare_document_content(
-                    text,
-                    title=title,
-                )
-                for text in batch
-            ]
-
-        elif task_type == (
-            "RETRIEVAL_QUERY"
-        ):
-            contents = [
-                _prepare_query_content(
-                    text
-                )
-                for text in batch
-            ]
-
-        else:
-            contents = [
-                types.Content(
-                    parts=[
-                        types.Part.from_text(
-                            text=text
-                        )
-                    ]
-                )
-                for text in batch
-            ]
-
-        batch_embeddings = _embed_batch(
-            contents
-        )
-
-        embeddings.extend(
-            batch_embeddings
-        )
-
-        log.info(
-            "Completed embedding batch "
-            "%s/%s.",
-            batch_number,
-            total_batches,
-        )
+        for embedding in response.embeddings:
+            embeddings.append(
+                list(embedding.values)
+            )
 
     return embeddings
+
+
 
 
 
@@ -488,28 +233,24 @@ async def ingest_text_document(
             "No usable text chunks were created."
         )
 
-    log.info(
-        "Document %s (%s) produced %s chunks.",
-        document.id,
-        document.filename,
-        len(chunks),
+    texts = [
+        chunk["content"]
+        for chunk in chunks
+    ]
+
+    embeddings = generate_embeddings(
+        texts,
+        task_type="RETRIEVAL_DOCUMENT",
     )
 
-    total_batches = (
-        len(chunks) + BATCH_SIZE - 1
-    ) // BATCH_SIZE
+    if len(embeddings) != len(chunks):
+        raise RuntimeError(
+            "Embedding count does not match "
+            "chunk count."
+        )
 
-    log.info(
-        "Document will be processed in "
-        "%s embedding batches.",
-        total_batches,
-    )
-
-
-    all_ids: list[str] = []
-    all_metadatas: list[
-        dict[str, Any]
-    ] = []
+    ids: list[str] = []
+    metadatas: list[dict[str, Any]] = []
 
     for index, chunk in enumerate(
         chunks
@@ -518,7 +259,7 @@ async def ingest_text_document(
             f"{document.id}:{index}"
         )
 
-        all_ids.append(chunk_id)
+        ids.append(chunk_id)
 
         metadata = {
             "document_id": document.id,
@@ -528,146 +269,44 @@ async def ingest_text_document(
         }
 
         if chunk["page"] is not None:
-            metadata["page"] = chunk[
-                "page"
-            ]
+            metadata["page"] = chunk["page"]
 
         if chunk["section"] is not None:
-            metadata["section"] = chunk[
-                "section"
-            ]
-
-        all_metadatas.append(
-            metadata
-        )
-
-
-    for start in range(
-        0,
-        len(chunks),
-        BATCH_SIZE,
-    ):
-        end = min(
-            start + BATCH_SIZE,
-            len(chunks),
-        )
-
-        batch_chunks = chunks[
-            start:end
-        ]
-
-        batch_ids = all_ids[
-            start:end
-        ]
-
-        batch_metadatas = (
-            all_metadatas[
-                start:end
-            ]
-        )
-
-
-        existing = _collection.get(
-            ids=batch_ids,
-            include=[],
-        )
-
-        existing_ids = set(
-            existing.get("ids") or []
-        )
-
-        missing_indexes: list[int] = []
-
-        for local_index, chunk_id in enumerate(
-            batch_ids
-        ):
-            if chunk_id not in existing_ids:
-                missing_indexes.append(
-                    local_index
-                )
-
-        if not missing_indexes:
-            log.info(
-                "Batch %s-%s already exists "
-                "in Chroma. Skipping.",
-                start + 1,
-                end,
-            )
-            continue
-
-        texts_to_embed = [
-            batch_chunks[index][
-                "content"
-            ]
-            for index in missing_indexes
-        ]
-
-        ids_to_add = [
-            batch_ids[index]
-            for index in missing_indexes
-        ]
-
-        metadatas_to_add = [
-            batch_metadatas[index]
-            for index in missing_indexes
-        ]
-
-        log.info(
-            "Processing chunks %s-%s "
-            "(%s new chunks).",
-            start + 1,
-            end,
-            len(texts_to_embed),
-        )
-
-        embeddings = generate_embeddings(
-            texts_to_embed,
-            task_type="RETRIEVAL_DOCUMENT",
-            title=document.filename,
-        )
-
-        if len(embeddings) != len(
-            texts_to_embed
-        ):
-            raise RuntimeError(
-                "Embedding count does not match "
-                "chunk count."
+            metadata["section"] = (
+                chunk["section"]
             )
 
+        metadatas.append(metadata)
 
-        _collection.add(
-            ids=ids_to_add,
-            embeddings=embeddings,
-            documents=texts_to_embed,
-            metadatas=metadatas_to_add,
-        )
+    # Remove old vectors first so re-ingestion
+    # does not leave stale chunks behind.
+    delete_document_vectors(
+        document.id
+    )
 
-        log.info(
-            "Stored chunks %s-%s in Chroma.",
-            start + 1,
-            end,
-        )
+    _collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=metadatas,
+    )
 
     log.info(
-        "Finished indexing document %s "
-        "(%s).",
-        document.id,
+        "Indexed %s chunks for %s",
+        len(chunks),
         document.filename,
     )
+
+
 
 
 
 def embed_query(
     query: str,
 ) -> list[float]:
-    contents = [
-        _prepare_query_content(
-            query
-        )
-    ]
-
-    embeddings = _embed_batch(
-        contents
+    embeddings = generate_embeddings(
+        [query],
+        task_type="RETRIEVAL_QUERY",
     )
 
     if not embeddings:
@@ -676,6 +315,7 @@ def embed_query(
         )
 
     return embeddings[0]
+
 
 
 
@@ -719,18 +359,15 @@ def retrieve(
     )
 
     documents = (
-        results.get("documents")
-        or [[]]
+        results.get("documents") or [[]]
     )[0]
 
     metadatas = (
-        results.get("metadatas")
-        or [[]]
+        results.get("metadatas") or [[]]
     )[0]
 
     distances = (
-        results.get("distances")
-        or [[]]
+        results.get("distances") or [[]]
     )[0]
 
     retrieved: list[RetrievedChunk] = []
@@ -746,10 +383,7 @@ def retrieve(
             distance
         )
 
-        if (
-            similarity
-            < RAG_MIN_SIMILARITY
-        ):
+        if similarity < RAG_MIN_SIMILARITY:
             continue
 
         retrieved.append(
@@ -772,19 +406,17 @@ def retrieve(
                     metadata.get("page")
                 ),
                 section=_optional_string(
-                    metadata.get(
-                        "section"
-                    )
+                    metadata.get("section")
                 ),
                 chunk_id=_optional_string(
-                    metadata.get(
-                        "chunk_id"
-                    )
+                    metadata.get("chunk_id")
                 ),
             )
         )
 
     return retrieved
+
+
 
 
 
@@ -804,6 +436,8 @@ def delete_document_vectors(
 
 
 
+
+
 def _optional_int(
     value: Any,
 ) -> int | None:
@@ -812,10 +446,7 @@ def _optional_int(
 
     try:
         return int(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         return None
 
 
