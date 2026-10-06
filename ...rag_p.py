@@ -1,100 +1,115 @@
-import json
-import sqlite3
-from contextlib import contextmanager
+import os
+import sys
+from pathlib import Path
 from uuid import uuid4
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import httpx
+import streamlit as st
 from config import settings
 
+st.set_page_config(
+    page_title="Billing Agent",
+    page_icon="💳",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+API = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+HEADERS = {"X-API-Key": settings.API_KEY}
 
-@contextmanager
-def connection():
-    conn = sqlite3.connect(settings.CONTEXT_DB, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
+
+def request(method, route, **kwargs):
+    with httpx.Client(timeout=settings.CHAT_TIMEOUT + 30, headers=HEADERS) as client:
+        result = client.request(method, API + route, **kwargs)
+        result.raise_for_status()
+        return result
+
+
+for key, value in {"messages": [], "conversation_id": None, "pending": None}.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+with st.sidebar:
+    st.subheader("Billing workspace")
+    st.caption("Local operator console")
+    customer = st.text_input("Customer ID (optional)", placeholder="CUST001", disabled=bool(st.session_state.conversation_id))
+    if st.button("New conversation", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.conversation_id = None
+        st.session_state.pending = None
+        st.rerun()
+    resume = st.text_input("Resume conversation ID")
+    if st.button("Resume", disabled=not resume):
+        try:
+            saved = request("GET", f"/conversations/{resume}").json()
+            st.session_state.conversation_id = saved["conversation_id"]
+            st.session_state.messages = saved["messages"]
+            st.session_state.pending = None
+            st.rerun()
+        except httpx.HTTPError as exc:
+            st.error(f"Could not resume: {exc}")
+    if st.session_state.conversation_id:
+        st.caption("Conversation ID")
+        st.code(st.session_state.conversation_id, language=None)
     try:
-        yield conn
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        health = request("GET", "/health").json()
+        if health["model_configured"]:
+            st.success("Azure OpenAI configured")
+            st.caption("Connection is checked when you send a message.")
+        else:
+            st.warning(health.get("configuration_error") or "Configure Azure OpenAI in .env to enable chat.")
+    except httpx.HTTPError:
+        st.warning("Start the API with python app.py")
+    st.divider()
+    st.caption("Refunds update the ledger only. This console does not send payments.")
+
+st.title("💳 Billing Agent")
+st.caption(
+    "Ask questions about invoices, orders, refunds, "
+    "billing, spending, and costs."
+)
 
 
-def initialize():
-    settings.CONTEXT_DB.parent.mkdir(parents=True, exist_ok=True)
-    with connection() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            conversation_id TEXT PRIMARY KEY, customer_id TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
-            request_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'done', response_json TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(conversation_id,request_id,role));
-        CREATE INDEX IF NOT EXISTS ix_messages_conversation ON messages(conversation_id,id);
-        """)
+def show_invoices(entry, index):
+    for n, invoice in enumerate(entry.get("invoices", [])):
+        if st.button(f"Prepare PDF · {invoice['invoice_number']}", key=f"pdf-{index}-{n}"):
+            try:
+                pdf = request("GET", f"/invoices/{invoice['invoice_number']}", params={
+                    "conversation_id": st.session_state.conversation_id, "customer_id": invoice["customer_id"]})
+                st.download_button("Download invoice", pdf.content, "invoice.pdf", "application/pdf", key=f"dl-{index}-{n}")
+            except httpx.HTTPError as exc:
+                st.error(f"Invoice unavailable: {exc}")
 
 
-def conversation(conversation_id=None, customer_id=None):
-    with connection() as conn:
-        if conversation_id:
-            row = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
-            if not row:
-                raise ValueError("Conversation not found.")
-            if customer_id != row["customer_id"]:
-                raise ValueError("Customer association cannot change. Start a new conversation.")
-            return conversation_id
-        conversation_id = str(uuid4())
-        conn.execute("INSERT INTO conversations(conversation_id,customer_id) VALUES (?,?)", (conversation_id, customer_id))
-        return conversation_id
+for i, entry in enumerate(st.session_state.messages):
+    with st.chat_message(entry["role"]):
+        st.markdown(entry["content"])
+        show_invoices(entry, i)
 
+prompt = st.chat_input("Ask a billing question...", disabled=bool(st.session_state.pending))
+if prompt:
+    try:
+        if not st.session_state.conversation_id:
+            st.session_state.conversation_id = request("POST", "/conversations", json={"customer_id": customer.strip() or None}).json()["conversation_id"]
+        st.session_state.pending = {"message": prompt, "request_id": str(uuid4()), "conversation_id": st.session_state.conversation_id}
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.rerun()
+    except httpx.HTTPError as exc:
+        st.error(f"Could not start the conversation: {exc}")
 
-def get_conversation(conversation_id):
-    with connection() as conn:
-        row = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
-        return dict(row) if row else None
-
-
-def history(conversation_id):
-    with connection() as conn:
-        rows = conn.execute("SELECT role,content FROM messages WHERE conversation_id=? "
-                            "AND status='done' ORDER BY id DESC LIMIT 40", (conversation_id,)).fetchall()
-        return [dict(row) for row in reversed(rows)]
-
-
-def begin(conversation_id, request_id, message):
-    with connection() as conn:
-        row = conn.execute("SELECT * FROM messages WHERE conversation_id=? AND request_id=? AND role='user'",
-                           (conversation_id, request_id)).fetchone()
-        if row:
-            if row["content"] != message:
-                raise ValueError("Request ID was already used with different content.")
-            if row["response_json"]:
-                return json.loads(row["response_json"])
-            raise ValueError("This turn is pending or failed. Check order state before sending a new mutation.")
-        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content,status) VALUES (?,?,'user',?,'pending')",
-                     (conversation_id, request_id, message))
-        return None
-
-
-def finish(conversation_id, request_id, response):
-    with connection() as conn:
-        conn.execute("UPDATE messages SET status='done',response_json=? WHERE conversation_id=? AND request_id=? AND role='user'",
-                     (json.dumps(response), conversation_id, request_id))
-        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content) VALUES (?,?,'assistant',?)",
-                     (conversation_id, request_id, response["response"]))
-
-
-def fail(conversation_id, request_id):
-    with connection() as conn:
-        conn.execute("UPDATE messages SET status='failed' WHERE conversation_id=? AND request_id=?", (conversation_id, request_id))
-
-
-def discard_pending(conversation_id, request_id):
-    """Only used for configuration rejection before any model/tool execution."""
-    with connection() as conn:
-        conn.execute("DELETE FROM messages WHERE conversation_id=? AND request_id=? "
-                     "AND role='user' AND status='pending'", (conversation_id, request_id))
+if st.session_state.pending:
+    try:
+        with st.chat_message("assistant"):
+            with st.spinner("Billing Agent is thinking..."):
+                reply = request("POST", "/chat", json=st.session_state.pending).json()
+        st.session_state.messages.append({"role": "assistant", "content": reply["response"], "invoices": reply.get("invoices", [])})
+        st.session_state.pending = None
+        st.rerun()
+    except httpx.HTTPError as exc:
+        detail = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else str(exc)
+        st.error(f"Request failed: {detail}")
+        st.caption("Check current order state before repeating a write. A timed-out request may have completed.")
+        if st.button("Retry same request"):
+            st.rerun()
+        if st.button("Clear pending request"):
+            st.session_state.pending = None
+            st.rerun()
