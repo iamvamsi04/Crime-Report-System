@@ -1,114 +1,96 @@
+import json
 import os
 import sys
-from pathlib import Path
-from uuid import uuid4
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import httpx
-import streamlit as st
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.messages import TextMessage
+from autogen_core.model_context import UnboundedChatCompletionContext
+from autogen_core.models import UserMessage, AssistantMessage
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
+from autogen_ext.tools.mcp import McpWorkbench, StdioServerParams
 from config import settings
-
-st.set_page_config(
-    page_title="Billing Agent",
-    page_icon="💳",
-    layout="centered",
-    initial_sidebar_state="collapsed",
-)
-API = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
-HEADERS = {"X-API-Key": settings.API_KEY}
+from agent.system_message import SYSTEM_MESSAGE
 
 
-def request(method, route, **kwargs):
-    with httpx.Client(timeout=settings.CHAT_TIMEOUT + 30, headers=HEADERS) as client:
-        result = client.request(method, API + route, **kwargs)
-        result.raise_for_status()
+def parameters():
+    return StdioServerParams(command=sys.executable, args=["-m", "mcp_server.server"],
+                            cwd=str(settings.ROOT), env={**os.environ,
+                            "BILLING_DB": str(settings.BILLING_DB),
+                            "INVOICE_DIR": str(settings.INVOICE_DIR)}, read_timeout_seconds=60)
+
+
+def decode_result(result):
+    for block in result.result:
+        content = getattr(block, "content", None)
+        if isinstance(content, str):
+            try:
+                value = json.loads(content)
+                if isinstance(value, dict):
+                    return value
+            except ValueError:
+                pass
+    return {"ok": False, "error": "Tool returned an unreadable response."}
+
+
+class RecordingWorkbench(McpWorkbench):
+    def __init__(self):
+        super().__init__(parameters())
+        self.downloads = []
+
+    async def call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
+        result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
+        if name == "download_invoice":
+            data = decode_result(result)
+            if data.get("ok") and data.get("ready"):
+                self.downloads.append({"invoice_number": data["invoice_number"], "customer_id": data["customer_id"]})
         return result
 
 
-for key, value in {"messages": [], "conversation_id": None, "pending": None}.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+def create_model_client(**client_options):
+    error = settings.azure_configuration_error()
+    if error:
+        raise ValueError(error)
+    # The deployment controls the Azure route; model is its underlying model name.
+    # This assistant needs text chat and tool calling, not vision or structured output.
+    return AzureOpenAIChatCompletionClient(
+        azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+        azure_deployment=settings.AZURE_OPENAI_DEPLOYMENT,
+        api_key=settings.AZURE_OPENAI_API_KEY,
+        api_version=settings.AZURE_OPENAI_API_VERSION,
+        model=settings.AZURE_OPENAI_MODEL,
+        model_info={"vision": False, "function_calling": True, "json_output": False,
+                    "family": "unknown", "structured_output": False},
+        parallel_tool_calls=False,
+        timeout=settings.CHAT_TIMEOUT,
+        max_retries=0,
+        **client_options,
+    )
 
-with st.sidebar:
-    st.subheader("Billing workspace")
-    st.caption("Local operator console")
-    customer = st.text_input("Customer ID (optional)", placeholder="CUST001", disabled=bool(st.session_state.conversation_id))
-    if st.button("New conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.conversation_id = None
-        st.session_state.pending = None
-        st.rerun()
-    resume = st.text_input("Resume conversation ID")
-    if st.button("Resume", disabled=not resume):
+
+class BillingAgent:
+    def validate_configuration(self):
+        error = settings.azure_configuration_error()
+        if error:
+            raise ValueError(error)
+
+    async def chat(self, message, history, customer_id):
+        client = create_model_client()
         try:
-            saved = request("GET", f"/conversations/{resume}").json()
-            st.session_state.conversation_id = saved["conversation_id"]
-            st.session_state.messages = saved["messages"]
-            st.session_state.pending = None
-            st.rerun()
-        except httpx.HTTPError as exc:
-            st.error(f"Could not resume: {exc}")
-    if st.session_state.conversation_id:
-        st.caption("Conversation ID")
-        st.code(st.session_state.conversation_id, language=None)
-    try:
-        health = request("GET", "/health").json()
-        if health["ollama_model_ready"]:
-            st.success("Model connected")
-        else:
-            st.warning(f"Start Ollama and pull {health['model']} to enable chat.")
-    except httpx.HTTPError:
-        st.warning("Start the API with python app.py")
-    st.divider()
-    st.caption("Refunds update the ledger only. This console does not send payments.")
+            async with RecordingWorkbench() as workbench:
+                previous = [UserMessage(content=m["content"], source="user") if m["role"] == "user"
+                            else AssistantMessage(content=m["content"], source="billing_agent") for m in history]
+                agent = AssistantAgent("billing_agent", model_client=client, workbench=workbench,
+                        model_context=UnboundedChatCompletionContext(initial_messages=previous),
+                        system_message=SYSTEM_MESSAGE + f"\nAssociated customer_id: {customer_id or 'unset'}",
+                        reflect_on_tool_use=True, max_tool_iterations=8)
+                result = await agent.run(task=message)
+                final = result.messages[-1]
+                if not isinstance(final, TextMessage):
+                    raise RuntimeError("Agent did not produce a final text answer.")
+                return {"response": final.content, "invoices": workbench.downloads}
+        finally:
+            await client.close()
 
-st.title("💳 Billing Agent")
-st.caption(
-    "Ask questions about invoices, orders, refunds, "
-    "billing, spending, and costs."
-)
-
-
-def show_invoices(entry, index):
-    for n, invoice in enumerate(entry.get("invoices", [])):
-        if st.button(f"Prepare PDF · {invoice['invoice_number']}", key=f"pdf-{index}-{n}"):
-            try:
-                pdf = request("GET", f"/invoices/{invoice['invoice_number']}", params={
-                    "conversation_id": st.session_state.conversation_id, "customer_id": invoice["customer_id"]})
-                st.download_button("Download invoice", pdf.content, "invoice.pdf", "application/pdf", key=f"dl-{index}-{n}")
-            except httpx.HTTPError as exc:
-                st.error(f"Invoice unavailable: {exc}")
-
-
-for i, entry in enumerate(st.session_state.messages):
-    with st.chat_message(entry["role"]):
-        st.markdown(entry["content"])
-        show_invoices(entry, i)
-
-prompt = st.chat_input("Ask a billing question...", disabled=bool(st.session_state.pending))
-if prompt:
-    try:
-        if not st.session_state.conversation_id:
-            st.session_state.conversation_id = request("POST", "/conversations", json={"customer_id": customer.strip() or None}).json()["conversation_id"]
-        st.session_state.pending = {"message": prompt, "request_id": str(uuid4()), "conversation_id": st.session_state.conversation_id}
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        st.rerun()
-    except httpx.HTTPError as exc:
-        st.error(f"Could not start the conversation: {exc}")
-
-if st.session_state.pending:
-    try:
-        with st.chat_message("assistant"):
-            with st.spinner("Billing Agent is thinking..."):
-                reply = request("POST", "/chat", json=st.session_state.pending).json()
-        st.session_state.messages.append({"role": "assistant", "content": reply["response"], "invoices": reply.get("invoices", [])})
-        st.session_state.pending = None
-        st.rerun()
-    except httpx.HTTPError as exc:
-        detail = exc.response.text if isinstance(exc, httpx.HTTPStatusError) else str(exc)
-        st.error(f"Request failed: {detail}")
-        st.caption("Check current order state before repeating a write. A timed-out request may have completed.")
-        if st.button("Retry same request"):
-            st.rerun()
-        if st.button("Clear pending request"):
-            st.session_state.pending = None
-            st.rerun()
+    async def invoice(self, invoice_number, customer_id):
+        async with McpWorkbench(parameters()) as workbench:
+            return decode_result(await workbench.call_tool("download_invoice",
+                {"invoice_number": invoice_number, "customer_id": customer_id}))
