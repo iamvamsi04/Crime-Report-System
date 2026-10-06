@@ -1,96 +1,129 @@
-import json
-import os
-import sys
-from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.messages import TextMessage
-from autogen_core.model_context import UnboundedChatCompletionContext
-from autogen_core.models import UserMessage, AssistantMessage
-from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
-from autogen_ext.tools.mcp import McpWorkbench, StdioServerParams
+import asyncio
+import hmac
+import logging
+from contextlib import asynccontextmanager
+from uuid import UUID
+from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from config import settings
-from agent.system_message import SYSTEM_MESSAGE
+from context import context_manager as context
+from database.connection import initialize as initialize_billing
+from database.invoice import invoice_path
+
+log = logging.getLogger(__name__)
 
 
-def parameters():
-    return StdioServerParams(command=sys.executable, args=["-m", "mcp_server.server"],
-                            cwd=str(settings.ROOT), env={**os.environ,
-                            "BILLING_DB": str(settings.BILLING_DB),
-                            "INVOICE_DIR": str(settings.INVOICE_DIR)}, read_timeout_seconds=60)
+async def authorize(x_api_key: str | None = Header(default=None)):
+    if settings.API_KEY and not hmac.compare_digest(x_api_key or "", settings.API_KEY):
+        raise HTTPException(401, "Invalid API key.")
 
 
-def decode_result(result):
-    for block in result.result:
-        content = getattr(block, "content", None)
-        if isinstance(content, str):
-            try:
-                value = json.loads(content)
-                if isinstance(value, dict):
-                    return value
-            except ValueError:
-                pass
-    return {"ok": False, "error": "Tool returned an unreadable response."}
+@asynccontextmanager
+async def lifespan(app):
+    initialize_billing()
+    context.initialize()
+    app.state.chat_lock = asyncio.Lock()
+    if not hasattr(app.state, "engine"):
+        from agent.billing_agent import BillingAgent
+        app.state.engine = BillingAgent()
+    yield
 
 
-class RecordingWorkbench(McpWorkbench):
-    def __init__(self):
-        super().__init__(parameters())
-        self.downloads = []
-
-    async def call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
-        result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
-        if name == "download_invoice":
-            data = decode_result(result)
-            if data.get("ok") and data.get("ready"):
-                self.downloads.append({"invoice_number": data["invoice_number"], "customer_id": data["customer_id"]})
-        return result
+app = FastAPI(title="Billing Agent", version="1.0.0", lifespan=lifespan,
+              dependencies=[Depends(authorize)])
 
 
-def create_model_client(**client_options):
+class ConversationRequest(BaseModel):
+    customer_id: str | None = Field(default=None, max_length=50, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ChatRequest(BaseModel):
+    conversation_id: UUID
+    request_id: UUID
+    message: str = Field(min_length=1, max_length=10000)
+
+
+@app.get("/health")
+async def health():
     error = settings.azure_configuration_error()
-    if error:
-        raise ValueError(error)
-    # The deployment controls the Azure route; model is its underlying model name.
-    # This assistant needs text chat and tool calling, not vision or structured output.
-    return AzureOpenAIChatCompletionClient(
-        azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-        azure_deployment=settings.AZURE_OPENAI_DEPLOYMENT,
-        api_key=settings.AZURE_OPENAI_API_KEY,
-        api_version=settings.AZURE_OPENAI_API_VERSION,
-        model=settings.AZURE_OPENAI_MODEL,
-        model_info={"vision": False, "function_calling": True, "json_output": False,
-                    "family": "unknown", "structured_output": False},
-        parallel_tool_calls=False,
-        timeout=settings.CHAT_TIMEOUT,
-        max_retries=0,
-        **client_options,
-    )
+    return {"status": "degraded" if error else "ok", "api": "ready",
+            "provider": "azure_openai", "model_configured": error is None,
+            "connection_verified": False, "configuration_error": error,
+            "model": settings.AZURE_OPENAI_MODEL,
+            "deployment": settings.AZURE_OPENAI_DEPLOYMENT}
 
 
-class BillingAgent:
-    def validate_configuration(self):
-        error = settings.azure_configuration_error()
-        if error:
-            raise ValueError(error)
+@app.post("/conversations")
+async def create_conversation(body: ConversationRequest):
+    return {"conversation_id": context.conversation(customer_id=body.customer_id)}
 
-    async def chat(self, message, history, customer_id):
-        client = create_model_client()
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: UUID):
+    record = context.get_conversation(str(conversation_id))
+    if not record:
+        raise HTTPException(404, "Conversation not found.")
+    return {**record, "messages": context.history(str(conversation_id))}
+
+
+@app.post("/chat")
+async def chat(body: ChatRequest):
+    cid, rid = str(body.conversation_id), str(body.request_id)
+    if not body.message.strip():
+        raise HTTPException(422, "Message must not be blank.")
+    # One worker and one active turn: no mutable agent state is shared across users.
+    async with app.state.chat_lock:
+        record = context.get_conversation(cid)
+        if not record:
+            raise HTTPException(404, "Conversation not found.")
         try:
-            async with RecordingWorkbench() as workbench:
-                previous = [UserMessage(content=m["content"], source="user") if m["role"] == "user"
-                            else AssistantMessage(content=m["content"], source="billing_agent") for m in history]
-                agent = AssistantAgent("billing_agent", model_client=client, workbench=workbench,
-                        model_context=UnboundedChatCompletionContext(initial_messages=previous),
-                        system_message=SYSTEM_MESSAGE + f"\nAssociated customer_id: {customer_id or 'unset'}",
-                        reflect_on_tool_use=True, max_tool_iterations=8)
-                result = await agent.run(task=message)
-                final = result.messages[-1]
-                if not isinstance(final, TextMessage):
-                    raise RuntimeError("Agent did not produce a final text answer.")
-                return {"response": final.content, "invoices": workbench.downloads}
-        finally:
-            await client.close()
+            cached = context.begin(cid, rid, body.message)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if cached:
+            return cached
+        try:
+            validate = getattr(app.state.engine, "validate_configuration", None)
+            if validate:
+                validate()
+        except ValueError as exc:
+            # No tools have run. Remove this pending request so a configured restart
+            # can retry the same request ID safely.
+            context.discard_pending(cid, rid)
+            raise HTTPException(503, str(exc)) from exc
+        try:
+            result = await asyncio.wait_for(app.state.engine.chat(body.message, context.history(cid), record["customer_id"]),
+                                            timeout=settings.CHAT_TIMEOUT)
+            response = {"conversation_id": cid, "request_id": rid, **result}
+            context.finish(cid, rid, response)
+            return response
+        except Exception as exc:
+            context.fail(cid, rid)
+            log.exception("Billing turn failed: %s", rid)
+            raise HTTPException(503, {"message": "Agent unavailable or timed out. Check the Azure OpenAI endpoint, deployment, API version and key. "
+                "A billing tool may already have committed; check the order before repeating a write.",
+                "conversation_id": cid, "request_id": rid}) from exc
 
-    async def invoice(self, invoice_number, customer_id):
-        async with McpWorkbench(parameters()) as workbench:
-            return decode_result(await workbench.call_tool("download_invoice",
-                {"invoice_number": invoice_number, "customer_id": customer_id}))
+
+@app.get("/invoices/{invoice_number}")
+async def invoice(invoice_number: str, conversation_id: UUID, customer_id: str | None = None):
+    record = context.get_conversation(str(conversation_id))
+    if not record:
+        raise HTTPException(404, "Conversation not found.")
+    associated = record["customer_id"]
+    if associated and customer_id and associated != customer_id:
+        raise HTTPException(403, "Invoice customer does not match this conversation.")
+    owner = associated or customer_id
+    if not owner:
+        raise HTTPException(422, "A customer ID is required.")
+    try:
+        result = await asyncio.wait_for(app.state.engine.invoice(invoice_number, owner), timeout=60)
+    except Exception as exc:
+        raise HTTPException(503, "Invoice tool unavailable.") from exc
+    if not result.get("ok"):
+        raise HTTPException(404, result.get("error", "Invoice not found."))
+    path = invoice_path(invoice_number, owner)
+    if not path.is_file():
+        raise HTTPException(503, "Invoice file was not generated.")
+    return FileResponse(path, media_type="application/pdf", filename="invoice.pdf")
