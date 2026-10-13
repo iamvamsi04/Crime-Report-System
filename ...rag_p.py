@@ -1,158 +1,83 @@
+"""Plain customer-facing text; structured tool and memory payloads stay internal."""
 import json
-import sqlite3
-from contextlib import contextmanager
-from uuid import uuid4
-from config import settings
+import re
+
+REPLY_POLICY = """
+Write the visible reply in plain English, using short sentences and paragraphs.
+Do not use JSON, code blocks, Markdown headings, tables, bullets, emphasis, emoji or
+decorative symbols in the visible reply. Preserve exact product and invoice identifiers,
+amounts, units and customer names. Use currency names or codes and the word percent.
+Explain comparisons in sentences. Keep numbered options understandable in plain text.
+Internal tool arguments and the customer shopping-memory envelope still use their required
+structured format. Only the reply field is customer-facing. Charts and invoices are attachments.
+"""
+
+FALLBACK = 'I could not display that answer clearly. Please ask me to check the current records before repeating an order or refund request.'
 
 
-@contextmanager
-def connection():
-    conn = sqlite3.connect(settings.CONTEXT_DB, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
+def plain_reply(content):
+    text = str(content).strip()
+    text = re.sub(r'^```(?:json)?\s*\n?(.*?)\n?```$', r'\1', text, flags=re.S)
+    if text.startswith(('{', '[')):
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            if text.startswith('{') or re.match(r'^\[\s*[\{"\[]', text):
+                return FALLBACK
+        else:
+            if not isinstance(payload, dict):
+                return FALLBACK
+            reply = payload.get('reply', payload.get('response'))
+            if not isinstance(reply, str) or not reply.strip() or reply == text:
+                return FALLBACK
+            return plain_reply(reply)
+    text = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
+    text = re.sub(r'</?(?:p|br|div|span|b|strong|i|em|code|pre|ul|ol|li|h[1-6])(?:\s+[^>]*)?\s*/?>', '', text)
+    text = re.sub(r'(?m)^\s*(?:#{1,6}\s+|[-*+]\s+|>\s*)', '', text)
+    text = re.sub(r'(\*\*|__|~~)(.+?)\1', r'\2', text, flags=re.S)
+    text = re.sub(r'(?<!\w)([*_])([^\n]+?)\1(?!\w)', r'\2', text)
+    text = text.replace('`', '')
+    # Convert Markdown tables to labelled prose without losing column associations.
+    lines, table = [], []
+    def flush_table():
+        if not table:
+            return
+        headers, *rows = table
+        if not rows:
+            lines.append('; '.join(headers))
+        for cells in rows:
+            lines.append('; '.join(f'{headers[i] if i < len(headers) else "Value"}: {c}' for i, c in enumerate(cells)) + '.')
+        table.clear()
+    for line in text.splitlines():
+        if '|' in line:
+            cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            if not all(re.fullmatch(r':?-+:?', c) for c in cells):
+                table.append(cells)
+        else:
+            flush_table()
+            lines.append(line)
+    flush_table()
+    text = '\n'.join(lines)
+    for symbol, word in {'$':' dollars ', '₹':' INR ', '€':' EUR ', '£':' GBP ', '%':' percent',
+                         '→':' to ', '≥':' at least ', '≤':' at most ', '×':' times ',
+                         '°':' degrees ', '–':'-', '—':'. '}.items():
+        text = text.replace(symbol, word)
+    text = ''.join(c for c in text if not (0x1F000 <= ord(c) <= 0x1FAFF or 0x2600 <= ord(c) <= 0x27BF) and c not in '\u200d\ufe0f\u20e3')
+    text = re.sub(r'(?m)^[ \t]*[-*_]{3,}[ \t]*$', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = '\n'.join(line.strip() for line in text.splitlines())
+    return re.sub(r'\n{3,}', '\n\n', text).strip() or FALLBACK
+
+
+def error_reply(response):
+    """Extract the safe message, never display a raw HTTP JSON body."""
     try:
-        yield conn
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def initialize():
-    settings.CONTEXT_DB.parent.mkdir(parents=True, exist_ok=True)
-    with connection() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            conversation_id TEXT PRIMARY KEY, customer_id TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
-            request_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'done', response_json TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(conversation_id,request_id,role));
-        CREATE INDEX IF NOT EXISTS ix_messages_conversation ON messages(conversation_id,id);
-        CREATE TABLE IF NOT EXISTS shopping_states (
-            conversation_id TEXT PRIMARY KEY REFERENCES conversations(conversation_id),
-            state_json TEXT NOT NULL CHECK(json_valid(state_json)),
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-        """)
-        columns = {r['name'] for r in conn.execute('PRAGMA table_info(conversations)')}
-        if 'mode' not in columns:
-            # Older transcripts may contain store-wide data; require admin to resume them.
-            conn.execute("ALTER TABLE conversations ADD COLUMN mode TEXT NOT NULL DEFAULT 'admin'")
-
-
-def conversation(conversation_id=None, customer_id=None, mode='customer'):
-    with connection() as conn:
-        if conversation_id:
-            row = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
-            if not row:
-                raise ValueError("Conversation not found.")
-            if customer_id != row["customer_id"]:
-                raise ValueError("Customer association cannot change. Start a new conversation.")
-            return conversation_id
-        conversation_id = str(uuid4())
-        conn.execute("INSERT INTO conversations(conversation_id,customer_id,mode) VALUES (?,?,?)", (conversation_id, customer_id, mode))
-        return conversation_id
-
-
-def associate_customer(conversation_id, customer_id):
-    with connection() as conn:
-        conn.execute("UPDATE conversations SET customer_id=? WHERE conversation_id=? AND customer_id IS NULL AND mode='customer'",
-                     (customer_id, conversation_id))
-
-
-def get_conversation(conversation_id):
-    with connection() as conn:
-        row = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
-        return dict(row) if row else None
-
-
-def shopping_state(conversation_id):
-    from context.shopping_state import empty_state
-    with connection() as conn:
-        row = conn.execute('SELECT state_json FROM shopping_states WHERE conversation_id=?',
-                           (conversation_id,)).fetchone()
-        return json.loads(row[0]) if row else empty_state()
-
-
-def write_shopping_state(conn, conversation_id, state):
-    conn.execute('''INSERT INTO shopping_states(conversation_id,state_json) VALUES (?,?)
-        ON CONFLICT(conversation_id) DO UPDATE SET state_json=excluded.state_json,
-        updated_at=CURRENT_TIMESTAMP''', (conversation_id, json.dumps(state)))
-
-
-def checkpoint_shopping(conversation_id, request_id, state, customer_id):
-    """Persist observed tool facts even if a later model call fails or times out."""
-    with connection() as conn:
-        record = conn.execute('''SELECT c.customer_id FROM conversations c JOIN messages m
-            ON m.conversation_id=c.conversation_id WHERE c.conversation_id=? AND c.mode='customer'
-            AND m.request_id=? AND m.role='user' AND m.status='pending' ''',
-            (conversation_id, request_id)).fetchone()
-        if record is None or (record['customer_id'] and record['customer_id'] != customer_id):
-            raise ValueError('Shopping checkpoint does not match the active conversation.')
-        if customer_id and not record['customer_id']:
-            conn.execute('UPDATE conversations SET customer_id=? WHERE conversation_id=?',
-                         (customer_id, conversation_id))
-        write_shopping_state(conn, conversation_id, state)
-
-
-def history(conversation_id, include_artifacts=False):
-    with connection() as conn:
-        rows = conn.execute("SELECT m.role,m.content,u.response_json FROM messages m LEFT JOIN messages u "
-                            "ON m.role='assistant' AND u.role='user' AND u.conversation_id=m.conversation_id "
-                            "AND u.request_id=m.request_id WHERE m.conversation_id=? "
-                            "AND m.status='done' ORDER BY m.id DESC LIMIT 40", (conversation_id,)).fetchall()
-        result = []
-        for row in reversed(rows):
-            message = {'role':row['role'],'content':row['content']}
-            if include_artifacts and row['role']=='assistant' and row['response_json']:
-                saved = json.loads(row['response_json'])
-                message.update(charts=saved.get('charts',[]),invoices=saved.get('invoices',[]))
-            result.append(message)
-        return result
-
-
-def begin(conversation_id, request_id, message):
-    with connection() as conn:
-        row = conn.execute("SELECT * FROM messages WHERE conversation_id=? AND request_id=? AND role='user'",
-                           (conversation_id, request_id)).fetchone()
-        if row:
-            if row["content"] != message:
-                raise ValueError("Request ID was already used with different content.")
-            if row["response_json"]:
-                return json.loads(row["response_json"])
-            raise ValueError("This turn is pending or failed. Check order state before sending a new mutation.")
-        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content,status) VALUES (?,?,'user',?,'pending')",
-                     (conversation_id, request_id, message))
-        return None
-
-
-def finish(conversation_id, request_id, response):
-    with connection() as conn:
-        if 'shopping_state' in response:
-            record = conn.execute('SELECT mode FROM conversations WHERE conversation_id=?',
-                                  (conversation_id,)).fetchone()
-            if not record or record['mode'] != 'customer':
-                raise ValueError('Only customer conversations have shopping state.')
-            write_shopping_state(conn, conversation_id, response['shopping_state'])
-        conn.execute("UPDATE messages SET status='done',response_json=? WHERE conversation_id=? AND request_id=? AND role='user'",
-                     (json.dumps(response), conversation_id, request_id))
-        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content) VALUES (?,?,'assistant',?)",
-                     (conversation_id, request_id, response["response"]))
-
-
-def fail(conversation_id, request_id):
-    with connection() as conn:
-        conn.execute("UPDATE messages SET status='failed' WHERE conversation_id=? AND request_id=?", (conversation_id, request_id))
-
-
-def discard_pending(conversation_id, request_id):
-    """Only used for configuration rejection before any model/tool execution."""
-    with connection() as conn:
-        conn.execute("DELETE FROM messages WHERE conversation_id=? AND request_id=? "
-                     "AND role='user' AND status='pending'", (conversation_id, request_id))
+        detail = response.json().get('detail')
+        if isinstance(detail, dict):
+            detail = detail.get('message')
+        if isinstance(detail, str):
+            return plain_reply(detail)
+    except (ValueError, AttributeError):
+        pass
+    return 'The request could not be completed. Check your connection and request details, then try again.'
