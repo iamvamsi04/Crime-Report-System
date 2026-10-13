@@ -1,162 +1,83 @@
-"""Customer shopping comparisons; deterministic prices, no invented specifications."""
-import json
-import re
-from decimal import Decimal
-from mcp_server.tools.billing_tools import BillingError, tool_result, money, price_for
-from mcp_server.tools.operations_tools import reading
+"""Trusted API/workbench scope carried over the private local stdio transport."""
+from contextvars import ContextVar
+from contextlib import closing
+from functools import wraps
+import inspect
+import sqlite3
+from database.connection import connect
+
+scope = ContextVar('tool_scope', default=None)
+ADMIN_TOOLS = {'execute_sql_query', 'billing_analysis', 'billing_anomalies', 'download_invoice'}
+CUSTOMER_TOOLS = {'execute_sql_query', 'request_order', 'place_order', 'apply_promotion',
+                  'download_invoice', 'manage_draft', 'manage_customer', 'process_refund',
+                  'compare_products', 'find_cheaper_alternatives'}
+SCOPE_FIELDS = ('execution_mode', 'execution_customer_id')
 
 
-def options(quantity, budget, required_features):
-    if type(quantity) is not int or not 1 <= quantity <= 100000:
-        raise BillingError('Quantity must be an integer from 1 to 100000.')
-    budget = money(budget) if budget is not None else None
-    required_features = required_features or {}
-    if not isinstance(required_features, dict) or len(required_features) > 20 or any(
-        not isinstance(k, str) or not k.strip() or not isinstance(v, (str, int, float, bool))
-        for k, v in required_features.items()
-    ):
-        raise BillingError('Required features must be a dictionary of at most 20 feature/value pairs.')
-    return budget, required_features
+def scoped_tool(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        mode = kwargs.pop('execution_mode', 'customer')
+        customer = kwargs.pop('execution_customer_id', None)
+        allowed = ADMIN_TOOLS if mode == 'admin' else CUSTOMER_TOOLS if mode == 'customer' else set()
+        if fn.__name__ not in allowed:
+            return {'ok': False, 'error': 'This tool is not available in the current mode.'}
+        arguments = inspect.signature(fn).bind(*args, **kwargs).arguments
+        if mode == 'customer' and 'customer_id' in arguments:
+            creating = fn.__name__ == 'manage_customer' and arguments.get('action', 'create') == 'create'
+            if creating and customer is None:
+                # An anonymous shopper may create a NEW account, never adopt an existing one.
+                with closing(connect(readonly=True)) as conn:
+                    exists = conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (arguments['customer_id'],)).fetchone()
+                if exists:
+                    return {'ok': False, 'error': 'Existing customer: start a conversation with that customer selected.'}
+            elif not customer or arguments['customer_id'] != customer:
+                return {'ok': False, 'error': 'Select the matching customer in a new conversation first.'}
+        token = scope.set({'mode': mode, 'customer_id': customer})
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            scope.reset(token)
+    run.__signature__ = inspect.signature(fn).replace(parameters=[
+        *inspect.signature(fn).parameters.values(),
+        inspect.Parameter('execution_mode', inspect.Parameter.KEYWORD_ONLY, default='customer', annotation=str),
+        inspect.Parameter('execution_customer_id', inspect.Parameter.KEYWORD_ONLY, default=None, annotation=str | None)])
+    run.__annotations__ = {**fn.__annotations__, 'execution_mode': str, 'execution_customer_id': str | None}
+    return run
 
 
-def resolve(conn, reference):
-    if not isinstance(reference, str) or not reference.strip() or len(reference) > 200:
-        raise BillingError('Provide an item code, SKU or product name.')
-    reference = reference.strip()
-    rows = conn.execute('SELECT * FROM items WHERE item_code=? OR sku=?', (reference, reference)).fetchall()
-    if not rows:
-        rows = conn.execute('SELECT * FROM items WHERE lower(name)=lower(?)', (reference,)).fetchall()
-    if not rows:
-        rows = conn.execute('SELECT * FROM items WHERE instr(lower(name),lower(?))>0 LIMIT 6', (reference,)).fetchall()
-    if len(rows) != 1:
-        choices = ', '.join(f"{r['item_code']} ({r['name']})" for r in rows[:5])
-        raise BillingError('Product not found.' if not rows else 'Product is ambiguous. Ask the customer to choose: ' + choices)
-    return rows[0]
+def customer_query_connection(customer_id):
+    """Materialize only public catalogue and associated customer rows in an isolated DB.
 
-
-def product(conn, row, today, quantity, budget, requirements):
-    detail = conn.execute('SELECT * FROM product_details WHERE item_code=?', (row['item_code'],)).fetchone()
-    features = json.loads(detail['features_json']) if detail else {}
-    units = {}
-    for attribute in conn.execute('SELECT * FROM product_attributes WHERE item_code=?', (row['item_code'],)):
-        key = attribute['attribute']
-        # Explicit typed attributes take precedence over a legacy JSON key (case-insensitively).
-        for existing in list(features):
-            if existing.casefold() == key.casefold():
-                del features[existing]
-        features[key] = attribute['text_value'] if attribute['text_value'] is not None else attribute['number_value']
-        if attribute['unit']:
-            units[key] = attribute['unit']
-    unit = price_for(conn, row, today)
-    total = money(unit * quantity)
-    matched, missing, different = [], [], []
-    for key, value in requirements.items():
-        recorded_key = next((k for k in features if k.casefold()==key.casefold()),None)
-        if recorded_key is None:
-            missing.append(key)
-        elif (str(features[recorded_key]).casefold() == str(value).casefold() or
-              (type(features[recorded_key]) in (int,float) and type(value) in (int,float)
-               and Decimal(str(features[recorded_key])) == Decimal(str(value)))):
-            matched.append(key)
-        else:
-            different.append(key)
-    return {'item_code': row['item_code'], 'sku': row['sku'], 'name': row['name'],
-            'category': detail['category'] if detail else None,
-            'description': detail['description'] if detail else '', 'features': features, 'feature_units': units,
-            'unit_price': str(unit), 'quantity': quantity, 'merchandise_total': str(total),
-            'available_quantity': row['availablequantity'], 'enough_stock': row['availablequantity'] >= quantity,
-            'within_budget': budget is None or total <= budget,
-            'matched_features': matched, 'unknown_features': missing, 'different_features': different}
-
-
-def context(conn):
-    config = dict(conn.execute('SELECT key,value FROM billing_config'))
-    return conn.execute('SELECT CURRENT_DATE').fetchone()[0], config.get('currency', 'USD')
-
-
-def eligible(row):
-    return row['enough_stock'] and row['within_budget'] and not row['unknown_features'] and not row['different_features']
-
-
-NOTES = ['Prices use today\'s dated price history, falling back to sellingprice, as in order quoting.',
-         'Budget covers merchandise for the requested quantity, before promotions, tax and shipping. Request an order draft for the final total.',
-         'Missing features are unknown. Price and stock do not establish quality, compatibility or suitability. No inventory is reserved.']
-
-
-@tool_result
-def compare_products(products: list[str], quantity: int = 1, budget: str | None = None,
-                     required_features: dict | None = None) -> dict:
-    """Compare 2-5 products by code/SKU/name, price, stock and recorded features.
-
-    budget is the TOTAL merchandise budget for quantity. required_features maps exact stored feature
-    names to desired values (e.g. {"connection":"wireless"}); missing features stay unknown.
-    Suggests the lowest-priced available match, never an unsupported overall quality winner.
-    Ask what 'better' means for the customer. Product names can be ambiguous; ask instead of guessing.
+    User SQL never touches the source connection, preventing joins, CTEs and main.table
+    qualification from bypassing a row filter. Original column names are preserved.
     """
-    budget, requirements = options(quantity, budget, required_features)
-    if not isinstance(products, list) or not 2 <= len(products) <= 5:
-        raise BillingError('Compare between 2 and 5 products.')
-    with reading() as conn:
-        today, currency = context(conn)
-        rows = [product(conn, resolve(conn, ref), today, quantity, budget, requirements) for ref in products]
-        if len({r['item_code'] for r in rows}) != len(rows):
-            raise BillingError('Choose distinct products to compare.')
-        matches = [r for r in rows if eligible(r)]
-        lowest = min((Decimal(r['unit_price']) for r in matches), default=None)
-        winners = [r['item_code'] for r in matches if Decimal(r['unit_price']) == lowest]
-        categories = {r['category'] for r in rows}
-        return {'currency': currency, 'as_of': today, 'products': rows,
-                'lowest_price_matching_items': winners,
-                'recommendation_basis': 'Lowest current price among in-stock products meeting budget and every recorded requirement; ties retained.',
-                'same_recorded_category': len(categories) == 1 and None not in categories,
-                'notes': NOTES + ['Different or missing categories require checking that the products serve the same purpose.']}
-
-
-def words(name):
-    return set(re.findall(r'[a-z]+', name.lower())) - {
-        'a', 'an', 'the', 'for', 'with', 'and', 'inch', 'cm', 'gb', 'tb', 'hd',
-        'black', 'white', 'red', 'blue', 'premium', 'basic', 'pro', 'model', 'variant', 'wireless', 'usb'}
-
-
-@tool_result
-def find_cheaper_alternatives(product_reference: str, quantity: int = 1, budget: str | None = None,
-                              required_features: dict | None = None, limit: int = 5) -> dict:
-    """Find cheaper in-stock alternatives within the same recorded category.
-
-    Without a source category, uses shared meaningful name words and labels matches tentative.
-    Never treats a cheaper unrelated item as equivalent. Exact required features must be recorded
-    and match. Budget is total merchandise cost for quantity, before tax/shipping/promotions.
-    """
-    budget, requirements = options(quantity, budget, required_features)
-    if type(limit) is not int or not 1 <= limit <= 10:
-        raise BillingError('Limit must be from 1 to 10.')
-    with reading() as conn:
-        today, currency = context(conn)
-        source = product(conn, resolve(conn, product_reference), today, quantity, budget, requirements)
-        if source['category']:
-            candidates = conn.execute('SELECT i.* FROM items i JOIN product_details d ON d.item_code=i.item_code '
-                'WHERE lower(d.category)=lower(?) AND i.item_code<>? AND i.availablequantity>=?',
-                (source['category'], source['item_code'], quantity)).fetchall()
-        else:
-            candidates = conn.execute('SELECT * FROM items WHERE item_code<>? AND availablequantity>=?',
-                                      (source['item_code'], quantity)).fetchall()
-        choices, unavailable_prices = [], []
-        for row in candidates:
-            if not source['category'] and not words(source['name']).intersection(words(row['name'])):
-                continue
-            try:
-                candidate = product(conn, row, today, quantity, budget, requirements)
-            except BillingError:
-                unavailable_prices.append(row['item_code'])
-                continue
-            if not eligible(candidate) or Decimal(candidate['unit_price']) >= Decimal(source['unit_price']):
-                continue
-            candidate['savings_for_quantity'] = str(money(Decimal(source['merchandise_total']) - Decimal(candidate['merchandise_total'])))
-            candidate['match_basis'] = 'recorded_category' if source['category'] else 'shared_name_words_only'
-            choices.append(candidate)
-        choices.sort(key=lambda r: (Decimal(r['unit_price']), r['item_code']))
-        return {'currency': currency, 'as_of': today, 'source': source, 'alternatives': choices[:limit],
-                'matched_count': len(choices), 'truncated': len(choices) > limit,
-                'items_with_unusable_prices': unavailable_prices,
-                'notes': NOTES + ['Name-based matches are possible alternatives only; verify purpose and compatibility before recommending.',
-                                 'No matches means no qualifying cheaper option was found; do not invent alternatives.']}
+    source, target = connect(readonly=True), sqlite3.connect(':memory:')
+    target.row_factory = sqlite3.Row
+    queries = {
+        'billing_config': "SELECT key,value FROM billing_config WHERE key IN ('currency','tax_rate','shipping_amount')",
+        'items': 'SELECT sku,item_code,name,sellingprice,availablequantity FROM items',
+        'product_details': 'SELECT * FROM product_details',
+        'product_attributes': 'SELECT * FROM product_attributes',
+        'product_relations': 'SELECT * FROM product_relations',
+        'price_history': 'SELECT * FROM price_history',
+        'promotions': 'SELECT * FROM promotions',
+        'customers': 'SELECT * FROM customers WHERE customer_id=?',
+        'orders': 'SELECT * FROM orders WHERE customer_id=?',
+    }
+    for table in ('order_requests','order_fulfilled','invoice_lines','order_details'):
+        queries[table] = f'SELECT t.* FROM {table} t JOIN orders o ON o.order_id=t.order_id WHERE o.customer_id=?'
+    try:
+        source.execute('BEGIN')
+        for table, sql in queries.items():
+            cursor = source.execute(sql, (customer_id,) if '?' in sql else ())
+            columns = [c[0] for c in cursor.description]
+            target.execute('CREATE TABLE '+table+' ('+', '.join('"'+c+'"' for c in columns)+')')
+            target.executemany('INSERT INTO '+table+' VALUES ('+','.join('?' for _ in columns)+')', cursor.fetchall())
+        target.commit()
+        return target
+    except BaseException:
+        target.close()
+        raise
+    finally:
+        source.close()
