@@ -1,20 +1,66 @@
--- Additive migration. Original orders and invoice lines remain intact.
-CREATE TABLE IF NOT EXISTS order_details (
-    order_id TEXT PRIMARY KEY REFERENCES orders(order_id),
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','cancelled')),
-    due_date TEXT,
-    currency TEXT NOT NULL,
-    customer_snapshot TEXT,
-    cancellation_reason TEXT
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS billing_config (
+    key VARCHAR(50) PRIMARY KEY, value VARCHAR(100) NOT NULL
 );
-CREATE TABLE IF NOT EXISTS billing_audit (
+CREATE TABLE IF NOT EXISTS customers (
+    customer_id VARCHAR(50) PRIMARY KEY, name VARCHAR(200) NOT NULL,
+    company VARCHAR(200), email VARCHAR(200)
+);
+CREATE TABLE IF NOT EXISTS items (
+    sku VARCHAR(50) PRIMARY KEY, item_code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    baseprice DECIMAL(10,2) NOT NULL CHECK(baseprice >= 0),
+    sellingprice DECIMAL(10,2) NOT NULL CHECK(sellingprice >= 0),
+    availablequantity INTEGER NOT NULL DEFAULT 0 CHECK(availablequantity >= 0)
+);
+CREATE TABLE IF NOT EXISTS promotions (
+    promo_code VARCHAR(50) PRIMARY KEY, description VARCHAR(300),
+    discount_type VARCHAR(20) NOT NULL CHECK(discount_type IN ('percent','flat')),
+    discount_value DECIMAL(10,2) NOT NULL CHECK(discount_value >= 0),
+    CHECK(discount_type != 'percent' OR discount_value <= 100)
+);
+CREATE TABLE IF NOT EXISTS orders (
+    order_id VARCHAR(50) PRIMARY KEY,
+    order_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    customer_id VARCHAR(50) NOT NULL REFERENCES customers(customer_id),
+    order_invoice VARCHAR(100),
+    subtotal DECIMAL(10,2) NOT NULL CHECK(subtotal >= 0),
+    tax_amount DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(tax_amount >= 0),
+    shipping_amount DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(shipping_amount >= 0),
+    discount_applied DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(discount_applied >= 0),
+    charged_price DECIMAL(10,2) NOT NULL CHECK(charged_price >= 0),
+    promo_code VARCHAR(50) REFERENCES promotions(promo_code),
+    refund_amount DECIMAL(10,2), refund_status VARCHAR(20), refund_reason TEXT,
+    CHECK(refund_amount IS NULL OR (refund_amount > 0 AND refund_amount <= charged_price))
+);
+CREATE TABLE IF NOT EXISTS order_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    action TEXT NOT NULL,
-    details_json TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    order_id VARCHAR(50) NOT NULL REFERENCES orders(order_id),
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    quantity INTEGER NOT NULL CHECK(quantity > 0), UNIQUE(order_id,item_code)
 );
-CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON billing_audit
-BEGIN SELECT RAISE(ABORT, 'Audit records cannot be updated'); END;
-CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON billing_audit
-BEGIN SELECT RAISE(ABORT, 'Audit records cannot be deleted'); END;
-CREATE INDEX IF NOT EXISTS ix_order_due ON order_details(due_date,status);
+CREATE TABLE IF NOT EXISTS order_fulfilled (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id VARCHAR(50) NOT NULL REFERENCES orders(order_id),
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    quantity INTEGER NOT NULL CHECK(quantity > 0), UNIQUE(order_id,item_code)
+);
+CREATE TABLE IF NOT EXISTS invoice_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id VARCHAR(50) NOT NULL REFERENCES orders(order_id),
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    qty_billed INTEGER NOT NULL CHECK(qty_billed > 0),
+    unit_price_billed DECIMAL(10,2) NOT NULL CHECK(unit_price_billed >= 0),
+    line_total DECIMAL(10,2) NOT NULL CHECK(line_total >= 0), UNIQUE(order_id,item_code)
+);
+CREATE TABLE IF NOT EXISTS price_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    unit_price DECIMAL(10,2) NOT NULL CHECK(unit_price >= 0),
+    effective_from DATE NOT NULL, effective_to DATE,
+    CHECK(effective_to IS NULL OR effective_to >= effective_from)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_invoice_number ON orders(order_invoice)
+    WHERE order_invoice IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_customer_orders ON orders(customer_id,order_date);
+CREATE INDEX IF NOT EXISTS ix_price_dates ON price_history(item_code,effective_from,effective_to);
