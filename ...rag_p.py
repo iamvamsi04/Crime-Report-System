@@ -1,92 +1,118 @@
-"""SQLite parser/authorizer is the security boundary, not a keyword regex."""
-import math
-import sqlite3
-import time
-from config import settings
-from database.connection import connect
+"""Customer and draft workflows. No external money movement or message delivery."""
+from contextlib import contextmanager
+from decimal import Decimal
+import re
 
-TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
-          'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
-          'order_details', 'billing_audit',
-          'product_details', 'product_attributes', 'product_relations', 'json_each'}
-FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnull '
-                'instr julianday length like lower ltrim max min nullif printf replace '
-                'round rtrim strftime substr substring sum time total trim typeof '
-                'unicode upper row_number rank dense_rank lag lead first_value last_value '
-                'json_extract json_type json_valid json_array_length current_date current_time current_timestamp'.split())
+from database.connection import connect, transaction
+from mcp_server.tools.billing_tools import (BillingError, tool_result, identifier, money,
+    order_row, is_placed, totals, update_totals, price_for)
 
 
-def authorize(action, arg1, arg2, db, trigger):
-    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_READ and arg1 in TABLES and db in ('main', None):
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_FUNCTION and (arg2 or '').lower() in FUNCTIONS:
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_PRAGMA and arg1 == 'table_info' and arg2 in TABLES:
-        return sqlite3.SQLITE_OK
-    return sqlite3.SQLITE_DENY
+def confirm(confirmed):
+    if confirmed is not True:
+        raise BillingError('Show the proposed change and obtain explicit confirmation first.')
 
 
-def execute_sql_query(query: str, chart: dict | None = None, parameters: list | None = None) -> dict:
-    """Answer flexible questions with one read-only SELECT/WITH or PRAGMA table_info(table).
+def text(value, name, maximum=2000):
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise BillingError(f'{name} must contain 1-{maximum} characters.')
+    return value.strip()
 
-    Join/filter/group permitted base tables instead of needing a tool per question.
-    Inspect columns with PRAGMA. No database views exist. Payment and credit records are unavailable.
-    Invoice totals minus recorded refunds are not amounts due or proof of settlement.
-    Use ? placeholders with parameters for user-provided values; never interpolate names into SQL.
-    For requested admin visuals optionally pass chart={"type":"bar","title":"Revenue","x":"month","y":["revenue"]}.
-    Types: bar,grouped_bar,horizontal_bar,stacked_bar,normalized_bar,line,step_line,area,stacked_area,
-    normalized_area,pie,donut,scatter,bubble,histogram,boxplot,heatmap,waterfall,range,combo,timeline,
-    candlestick,pareto,funnel,treemap. x/y and optional group,size,end must be returned column aliases.
-    Histogram: numeric x,y:[],bins 2-50. Timeline: ISO x,end,group task label,y:[]. Heatmap: x,group,y:[measure].
-    Bubble: numeric x,y:[measure],size. Range: y:[low,high]. Combo: y:[bar,line]. Candlestick: y:[open,high,low,close].
-    Other types accept the column counts in the chart contract. Optional x_type: categorical,numeric,temporal.
-    Distributions use complete observations; summaries aggregate duplicate coordinates in SQL.
-    Include a currency column for money and query ONE currency per chart. Order trends chronologically.
-    Chart queries allow up to 1000 rows; ordinary reads use SQL_MAX_ROWS. No charts from truncated results. A chart_error leaves query rows usable; correct SQL/spec if needed.
-    """
-    if not isinstance(query, str) or not query.strip() or len(query) > 20000:
-        return {'ok': False, 'error': 'Provide one SQL query of at most 20000 characters.'}
-    if parameters is not None and (not isinstance(parameters,list) or len(parameters)>100 or
-            any(value is not None and not isinstance(value,(str,int,float)) for value in parameters)):
-        return {'ok':False,'error':'Parameters must be a list of up to 100 text, numeric or null values.'}
-    if any((isinstance(value, int) and not -(2**63) <= value < 2**63) or
-           (isinstance(value, float) and not math.isfinite(value)) for value in parameters or []):
-        return {'ok':False,'error':'Numeric parameters must be finite and integers must fit the SQLite 64-bit range.'}
-    from mcp_server.access import scope, customer_query_connection
-    access = scope.get()
-    if chart is not None and (not access or access['mode'] != 'admin'):
-        return {'ok': False, 'error': 'Analytics charts require Admin mode.'}
-    conn = (customer_query_connection(access['customer_id'])
-            if access and access['mode'] == 'customer' else connect(readonly=True))
+
+@contextmanager
+def reading():
+    conn = connect(readonly=True)
     try:
-        conn.execute('PRAGMA query_only=ON')
-        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1000000)
-        conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 20000)
-        conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 100)
-        deadline = time.monotonic() + 2
-        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
-        conn.set_authorizer(authorize)
-        cursor = conn.execute(query, parameters or [])
-        from mcp_server.charts import MAX_CHART_ROWS
-        row_limit = MAX_CHART_ROWS if chart is not None else settings.SQL_MAX_ROWS
-        rows = cursor.fetchmany(row_limit + 1)
-        if any(isinstance(value, float) and not math.isfinite(value) for row in rows for value in row):
-            return {'ok':False,'error':'The query produced a non-finite number. Narrow the calculation or correct its inputs.'}
-        result = {'ok': True, 'columns': [c[0] for c in cursor.description or []],
-                'rows': [list(row) for row in rows[:row_limit]],
-                'row_count': min(len(rows), row_limit),
-                'truncated': len(rows) > row_limit}
-        if chart is not None:
-            from mcp_server.charts import prepare_chart
-            try:
-                payload = prepare_chart(result['columns'],result['rows'],chart,result['truncated'])
-                result['chart'] = {key:value for key,value in payload.items() if key != 'data'}
-            except ValueError as exc:
-                result['chart_error'] = str(exc)
-        return result
-    except sqlite3.Error as exc:
-        return {'ok': False, 'error': f'Query rejected or failed: {exc}'}
+        conn.execute('BEGIN')
+        yield conn
     finally:
         conn.close()
+
+
+def ensure_customer(conn, customer_id):
+    if not conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (customer_id,)).fetchone():
+        raise BillingError('Customer not found.')
+
+
+@tool_result
+def manage_customer(customer_id: str, name: str, company: str = '', email: str = '',
+                    action: str = 'create', confirmed: bool = False) -> dict:
+    """Create or update a customer after confirmation. Update replaces all contact fields; show them first.
+
+    Existing issued invoice contact snapshots are preserved. Use SQL to look up a customer before editing.
+    """
+    confirm(confirmed)
+    identifier(customer_id, 'customer ID')
+    name = text(name, 'Name', 200)
+    if not isinstance(company, str) or len(company) > 200:
+        raise BillingError('Company must contain at most 200 characters.')
+    if not isinstance(email, str) or len(email) > 200 or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)):
+        raise BillingError('Provide a valid email address or leave it empty.')
+    with transaction() as conn:
+        existing = conn.execute('SELECT * FROM customers WHERE customer_id=?', (customer_id,)).fetchone()
+        if action == 'create':
+            if existing:
+                if (existing['name'], existing['company'] or '', existing['email'] or '') != (name, company, email):
+                    raise BillingError('Customer ID exists with different details. Use update after confirmation.')
+                return {'customer_id': customer_id, 'already_exists': True}
+            conn.execute('INSERT INTO customers VALUES (?,?,?,?)', (customer_id, name, company, email))
+        elif action == 'update':
+            ensure_customer(conn, customer_id)
+            conn.execute('UPDATE customers SET name=?,company=?,email=? WHERE customer_id=?', (name, company, email, customer_id))
+        else:
+            raise BillingError('Action must be create or update.')
+    return {'customer_id': customer_id, 'name': name, 'company': company, 'email': email, 'action': action}
+
+
+@tool_result
+def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict] | None = None,
+                 reason: str = '', confirmed: bool = False) -> dict:
+    """After confirmation, replace all lines of a draft or cancel it. action: replace_items or cancel.
+
+    items is the complete desired list of item_code and integer quantity. Never edits issued invoices.
+    Cancellation retains records for audit and does not restock since drafts never reserved stock.
+    """
+    confirm(confirmed)
+    with transaction() as conn:
+        existing_meta = conn.execute('SELECT status FROM order_details WHERE order_id=?', (order_id,)).fetchone()
+        if existing_meta and existing_meta['status'] == 'cancelled' and action == 'cancel':
+            owner = conn.execute('SELECT customer_id FROM orders WHERE order_id=?', (order_id,)).fetchone()
+            if owner and owner[0] == customer_id:
+                return {'order_id': order_id, 'status': 'cancelled', 'already_cancelled': True}
+        order = order_row(conn, order_id, customer_id)
+        if is_placed(conn, order):
+            raise BillingError('Issued invoices cannot be edited. Review the supported refund workflow with store staff.')
+        if action == 'cancel':
+            reason = text(reason, 'Cancellation reason')
+            currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
+            conn.execute("INSERT INTO order_details(order_id,currency,status,cancellation_reason) VALUES (?,?,'cancelled',?) "
+                         "ON CONFLICT(order_id) DO UPDATE SET status='cancelled',cancellation_reason=excluded.cancellation_reason",
+                         (order_id, currency, reason))
+            return {'order_id': order_id, 'status': 'cancelled', 'reason': reason}
+        if action != 'replace_items' or not isinstance(items, list) or not 1 <= len(items) <= 100:
+            raise BillingError('Use cancel or replace_items with 1-100 line items.')
+        quantities = {}
+        for line in items:
+            if not isinstance(line, dict):
+                raise BillingError('Each item must contain item_code and quantity.')
+            code = identifier(line.get('item_code'), 'item code')
+            qty = line.get('quantity')
+            if type(qty) is not int or not 1 <= qty <= 100000:
+                raise BillingError('Quantity must be an integer from 1 to 100000.')
+            quantities[code] = quantities.get(code, 0) + qty
+            if quantities[code] > 100000:
+                raise BillingError('Combined quantity exceeds 100000.')
+        subtotal = Decimal(0)
+        for code, qty in quantities.items():
+            item = conn.execute('SELECT * FROM items WHERE item_code=?', (code,)).fetchone()
+            if not item or item['availablequantity'] < qty:
+                raise BillingError(f'Item {code} is unavailable or has insufficient stock.')
+            subtotal += price_for(conn, item, order['order_date']) * qty
+        values = totals(conn, subtotal, order['promo_code'])
+        conn.execute('DELETE FROM order_requests WHERE order_id=?', (order_id,))
+        conn.executemany('INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)',
+                         [(order_id, code, qty) for code, qty in quantities.items()])
+        update_totals(conn, order_id, values)
+        return {'order_id': order_id, 'status': 'requested', 'estimate': values}
+
+
