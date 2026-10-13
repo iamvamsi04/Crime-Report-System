@@ -1,55 +1,24 @@
-import sqlite3
-import json
-from contextlib import contextmanager
-from contextvars import ContextVar
-from config import settings
-
-audit_context = ContextVar('billing_audit', default=None)
-
-
-def connect(readonly=False):
-    if readonly:
-        conn = sqlite3.connect(settings.BILLING_DB.resolve().as_uri() + '?mode=ro', uri=True, timeout=10)
-    else:
-        conn = sqlite3.connect(settings.BILLING_DB, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA foreign_keys=ON')
-    conn.execute('PRAGMA busy_timeout=10000')
-    return conn
-
-
-@contextmanager
-def transaction():
-    conn = connect()
-    try:
-        conn.execute('BEGIN IMMEDIATE')
-        yield conn
-        event = audit_context.get()
-        if event and conn.total_changes:
-            conn.execute('INSERT INTO billing_audit(action,details_json) VALUES (?,?)',
-                         (event['action'], json.dumps(event['arguments'], default=str, sort_keys=True)))
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def initialize():
-    settings.BILLING_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = connect()
-    try:
-        conn.execute('PRAGMA journal_mode=WAL')
-        from database.migrations import remove_retired_tables, remove_views
-        remove_views(conn)
-        remove_retired_tables(conn)
-        conn.executescript((settings.ROOT / 'database/schema.sql').read_text())
-        conn.executescript((settings.ROOT / 'database/operations.sql').read_text())
-        conn.executescript((settings.ROOT / 'database/catalogue.sql').read_text())
-        conn.executescript((settings.ROOT / 'database/insights.sql').read_text())
-        conn.executemany('INSERT OR IGNORE INTO billing_config(key,value) VALUES (?,?)',
-                         [('tax_rate', '0'), ('shipping_amount', '0'), ('currency', 'USD')])
-        conn.commit()
-    finally:
-        conn.close()
+-- Additive schema: existing catalogue, orders and financial records are untouched.
+CREATE TABLE IF NOT EXISTS product_attributes (
+    item_code TEXT NOT NULL REFERENCES items(item_code),
+    attribute TEXT NOT NULL COLLATE NOCASE CHECK(length(trim(attribute)) BETWEEN 1 AND 100),
+    text_value TEXT CHECK(text_value IS NULL OR length(text_value)<=500),
+    number_value REAL CHECK(number_value IS NULL OR abs(number_value)<=1e15),
+    unit TEXT CHECK(unit IS NULL OR length(unit)<=30),
+    PRIMARY KEY(item_code,attribute),
+    CHECK((text_value IS NOT NULL AND number_value IS NULL AND unit IS NULL)
+       OR (text_value IS NULL AND number_value IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS ix_attributes_numeric ON product_attributes(attribute,unit,number_value);
+CREATE INDEX IF NOT EXISTS ix_attributes_text ON product_attributes(attribute,text_value);
+CREATE INDEX IF NOT EXISTS ix_orders_date ON orders(order_date);
+CREATE TABLE IF NOT EXISTS product_relations (
+    item_code TEXT NOT NULL REFERENCES items(item_code),
+    related_item_code TEXT NOT NULL REFERENCES items(item_code),
+    relation_type TEXT NOT NULL CHECK(relation_type IN ('substitute','compatible','accessory')),
+    notes TEXT NOT NULL DEFAULT '' CHECK(length(notes)<=2000),
+    PRIMARY KEY(item_code,related_item_code,relation_type),
+    CHECK(item_code<>related_item_code)
+);
+-- Relations are directional; store the reverse explicitly when appropriate.
+CREATE INDEX IF NOT EXISTS ix_relations_reverse ON product_relations(related_item_code,relation_type);
