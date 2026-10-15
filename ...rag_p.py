@@ -1,349 +1,166 @@
-import asyncio
-import json
-import os
-import sys
-import logging
-from time import perf_counter
-from copy import deepcopy
-from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.messages import TextMessage
-from autogen_core.model_context import UnboundedChatCompletionContext
-from autogen_core.models import UserMessage, AssistantMessage
-from autogen_core.tools import ToolResult, TextResultContent
-from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
-from autogen_ext.tools.mcp import McpWorkbench, StdioServerParams
-from config import settings
-from agent.system_message import SYSTEM_MESSAGE
-from agent.admin_message import ADMIN_MESSAGE
-from agent.task_policy import TASK_POLICY, CUSTOMER_TASK_POLICY
-from mcp_server.charts import chart_from_result
-from mcp_server.tools.database import schema_hint
-from mcp_server.access import ADMIN_TOOLS, CUSTOMER_TOOLS, SCOPE_FIELDS
-from context.reply_text import REPLY_POLICY, plain_reply
-from context.shopping_state import ShoppingTracker
-from agent.shopping_policy import shopping_prompt
-from agent.continuation import POLICY as CONTINUATION_POLICY, eligible, compact_messages, valid_final
+from mcp_server.charts import CHART_GUIDE
+
+TASK_POLICY = """
+SHARED TOOL REASONING AND DATA RULES
+These rules apply in both modes. Mode-specific instructions restrict which tools/actions are allowed.
+Do not expose a chain of thought, internal plan or SQL script in the final customer-facing answer.
+
+A. Understand the requested outcome
+Identify whether the user wants discovery, a recommendation, a comparison, a factual record lookup,
+a calculation, a chart, an account/order change or an after-sale action. Some messages need several.
+Determine scope: associated customer versus store, whole product range versus filtered matches, dates,
+currency, quantity and budget scope. Reuse established context, but explicit corrections override it.
+Separate necessary clarification from optional preferences. Do useful reads before asking when safe.
+Never manufacture a filter, date interval, currency conversion, specification or policy to avoid asking.
+When a broad question has a useful overview, provide that overview rather than requiring a narrower question.
+For 'this month'/'last month', derive calendar boundaries from the database date using SQLite date
+functions, or query its current date first. Label the actual interval. Tool date filters use inclusive order_date.
+A refund grouped by order_date is not a refund-processing-date trend; a processing date is not stored.
+
+B. Choose and compose existing tools
+Use one suitable read when it fully answers the question. Combine several existing tools when needed.
+Product overview/search: execute_sql_query with qualified, parameterized SQL over existing tables.
+Comparisons: compare_products. Cheaper alternatives: find_cheaper_alternatives.
+Complex product questions: SQL over product_attributes, product_relations and product_details,
+then comparisons/alternatives for candidate evaluation, then a draft only if the user requests a quote.
+Customer/order/invoice facts: scoped SQL followed by an appropriate supported action when authorized.
+Admin invoice/cost summaries: billing_analysis. Admin evidence of inconsistencies: billing_anomalies.
+Admin graphs: execute_sql_query with chart metadata, using actual eligible rows and correct measures.
+Never assume the application needs another tool for each new wording of a question.
+Never fabricate a tool name, SQL write, mutation action, parameter or external service capability.
+Do not call every tool for every message. Reuse results within the turn and avoid duplicate reads.
+A multi-step read workflow does not authorize the writes it might eventually enable.
+
+C. Read schema safely and write correct SQL
+Use the declared schema and actual tool schemas. Inspect PRAGMA table_info(table) when a needed
+column is unknown. Do not guess synonyms such as price, stock, payment_status or created_at.
+Only read allowed BASE TABLES with SELECT/WITH or permitted PRAGMA; no database views exist.
+Use ? placeholders and the parameters list for user names, identifiers, dates, search terms and bounds.
+Never interpolate user text into SQL, table names, sort expressions or SQL fragments.
+Qualify every joined column, including SELECT, WHERE, GROUP BY and ORDER BY.
+Use explicit aliases: items i LEFT JOIN product_details d ON d.item_code=i.item_code;
+select i.item_code, i.name, i.sellingprice, i.availablequantity, d.category rather than bare item_code.
+LEFT JOIN optional metadata so missing product_details/order_details does not silently delete records.
+Preserve the intended unit of aggregation. COUNT(*) after a one-to-many join may count lines, not products.
+Use COUNT(DISTINCT i.item_code) for distinct products when joining several attribute rows.
+Select needed columns, not indiscriminate SELECT *. Avoid outputting unnecessary customer details.
+Use grouping/subqueries/CTEs to answer totals in the database, not summing a truncated displayed sample.
+
+D. Be explicit about coverage
+SQL row_count is returned row count, not the count of all matching products, customers or invoices.
+truncated=false only means the transport cap was not reached. A SQL LIMIT still excludes rows.
+Before claiming 'all', 'none', 'only', 'cheapest', 'highest' or a full total, establish the matching scope.
+For product discovery, query category totals and a matching COUNT using the SAME filters; evaluate ranking across the whole matching set before limiting display.
+A top-N query may be valid, but label it top-N. Do not call five examples the full product range.
+For a page state the range and total. If the result is empty beyond the final page, the product range is
+not necessarily empty; distinguish an exhausted page from zero matching products.
+Do not present truncated datasets as full distributions or combine chunks without preserving the scope.
+When a task cannot be completed within available tools/iterations, describe completed and missing parts
+accurately. Never manufacture the unqueried remainder.
+
+E. Product queries and follow-ups
+Use execute_sql_query(query=..., parameters=[...]) against items and optional product_details.
+Whole-store summary example:
+SELECT COALESCE(d.category,'Uncategorised') AS category, COUNT(*) AS products,
+SUM(CASE WHEN i.availablequantity>0 THEN 1 ELSE 0 END) AS in_stock_products
+FROM items i LEFT JOIN product_details d ON d.item_code=i.item_code
+GROUP BY COALESCE(d.category,'Uncategorised') ORDER BY category;
+Sum all returned category counts for the total only when that grouped result is complete.
+If truncated, obtain a separate COUNT(*) from items and paginate categories as necessary.
+For a nonempty product page, return COUNT(*) OVER() AS matching_products with the same filtered
+product rows and stable ORDER BY i.name, i.item_code LIMIT ? OFFSET ?. The window count is computed
+before LIMIT, so a separate count call is unnecessary. Use a one-row-per-product source before counting.
+If a requested page is empty, query a matching COUNT to distinguish no matches from an exhausted page.
+Show at most ten products per page. Keep filters and ordering in recent conversation context;
+advance the offset by the page size for 'next', and stop once the matching count is reached.
+After a summary, start the detailed list at offset zero. Changed filters restart at offset zero.
+Use bound values for search/category/price filters. Escape LIKE wildcards when literal text is intended.
+Default scope includes out-of-stock products. Only filter stock when explicitly requested.
+For current prices use the effective-price rules below before sorting, filtering or showing prices.
+A price bound is CURRENT UNIT merchandise price; translate quantity budgets appropriately.
+Ambiguous prices are unknown, not zero; exclude them from price-bounded results and explain exclusions.
+Use attributes, relationships and categories for semantic requirements, compatibility and bundles.
+
+F. Pricing, features and relationships
+Current price: price_history effective_from<=CURRENT_DATE and effective_to IS NULL or >=CURRENT_DATE.
+Count active price rows per item: exactly one supplies unit_price; zero falls back to sellingprice;
+more than one is ambiguous and requires staff correction. Never resolve overlap by LIMIT, MAX or MIN.
+price_history dates are inclusive. Draft quotes use order_date. Issued invoices use invoice_lines.
+Read product_attributes text_value/number_value/unit. Structured attributes override same-name
+features_json keys case-insensitively. If a key is absent, primitive JSON features may supply it.
+Missing/null features are unknown, not false or zero. Respect numeric units, exact-match tool requirements
+and the distinction between a threshold request and an exact stored value. Use SQL for thresholds.
+Do not convert units or currencies without a verified conversion basis. Do not round away budget breaches.
+Product relations are directional substitute/compatible/accessory links; read the correct direction.
+A recorded relationship supports that recorded fact, not every imagined device/environment compatibility.
+Check candidate stock and current price before recommending or quoting. Do not reveal baseprice in customer mode.
+
+G. Financial definitions and avoiding duplicated totals
+Issued invoices have order_invoice IS NOT NULL. Drafts/cancelled drafts are not billed sales.
+For issued-order totals read orders o LEFT JOIN order_details d ON d.order_id=o.order_id and filter
+COALESCE(d.status,'active')<>'cancelled'. Keep the user's requested customer/date/order filters.
+Currency is COALESCE(d.currency,(SELECT value FROM billing_config WHERE key='currency'),'USD').
+Group or filter by currency; never sum money in unlike currencies.
+Sum subtotal, charged_price, tax_amount, shipping_amount, discount_applied and refund_amount at the
+ORDER level. Joining invoice_lines/order_requests/order_fulfilled before summing duplicates order totals.
+If line and order summaries are needed, aggregate each separately then join one-row-per-order results.
+Product units/revenue come from invoice_lines joined to eligible issued orders and items.
+Line_total is merchandise before order-level discount, tax, shipping and refund allocation.
+Do not silently assign an entire order refund/discount to every line or invent per-line allocations.
+Charged invoice total = subtotal minus applied discount plus tax plus shipping, as the tools calculate.
+Recorded refund-adjusted invoice amount = charged_price minus COALESCE(refund_amount,0), rounded
+for currency reporting. It is not cash collected or an outstanding amount due.
+Payments and credit notes are not stored. No paid/unpaid status, actual balance due, overdue debt,
+customer credit balance, provider refund timing or payment reconciliation can be established here.
+Order due dates do not supply those missing payment facts. Refer payment reconciliation to store staff.
+Current baseprice supports admin estimated procurement cost, not historical cost or operating profit.
+State which margin/cost measure is being reported and its limitations. Never treat it as audited net profit.
+An anomaly is evidence for review, not proof of fraud or a license to automatically change/refund records.
+billing_audit is retained internal change history and is admin-only.
+
+H. Tool failures, recovery and accurate completion
+Read ok/error and every relevant warning before composing the answer.
+Correct an ambiguous-column error with qualified SQL. Correct a chart error using returned requirements.
+Do not repeat an unchanged invalid read or exhaust iterations on the same impossible operation.
+A failed read does not mean there are no rows. An inaccessible account does not mean it does not exist.
+A failed mutation does not authorize another mutation, alternative customer ID or weaker confirmation.
+For transport failures/timeouts after a possible write, inspect stored state before deciding whether
+it completed. Do not blindly replay request_order/place_order/refund or create a duplicate customer.
+Reuse established order IDs for safe draft retry when appropriate. The app's request-id retry is not
+a suggestion to invent new business actions. Never claim success until verified by a successful tool/state read.
+If only part of a multi-request task succeeded, identify that part and the unresolved part plainly.
+Do not expose raw exceptions, internal JSON, stack traces or secrets in the visible answer.
+
+I. Admin charts and visual analytics (ADMIN MODE ONLY)
+For graph/chart/plot/pictorial/dashboard requests, call execute_sql_query with its chart argument.
+Customer mode cannot create admin chart artifacts; do not attempt to bypass that restriction.
+Text-only questions need no chart. A chart is an attachment from successful tool output, not a URL
+or hand-drawn ASCII/Markdown picture. Never generate Python/JavaScript/Mermaid or raw Vega as a substitute.
+Choose a supported chart suited to the requested relationship and actual stored data.
+Simple comparison: bars. Time trend: line/area. Parts of a positive whole: pie/donut with limited categories.
+Distribution: histogram/boxplot with raw observations. Relationship: scatter/bubble with numeric axes.
+Two-dimensional categories: heatmap. Signed changes: waterfall. Ranked contribution: Pareto.
+Do not fabricate OHLC data for candlesticks, process stages for funnels or delivery dates for timelines.
+Use the detailed chart contract below for all supported types, measures and field restrictions.
+Include returned aliases for x/y/group/size/end. Charts must contain at most 1000 complete rows.
+Use at most six charts per turn; offer remaining views in a later turn.
+Include currency as a column named currency for monetary charts and filter to ONE currency per chart.
+When multiple currencies exist and none was requested, inspect them and ask or create clearly separate
+currency-specific charts. Different definitions/units may also require separate charts.
+Sort periods chronologically in SQL. Preserve raw observations for distributions; aggregate duplicate
+coordinates for summaries. A selected top-N plot is titled top-N, not all-store distribution.
+For a pie over more than twelve categories, use a suitable bar chart or an accurately labelled top-N
+plus a SQL-computed Other group, with the full denominator. Never silently discard categories.
+For 'show that as a chart', reuse the previous measure, filters, currency and date scope with fresh data.
+No rows means no data. Do not fabricate a zero series or invent observations to make a chart valid.
+chart_error means no chart was produced. Repair a suitable query/spec or explain and offer an alternative.
+When the tool confirms a chart artifact, finish with a brief plain-English explanation of scope,
+measure and useful findings; do not duplicate the entire plotted dataset in the reply.
+Chart attachments and PDFs are handled by the UI; do not insert imaginary download links.
+""" + CHART_GUIDE
 
 
-log = logging.getLogger("uvicorn.error.billing_performance")
-
-# Only these tools are allowed together in a model-selected batch. Unknown and
-# mutating tools fail closed before any member of that batch is dispatched.
-BATCH_READ_TOOLS = frozenset({'execute_sql_query', 'compare_products',
-    'find_cheaper_alternatives', 'billing_analysis', 'billing_anomalies'})
-BATCH_POLICY = ('\nYou may request multiple independent read-only tools in one round. '
-    'Use a later round when arguments depend on an earlier result. '
-    'Request writes and invoice generation one tool at a time; never batch them.\n')
-
-
-class TimedAzureClient(AzureOpenAIChatCompletionClient):
-    """Measure SDK requests without logging prompts, identifiers or credentials."""
-    async def create(self, *args, **kwargs):
-        started = perf_counter()
-        try:
-            workbench = getattr(self, 'batch_workbench', None)
-            if workbench is not None:
-                kwargs['extra_create_args'] = {**kwargs.get('extra_create_args', {}),
-                                               'parallel_tool_calls': True}
-            messages = args[0] if args else kwargs.get('messages', [])
-            compact_policy = getattr(self, 'continuation_policy', None)
-            use_compact = bool(compact_policy and workbench is not None
-                               and kwargs.get('tool_choice') != 'none' and eligible(messages))
-            async def invoke(compact):
-                call_args, call_kwargs = args, dict(kwargs)
-                if compact:
-                    attachments = {'charts':[{'title':c['title'],'type':c['type']} for c in workbench.charts],
-                                   'invoices':workbench.downloads}
-                    reduced = compact_messages(messages, compact_policy + '\nATTACHMENTS: ' + json.dumps(attachments))
-                    if args:
-                        call_args = (reduced, *args[1:])
-                    else:
-                        call_kwargs['messages'] = reduced
-                before = perf_counter()
-                value = await super(TimedAzureClient, self).create(*call_args, **call_kwargs)
-                log.info('billing_model_phase phase=%s seconds=%.3f input_tokens=%s output_tokens=%s',
-                         'compact_answer' if compact else 'full', perf_counter()-before,
-                         value.usage.prompt_tokens, value.usage.completion_tokens)
-                return value
-            result = await invoke(use_compact)
-            if use_compact and not valid_final(result, workbench.mode):
-                # No tool suggested under reduced policy executes until full
-                # planning has reconsidered the unchanged question and evidence.
-                log.info('billing_compact fallback=full_planning')
-                result = await invoke(False)
-            if workbench is not None:
-                workbench.prepare_batch(result.content)
-            usage = result.usage
-            log.info("billing_model seconds=%.3f input_tokens=%s output_tokens=%s",
-                     perf_counter() - started, usage.prompt_tokens, usage.completion_tokens)
-            return result
-        except BaseException:
-            log.info("billing_model seconds=%.3f status=failed", perf_counter() - started)
-            raise
-
-
-def parameters():
-    return StdioServerParams(command=sys.executable, args=["-m", "mcp_server.server"],
-                            cwd=str(settings.ROOT), env={**os.environ,
-                            "BILLING_DB": str(settings.BILLING_DB),
-                            "INVOICE_DIR": str(settings.INVOICE_DIR)}, read_timeout_seconds=60)
-
-
-def decode_result(result):
-    for block in result.result:
-        content = getattr(block, "content", None)
-        if isinstance(content, str):
-            try:
-                value = json.loads(content)
-                if isinstance(value, dict):
-                    return value
-            except ValueError:
-                pass
-    return {"ok": False, "error": "Tool returned an unreadable response."}
-
-
-class RecordingWorkbench(McpWorkbench):
-    def __init__(self, server_params=None):
-        super().__init__(server_params or parameters())
-        self.downloads = []
-        self.charts = []
-        self.failed = False
-        self._tool_schemas = None
-        self.mode = 'customer'
-        self.customer_id = None
-        self.shopping_tracker = None
-        self.tool_seconds = 0.0
-        self.tool_calls = 0
-        self._batch_blocked = False
-        self._dispatch_lock = asyncio.Lock()
-
-    def prepare_batch(self, content):
-        calls = content if isinstance(content, list) else []
-        self._batch_blocked = len(calls) > 1 and any(
-            getattr(call, 'name', None) not in BATCH_READ_TOOLS for call in calls)
-        if len(calls) > 1:
-            log.info('billing_batch calls=%s allowed=%s', len(calls), not self._batch_blocked)
-
-    async def list_tools(self):
-        # Our server registers a fixed tool set. Cache schemas, never billing data.
-        if self._tool_schemas is None:
-            self._tool_schemas = await super().list_tools()
-        allowed = ADMIN_TOOLS if self.mode == 'admin' else CUSTOMER_TOOLS
-        schemas = [deepcopy(s) for s in self._tool_schemas if s['name'] in allowed]
-        for schema in schemas:
-            parameters = schema.get('parameters', {})
-            if self.mode == 'customer' and schema['name'] == 'execute_sql_query':
-                schema['description'] = schema['description'].split('For requested admin visuals', 1)[0].rstrip()
-                parameters.get('properties', {}).pop('chart', None)
-                if 'required' in parameters:
-                    parameters['required'] = [f for f in parameters['required'] if f != 'chart']
-            for field in SCOPE_FIELDS:
-                parameters.get('properties', {}).pop(field, None)
-            if 'required' in parameters:
-                parameters['required'] = [f for f in parameters['required'] if f not in SCOPE_FIELDS]
-        return schemas
-
-    async def stop(self):
-        self._tool_schemas = None
-        await super().stop()
-
-    async def call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
-        if self._batch_blocked:
-            return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
-                'ok': False, 'error': 'No tools in this batch were executed. Request writes and '
-                'invoice generation one at a time. Only independent read-only tools may be batched.'}))])
-        # AutoGen dispatches a returned batch concurrently. Preserve tool/result
-        # ordering for shopping navigation and checkpoints; savings come from
-        # fewer model round trips, not concurrent database access.
-        async with self._dispatch_lock:
-            return await self._call_tool(name, arguments, cancellation_token, **kwargs)
-
-    async def _call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
-        # The model cannot choose its execution role or customer scope.
-        arguments = {**(arguments or {}), 'execution_mode': self.mode,
-                     'execution_customer_id': self.customer_id}
-        started = perf_counter()
-        try:
-            result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
-        finally:
-            elapsed = perf_counter() - started
-            self.tool_seconds += elapsed
-            self.tool_calls += 1
-            log.info("billing_tool tool=%s seconds=%.3f", name, elapsed)
-        self.failed = self.failed or result.is_error
-        if name == 'execute_sql_query' and self.mode == 'admin':
-            data = decode_result(result)
-            if data.get('ok') and data.get('chart'):
-                chart = chart_from_result(data)
-                if chart not in self.charts:
-                    if len(self.charts) < 6:
-                        self.charts.append(chart)
-                    else:
-                        data.pop('chart')
-                        data['chart_error'] = 'Six-chart limit reached. Ask for remaining charts in another turn.'
-                        for block in result.result:
-                            if isinstance(getattr(block,'content',None),str):
-                                block.content = json.dumps(data)
-                                break
-        if name == "download_invoice":
-            data = decode_result(result)
-            if data.get("ok") and data.get("ready"):
-                self.downloads.append({"invoice_number": data["invoice_number"], "customer_id": data["customer_id"]})
-        if name == 'manage_customer' and self.mode == 'customer' and self.customer_id is None:
-            data = decode_result(result)
-            if data.get('ok') and data.get('action') == 'create':
-                self.customer_id = data['customer_id']
-        if self.shopping_tracker is not None and self.mode == 'customer':
-            self.shopping_tracker.observe(name, arguments, decode_result(result), self.customer_id)
-        return result
-
-
-def create_model_client(**client_options):
-    error = settings.azure_configuration_error()
-    if error:
-        raise ValueError(error)
-    if settings.AZURE_REASONING_EFFORT:
-        client_options.setdefault('reasoning_effort', settings.AZURE_REASONING_EFFORT)
-    # The deployment controls the Azure route; model is its underlying model name.
-    # This assistant needs text chat and tool calling, not vision or structured output.
-    return TimedAzureClient(
-        azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-        azure_deployment=settings.AZURE_OPENAI_DEPLOYMENT,
-        api_key=settings.AZURE_OPENAI_API_KEY,
-        api_version=settings.AZURE_OPENAI_API_VERSION,
-        model=settings.AZURE_OPENAI_MODEL,
-        model_info={"vision": False, "function_calling": True, "json_output": False,
-                    "family": "unknown", "structured_output": False},
-        parallel_tool_calls=False,
-        timeout=settings.CHAT_TIMEOUT,
-        max_retries=0,
-        **client_options,
-    )
-
-
-class BillingAgent:
-    system_message = SYSTEM_MESSAGE
-    workbench_factory = RecordingWorkbench
-
-    def __init__(self):
-        self._client = None
-        self._workbench = None
-        self._managed = False
-        self._lock = asyncio.Lock()
-
-    async def start(self):
-        """Warm the MCP process once during API startup; Azure stays lazy."""
-        async with self._lock:
-            await self._get_workbench()
-            self._managed = True
-
-    async def _get_workbench(self):
-        if self._workbench is None:
-            self._workbench = self.workbench_factory()
-            try:
-                await self._workbench.start()
-                await self._workbench.list_tools()
-            except BaseException:
-                await self._reset()
-                raise
-        return self._workbench
-
-    async def _reset(self):
-        workbench, client = self._workbench, self._client
-        self._workbench = self._client = None
-        try:
-            if workbench is not None:
-                await workbench.stop()
-        finally:
-            if client is not None:
-                await client.close()
-
-    async def close(self):
-        async with self._lock:
-            self._managed = False
-            await self._reset()
-
-    def validate_configuration(self):
-        error = settings.azure_configuration_error()
-        if error:
-            raise ValueError(error)
-
-    async def chat(self, message, history, customer_id, mode='customer', shopping_state=None, state_callback=None):
-        started = perf_counter()
-        async with self._lock:
-            acquired = perf_counter()
-            workbench = None
-            try:
-                workbench = await self._get_workbench()
-                workbench.tool_seconds = 0.0
-                workbench.tool_calls = 0
-                workbench.downloads.clear()
-                workbench.charts.clear()
-                workbench.mode, workbench.customer_id = mode, customer_id
-                workbench.prepare_batch(None)
-                tracker = ShoppingTracker(shopping_state, customer_id, state_callback) if mode == 'customer' else None
-                workbench.shopping_tracker = tracker
-                memory_prompt = shopping_prompt(tracker.state) if tracker else ''
-                # A new user turn invalidates the previous pending proposal as a
-                # future approval target; it remains visible in this turn's prompt.
-                if tracker:
-                    tracker.state['pending_confirmation'] = None
-                    tracker.state['next_question'] = None
-                    tracker.stage()
-                    if state_callback:
-                        state_callback(deepcopy(tracker.state), customer_id)
-                if self._client is None:
-                    self._client = create_model_client()
-                if isinstance(self._client, TimedAzureClient):
-                    self._client.batch_workbench = workbench
-                    self._client.continuation_policy = (CONTINUATION_POLICY + REPLY_POLICY
-                        + f'\nTrusted mode: {mode}. Associated customer_id: {customer_id or "unset"}.\n'
-                        + (memory_prompt if tracker else 'Return plain English without a shopping JSON envelope.'))
-                previous = [UserMessage(content=m["content"], source="user") if m["role"] == "user"
-                            else AssistantMessage(content=m["content"], source="billing_agent") for m in history]
-                # Agent/model context is fresh per turn; only transports are shared.
-                agent = AssistantAgent("billing_agent", model_client=self._client, workbench=workbench,
-                        model_context=UnboundedChatCompletionContext(initial_messages=previous),
-                        system_message=(ADMIN_MESSAGE if mode == 'admin' else self.system_message) + (TASK_POLICY if mode == 'admin' else CUSTOMER_TASK_POLICY) + REPLY_POLICY + BATCH_POLICY + '\n' + schema_hint(mode) + f"\nAssociated customer_id: {customer_id or 'unset'}\n" + memory_prompt,
-                        reflect_on_tool_use=True, max_tool_iterations=settings.MAX_TOOL_ITERATIONS)
-                result = await agent.run(task=message)
-                final = result.messages[-1]
-                if not isinstance(final, TextMessage):
-                    raise RuntimeError("Agent did not produce a final text answer.")
-                reply = tracker.finish(final.content) if tracker else plain_reply(final.content)
-                return {"response": reply, "invoices": list(workbench.downloads),
-                        "charts": list(workbench.charts),
-                        "associated_customer_id": workbench.customer_id,
-                        **({'shopping_state': deepcopy(tracker.state)} if tracker else {})}
-            except BaseException:
-                # Discard failed/cancelled transports without retrying the turn.
-                await self._reset()
-                raise
-            finally:
-                log.info("billing_turn mode=%s total_seconds=%.3f lock_wait_seconds=%.3f tool_calls=%s tool_seconds=%.3f",
-                         mode, perf_counter() - started, acquired - started,
-                         workbench.tool_calls if workbench else 0,
-                         workbench.tool_seconds if workbench else 0.0)
-                if self._workbench is not None:
-                    self._workbench.shopping_tracker = None
-                if not self._managed or (self._workbench is not None and self._workbench.failed):
-                    await self._reset()
-
-    async def invoice(self, invoice_number, customer_id):
-        if self._managed:
-            async with self._lock:
-                try:
-                    workbench = await self._get_workbench()
-                    workbench.mode, workbench.customer_id = 'customer', customer_id
-                    result = decode_result(await workbench.call_tool('download_invoice',
-                        {'invoice_number': invoice_number, 'customer_id': customer_id}))
-                    if workbench.failed:
-                        await self._reset()
-                    return result
-                except BaseException:
-                    await self._reset()
-                    raise
-        async with McpWorkbench(parameters()) as workbench:
-            return decode_result(await workbench.call_tool("download_invoice",
-                {"invoice_number": invoice_number, "customer_id": customer_id,
-                 "execution_mode": "customer", "execution_customer_id": customer_id}))
+# Customers cannot use chart artifacts; omit their entire admin-only contract.
+CUSTOMER_TASK_POLICY = TASK_POLICY.split("I. Admin charts and visual analytics", 1)[0] + (
+    "Customer mode cannot create charts or call admin analytics tools. "
+    "Explain that store-wide visual reports require Admin mode.\n")
