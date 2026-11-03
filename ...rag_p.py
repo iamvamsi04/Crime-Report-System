@@ -1,13 +1,16 @@
-"""YAML-based settings preserving the existing application's setting names.
+"""SDK-loaded configuration with the existing application's setting names.
 
-Replace load_yaml_config() with your private SDK's YAML-loading call when ready.
-The supplied reader works with PyYAML; it does not claim to call the private SDK.
-YAML controls ordinary settings. The .env/environment supplies referenced secrets.
+Replace only the private SDK import below. Agent configuration is obtained by
+its registered name, without importing BillingAgent or creating a circular import.
 """
 import os
 from collections.abc import Mapping
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+# Replace XXX with the module used in your existing ConfigLoader import.
+from XXX import ConfigLoader
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / 'config' / 'app.yaml'
@@ -23,19 +26,25 @@ except ImportError:
 
 
 def load_yaml_config(path: Path) -> Mapping:
-    """SDK connection point: return the loaded YAML as a Python mapping.
-
-    Replace the body below with your already-working SDK loader. If it returns
-    an SDK settings object, convert it using that SDK's documented mapping API.
-    """
-    import yaml
-    with path.open(encoding='utf-8') as stream:
-        return yaml.safe_load(stream)
+    """Use the SDK once; retain its loaded data for legacy scalar settings."""
+    if not path.is_file():
+        raise FileNotFoundError(f'Configuration file not found: {path}')
+    ConfigLoader.load_from_filesystem(str(path))
+    # The supplied SDK tracebacks confirm this loaded mapping exists. This is a
+    # private SDK attribute, isolated here because no public root accessor was
+    # provided. Snapshot before SDK config construction can change nested data.
+    config = getattr(ConfigLoader, '_config', None)
+    if not isinstance(config, Mapping):
+        raise ValueError(f'The SDK did not load a configuration mapping from {path}.')
+    return deepcopy(config)
 
 
 CONFIG = load_yaml_config(CONFIG_PATH)
-if not isinstance(CONFIG, Mapping):
-    raise ValueError('Configuration must contain a YAML mapping at its root.')
+AGENT_CONFIG = ConfigLoader.get_agent_config(AGENT_NAME)
+if AGENT_CONFIG is None:
+    raise ValueError(
+        f'The SDK found no agent configuration for {AGENT_NAME!r} in {CONFIG_PATH}. '
+        'Check the registered agent name and app.services agent entries.')
 
 
 def _mapping(parent, key, location):
@@ -64,37 +73,17 @@ if not isinstance(PROJECT_CONFIG, Mapping):
     raise ValueError('project must contain a mapping for application-specific settings.')
 SERVICES = _mapping(APP_CONFIG, 'services', 'app.services')
 
-# ConfigLoader constructs every service, not just the selected billing service.
-# Match the actual ServiceConfig(version, key, agents) signature provided by
-# the user and catch missing/unsupported fields before calling the private SDK.
-for _name, _service in SERVICES.items():
-    _location = f'app.services.{_name}'
-    if not isinstance(_name, str) or not _name.strip():
-        raise ValueError(f'app.services in {CONFIG_PATH} must use nonempty service names.')
-    _service = _mapping(SERVICES, _name, _location)
-    _required = {'version', 'key', 'agents'}
-    _missing = _required - _service.keys()
-    _unsupported = _service.keys() - _required
-    if _missing or _unsupported:
-        raise ValueError(
-            f'{_location} requires exactly version, key and agents. '
-            f'Missing fields: {", ".join(sorted(_missing)) or "none"}. '
-            f'Unsupported fields: {", ".join(sorted(str(name) for name in _unsupported)) or "none"}. '
-            'Keep application-specific settings in the top-level project section.')
-    for _field in ('version', 'key'):
-        if not isinstance(_service[_field], str) or not _service[_field].strip():
-            raise ValueError(f'{_location}.{_field} must be nonempty text.')
-    _mapping(_service, 'agents', f'{_location}.agents')
-
 SERVICE_CONFIG = _mapping(SERVICES, SERVICE_NAME, f'app.services.{SERVICE_NAME}')
 AGENTS = _mapping(SERVICE_CONFIG, 'agents', f'app.services.{SERVICE_NAME}.agents')
-AGENT_CONFIG = _mapping(AGENTS, AGENT_NAME, f'app.services.{SERVICE_NAME}.agents.{AGENT_NAME}')
+# Keep raw scalar settings distinct from the SDK's AgentConfig object above.
+# This reads the provider reference without assuming private AgentConfig fields.
+AGENT_SETTINGS = _mapping(AGENTS, AGENT_NAME, f'app.services.{SERVICE_NAME}.agents.{AGENT_NAME}')
 SERVICE_VERSION = SERVICE_CONFIG['version']
 SERVICE_KEY = SERVICE_CONFIG['key']
-AGENT_FRAMEWORK = AGENT_CONFIG.get('framework', 'autogen')
+AGENT_FRAMEWORK = AGENT_SETTINGS.get('framework', 'autogen')
 if AGENT_FRAMEWORK != 'autogen':
     raise ValueError('BillingAgent currently requires framework: autogen.')
-LLM_REFERENCE = _mapping(AGENT_CONFIG, 'llm', f'app.services.{SERVICE_NAME}.agents.{AGENT_NAME}.llm')
+LLM_REFERENCE = _mapping(AGENT_SETTINGS, 'llm', f'app.services.{SERVICE_NAME}.agents.{AGENT_NAME}.llm')
 LLM_IDENTIFIER = LLM_REFERENCE.get('identifier')
 if not isinstance(LLM_IDENTIFIER, str) or not LLM_IDENTIFIER.strip():
     raise ValueError('Agent llm.identifier must reference an entry in the top-level llm section.')
