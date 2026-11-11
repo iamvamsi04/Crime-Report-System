@@ -1,588 +1,451 @@
-"""All mutations are serialized by BEGIN IMMEDIATE and use Decimal totals."""
-import functools
-import re
-import sqlite3
-import inspect
+"""Local store service records. No payment, card or settlement integration."""
 import json
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Annotated, Literal
-from uuid import uuid4
-from pydantic import Field
-from database.connection import transaction, connect, audit_context
+from contextlib import closing
+from datetime import date
+from decimal import Decimal
+from database.connection import connect, transaction
+from mcp_server.access import scope
+from mcp_server.tools.billing_tools import BillingError, money, order_row, is_placed, tool_result
 
 
-class BillingError(ValueError):
-    pass
+def currency_for(conn, oid):
+    row=conn.execute("SELECT COALESCE(NULLIF(TRIM(d.currency),''),(SELECT NULLIF(TRIM(value),'') FROM billing_config WHERE key='currency'),'USD') FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE o.order_id=?",(oid,)).fetchone()
+    return row[0].strip().upper()
 
 
-def tool_result(fn):
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        token = audit_context.set({'action': fn.__name__,
-            'arguments': dict(inspect.signature(fn).bind(*args, **kwargs).arguments)})
-        try:
-            return {"ok": True, **fn(*args, **kwargs)}
-        except (BillingError, InvalidOperation) as exc:
-            return {"ok": False, "error": str(exc)}
-        except sqlite3.Error:
-            return {"ok": False, "error": "Database operation failed; no transaction was committed."}
-        finally:
-            audit_context.reset(token)
-    return wrapped
+def credit_balance(conn, customer, currency):
+    return sum((Decimal(str(r[0])) for r in conn.execute('SELECT amount FROM store_credit_ledger WHERE customer_id=? AND UPPER(TRIM(currency))=?',(customer,currency.strip().upper()))),Decimal(0))
 
 
-def money(value):
-    value = Decimal(str(value))
-    if not value.is_finite() or value < 0 or value > Decimal("99999999.99"):
-        raise BillingError("Money must be finite, nonnegative and fit DECIMAL(10,2).")
-    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def available_credit(conn, customer, currency, exclude_order_id=None):
+    """Ledger balance less this customer's other active draft allocations."""
+    currency = currency.strip().upper()
+    rows = conn.execute('''SELECT s.credit_requested FROM orders o
+        JOIN order_service s ON s.order_id=o.order_id
+        LEFT JOIN order_details d ON d.order_id=o.order_id
+        WHERE o.customer_id=? AND o.order_status='draft'
+          AND (? IS NULL OR o.order_id<>?)
+          AND UPPER(COALESCE(NULLIF(TRIM(d.currency),''),
+              (SELECT NULLIF(TRIM(value),'') FROM billing_config WHERE key='currency'),'USD'))=?''',
+        (customer, exclude_order_id, exclude_order_id, currency))
+    reserved = sum((max(Decimal(0), Decimal(str(row[0]))) for row in rows), Decimal(0))
+    return max(Decimal(0), credit_balance(conn, customer, currency) - reserved)
 
 
-def identifier(value, label):
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,50}", value):
-        raise BillingError(f"Invalid {label}; use 1-50 letters, digits, underscores or hyphens.")
-    return value
-
-
-def order_row(conn, order_id, customer_id, *, allow_cancelled=False):
-    row = conn.execute("SELECT * FROM orders WHERE order_id=? AND customer_id=?",
-                       (order_id, customer_id)).fetchone()
-    if row is None:
-        raise BillingError("Order not found for this customer.")
-    if row['order_status'] == 'cancelled' and not allow_cancelled:
-        raise BillingError("This order was cancelled. Create a new draft; cancelled orders cannot be reopened.")
-    if row['order_status'] == 'draft':
-        if row['refund_amount'] is not None or row['refund_status']:
-            raise BillingError('Draft has inconsistent refund records. Staff must correct its records before changes.')
-        if conn.execute("SELECT 1 FROM order_fulfilled WHERE order_id=? UNION ALL "
-                        "SELECT 1 FROM invoice_lines WHERE order_id=? LIMIT 1", (order_id, order_id)).fetchone():
-            raise BillingError('Draft has unissued fulfillment or invoice records. Staff must correct its records before changes.')
+def check_target(conn, target, customer):
+    row=order_row(conn,target,customer)
+    if is_placed(conn,row): raise BillingError('Store credit target must be an active draft owned by this customer.')
     return row
 
 
-def is_placed(conn, order):
-    return order['order_status'] in ('placed', 'cancelled') and bool((order['order_invoice'] or '').strip())
-
-
-def lines_for(conn, order_id):
-    return conn.execute("SELECT r.item_code,r.quantity,i.sellingprice,i.availablequantity "
-                        "FROM order_requests r JOIN items i ON i.item_code=r.item_code "
-                        "WHERE r.order_id=? ORDER BY r.item_code", (order_id,)).fetchall()
-
-
-def price_for(conn, item, date):
-    rows = conn.execute("SELECT unit_price FROM price_history WHERE item_code=? "
-                        "AND effective_from<=? AND (effective_to IS NULL OR effective_to>=?)",
-                        (item["item_code"], date, date)).fetchall()
-    if len(rows) > 1:
-        raise BillingError("Overlapping price history requires an operator correction.")
-    return money(rows[0][0] if rows else item["sellingprice"])
-
-
-def totals(conn, subtotal, promo_code=None, *, check_expiry=True):
-    config = dict(conn.execute("SELECT key,value FROM billing_config"))
-    tax_rate = Decimal(config.get("tax_rate", "0"))
-    if not tax_rate.is_finite() or not 0 <= tax_rate <= 100:
-        raise BillingError("tax_rate must be a percentage between 0 and 100.")
-    discount = Decimal(0)
-    if promo_code:
-        promo = conn.execute("SELECT * FROM promotions WHERE promo_code=?", (promo_code,)).fetchone()
-        if not promo:
-            raise BillingError("Promotion not found.")
-        if check_expiry:
-            from datetime import date
-            try:
-                expiry = date.fromisoformat(promo['expires_on'])
-                if expiry.isoformat() != promo['expires_on']:
-                    raise ValueError()
-            except (ValueError, TypeError):
-                raise BillingError('Coupon has no valid expiry date. Ask store staff to correct it.')
-            today = date.fromisoformat(conn.execute('SELECT CURRENT_DATE').fetchone()[0])
-            if expiry < today:
-                raise BillingError('Coupon has expired. It cannot be applied or used at checkout.')
-        value = money(promo["discount_value"])
-        if promo["discount_type"] == "percent" and value <= 100:
-            discount = money(subtotal * value / 100)
-        elif promo["discount_type"] == "flat":
-            discount = value
-        else:
-            raise BillingError("Invalid promotion definition.")
-    discount = min(discount, subtotal)
-    tax = money((subtotal - discount) * tax_rate / 100)
-    shipping = money(config.get("shipping_amount", "0"))
-    return dict(subtotal=str(money(subtotal)), discount_applied=str(money(discount)),
-                tax_amount=str(tax), shipping_amount=str(shipping),
-                charged_price=str(money(subtotal - discount + tax + shipping)))
-
-
-def credit_for_total(conn, order_id, total):
-    """Describe draft credit at a proposed total without changing any records."""
-    total = money(total)
-    row = conn.execute('''SELECT o.order_status,COALESCE(s.credit_requested,0)
-        FROM orders o LEFT JOIN order_service s ON s.order_id=o.order_id
-        WHERE o.order_id=?''', (order_id,)).fetchone()
-    credit = money(row[1]) if row else money(0)
-    if row and row[0] == 'draft':
-        credit = min(credit, total)
-    return {'store_credit_requested': str(credit),
-            'remaining_invoice_amount': str(total - credit)}
-
-
-def update_totals(conn, order_id, values):
-    """Keep an existing draft allocation within its revised invoice total."""
-    conn.execute("UPDATE orders SET subtotal=:subtotal,discount_applied=:discount_applied,"
-                 "tax_amount=:tax_amount,shipping_amount=:shipping_amount,charged_price=:charged_price "
-                 "WHERE order_id=:order_id", {**values, "order_id": order_id})
-    credit = credit_for_total(conn, order_id, values['charged_price'])
-    conn.execute('''UPDATE order_service SET credit_requested=? WHERE order_id=?
-        AND EXISTS (SELECT 1 FROM orders o WHERE o.order_id=order_service.order_id
-                    AND o.order_status='draft')''',
-        (credit['store_credit_requested'], order_id))
-    return credit
-
-
-@tool_result
-def request_order(customer_id: str, items: list[dict], order_id: str | None = None) -> dict:
-    """Create a draft. items contains item_code and integer quantity. Reuse order_id on retries."""
-    identifier(customer_id, "customer ID")
-    order_id = identifier(order_id or "ORD-" + uuid4().hex[:20], "order ID")
-    audit_context.get()['arguments']['order_id'] = order_id
-    if not isinstance(items, list) or not items or len(items) > 100:
-        raise BillingError("Provide between 1 and 100 items.")
-    # Accumulate quantities by product so repeated lines cannot evade stock or quantity limits.
+def billed_lines(conn, order):
+    """Reject inconsistent invoice records before calculating a refund or restocking."""
+    lines = conn.execute('SELECT * FROM invoice_lines WHERE order_id=?', (order['order_id'],)).fetchall()
+    if not lines:
+        raise BillingError('Invoice has no billed lines. Staff must correct its records before a refund.')
+    subtotal = Decimal(0)
     quantities = {}
-    for item in items:
-        if not isinstance(item, dict):
-            raise BillingError("Each item must contain item_code and quantity.")
-        code = identifier(item.get("item_code"), "item code")
-        qty = item.get("quantity")
-        if type(qty) is not int or not 1 <= qty <= 100000:
-            raise BillingError("Quantity must be an integer between 1 and 100000.")
+    values = {}
+    for line in lines:
+        qty = line['qty_billed']
+        if type(qty) is not int or qty <= 0 or money(money(line['unit_price_billed']) * qty) != money(line['line_total']):
+            raise BillingError('Invoice line amounts or quantities are inconsistent. Staff review is required.')
+        subtotal += money(line['line_total'])
+        code = line['item_code']
         quantities[code] = quantities.get(code, 0) + qty
-        if quantities[code] > 100000:
-            raise BillingError("Combined quantity exceeds 100000.")
-    with transaction() as conn:
-        if not conn.execute("SELECT 1 FROM customers WHERE customer_id=?", (customer_id,)).fetchone():
-            raise BillingError("Customer not found.")
-        existing = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
-        if existing:
-            order_row(conn, order_id, customer_id)
-            previous = dict(conn.execute("SELECT item_code,quantity FROM order_requests WHERE order_id=?", (order_id,)))
-            if existing["customer_id"] != customer_id or previous != quantities:
-                raise BillingError("Order ID already exists with different request data.")
-            return {"order_id": order_id, "already_exists": True, "status": existing['order_status'],
-                    'order_status': existing['order_status']}
-        date = conn.execute("SELECT CURRENT_DATE").fetchone()[0]
-        subtotal = Decimal(0)
-        for code, qty in quantities.items():
-            item = conn.execute("SELECT * FROM items WHERE item_code=?", (code,)).fetchone()
-            if item is None:
-                raise BillingError(f"Item {code} not found.")
-            if item["availablequantity"] < qty:
-                raise BillingError(f"Insufficient inventory for {code}.")
-            subtotal += price_for(conn, item, date) * qty
-        values = totals(conn, subtotal)
-        conn.execute("INSERT INTO orders(order_id,customer_id,subtotal,charged_price) VALUES (?,?,0,0)",
-                     (order_id, customer_id))
-        conn.executemany("INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)",
-                         [(order_id, code, qty) for code, qty in quantities.items()])
-        update_totals(conn, order_id, values)
-        currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()
-        conn.execute('INSERT INTO order_details(order_id,currency) VALUES (?,?)',
-                     (order_id, currency[0] if currency else 'USD'))
-    return {"order_id": order_id, "status": "draft", "order_status": "draft", "estimate": values,
-            "currency": currency[0] if currency else 'USD',
-            'delivery_address_required': True,
-            "note": "Inventory is not reserved. Select a saved delivery address, then review and confirm checkout. Placement recalculates totals using order-date prices."}
+        values[code] = values.get(code, Decimal(0)) + money(line['line_total'])
+    discount = money(order['discount_applied'])
+    if subtotal != money(order['subtotal']) or discount > subtotal or money(subtotal-discount+money(order['tax_amount'])+money(order['shipping_amount'])) != money(order['charged_price']):
+        raise BillingError('Invoice totals do not reconcile with billed lines. Staff review is required.')
+    return quantities, values
 
 
-@tool_result
-def apply_promotion(order_id: str | None, customer_id: str, promo_code: str, action: str = 'apply') -> dict:
-    """Check or apply only the coupon code the customer supplied.
+def return_quote(conn, order, items):
+    """Allocate actual discounted merchandise and recorded tax by returned billed value."""
+    if not isinstance(items,list) or not items or len(items)>100: raise BillingError('Select 1-100 returned item lines.')
+    quantities, values = billed_lines(conn, order)
+    seen=set(); gross=Decimal(0); saved=[]
+    for entry in items:
+        if not isinstance(entry,dict): raise BillingError('Return lines need item_code and quantity.')
+        code=entry.get('item_code'); qty=entry.get('quantity')
+        if not isinstance(code,str) or code in seen or type(qty) is not int or qty<1: raise BillingError('Use unique returned item codes and positive integer quantities.')
+        seen.add(code)
+        billed_qty = quantities.get(code, 0)
+        if not billed_qty or qty>billed_qty: raise BillingError('Returned quantity exceeds the billed quantity for this item.')
+        portion=values[code]*qty/billed_qty; gross+=portion
+        saved.append({'item_code':code,'quantity':qty,'billed_quantity':billed_qty,'returned_billed_value':str(money(portion))})
+    subtotal=money(order['subtotal'])
+    if subtotal<=0: raise BillingError('No positive billed merchandise is available to return.')
+    value=money((subtotal-money(order['discount_applied'])+money(order['tax_amount']))*gross/subtotal)
+    if value<=0 or value>money(order['charged_price']): raise BillingError('No positive eligible refund for these returned items.')
+    return value,saved
 
-    action=validate previews a code without changing anything; order_id may be null
-    for a validity check before a draft exists. action=apply requires a draft and
-    the customer's request to apply that specific code. Never discover, select or
-    automatically apply another code. One unexpired coupon is allowed per order.
+
+def refund_approval_check(conn, order, role, *, return_received=False, waiver_reason=''):
+    """Read the pending request against current invoice facts before any approval write.
+
+    Financial eligibility and physical-return readiness are separate: a valid
+    merchandise request may still need staff to attest that the goods arrived.
+    The approval transaction repeats this same check with the supplied evidence.
     """
-    if action not in ('apply', 'validate'):
-        raise BillingError('Coupon action must be apply or validate.')
-    if not isinstance(promo_code, str):
-        raise BillingError('Provide the coupon code you received.')
-    promo_code = identifier(promo_code.strip(), 'coupon code')
-    if action == 'apply' and not order_id:
-        raise BillingError('Create a draft before applying a coupon.')
-    with transaction() as conn:
-        matches = conn.execute('SELECT * FROM promotions WHERE promo_code=? COLLATE NOCASE',
-                               (promo_code,)).fetchmany(2)
-        if not matches:
-            raise BillingError('Promotion not found.')
-        if len(matches) != 1:
-            raise BillingError('This coupon code has an ambiguous store definition. Ask store staff to correct it.')
-        promo = matches[0]
-        promo_code = promo['promo_code']
-        # Run the same definition and expiry checks for previews and checkout.
-        totals(conn, Decimal(0), promo_code)
-        preview = {'promo_code': promo_code, 'valid': True,
-                   'discount_type': promo['discount_type'],
-                   'discount_value': str(money(promo['discount_value'])),
-                   'expires_on': promo['expires_on']}
-        if action == 'validate' and not order_id:
-            return {**preview, 'applied': False,
-                    'note': 'Coupon checked only. No draft or invoice was changed.'}
-        order = order_row(conn, order_id, customer_id)
-        if is_placed(conn, order):
-            raise BillingError("Promotions can only change before order placement.")
-        if order['promo_code'] and order['promo_code'] != promo_code:
-            raise BillingError('Only one coupon code is allowed per order. A coupon is already applied.')
-        lines = lines_for(conn, order_id)
-        if not lines:
-            raise BillingError("Order has no requested items.")
-        subtotal = sum((price_for(conn, line, order["order_date"]) * line["quantity"] for line in lines), Decimal(0))
-        values = totals(conn, subtotal, promo_code)
-        if action == 'validate':
-            return {**preview, 'order_id': order_id, 'applied': False, **values,
-                    **credit_for_total(conn, order_id, values['charged_price']),
-                    'note': 'Preview only. The coupon has not been applied by this check.'}
-        conn.execute("UPDATE orders SET promo_code=? WHERE order_id=?", (promo_code, order_id))
-        credit = update_totals(conn, order_id, values)
-    return {"order_id": order_id, "promo_code": promo_code, 'applied': True, **values, **credit}
-
-
-@tool_result
-def place_order(order_id: str, customer_id: str, expected_delivery: dict | None = None) -> dict:
-    """Fulfill a confirmed draft with an explicitly selected delivery address atomically.
-
-    Repeat calls return the existing invoice. expected_delivery binds the reviewed delivery terms.
-    """
-    # The trusted quote includes private delivery facts; audit only the address reference.
-    event = audit_context.get()
-    if event:
-        event['arguments'].pop('expected_delivery', None)
-        if isinstance(expected_delivery, dict):
-            event['arguments']['delivery_address_id'] = expected_delivery.get('address_id')
-    with transaction() as conn:
-        order = order_row(conn, order_id, customer_id)
-        service=conn.execute('SELECT fulfillment_status FROM order_service WHERE order_id=?',(order_id,)).fetchone()
-        if service and service[0]=='cancelled': raise BillingError('Order is cancelled. Create a new draft instead of placing it again.')
-        if is_placed(conn, order):
-            from database.addresses import selected_address
-            delivery = selected_address(conn, order_id, customer_id)
-            return {"order_id": order_id, "invoice_number": order["order_invoice"], "already_placed": True,
-                    'status': 'placed', 'order_status': 'placed', **(delivery or {})}
-        from database.addresses import selected_address
-        try:
-            delivery = selected_address(conn, order_id, customer_id, require_current=True)
-        except ValueError as exc:
-            raise BillingError(str(exc)) from exc
-        if expected_delivery is not None and expected_delivery != delivery:
-            raise BillingError('The reviewed delivery address changed. Review the current address and order, then confirm checkout again.')
-        lines = lines_for(conn, order_id)
-        if not lines:
-            raise BillingError("Order has no requested items.")
-        subtotal = Decimal(0)
-        for line in lines:
-            qty, code = line["quantity"], line["item_code"]
-            price = price_for(conn, line, order["order_date"])
-            amount = money(price * qty)
-            # Decrement stock conditionally, so a concurrent order cannot drive availability below zero.
-            changed = conn.execute("UPDATE items SET availablequantity=availablequantity-? "
-                                   "WHERE item_code=? AND availablequantity>=?", (qty, code, qty))
-            # Require exactly one product row to be decremented; otherwise roll back every earlier line
-            # too.
-            if changed.rowcount != 1:
-                raise BillingError(f"Insufficient inventory for {code}.")
-            conn.execute("INSERT INTO order_fulfilled(order_id,item_code,quantity) VALUES (?,?,?)", (order_id, code, qty))
-            conn.execute("INSERT INTO invoice_lines(order_id,item_code,qty_billed,unit_price_billed,line_total) "
-                         "VALUES (?,?,?,?,?)", (order_id, code, qty, str(price), str(amount)))
-            subtotal += amount
-        values = totals(conn, subtotal, order["promo_code"])
-        if any(money(order[key]) != money(value) for key, value in values.items()):
-            raise BillingError('Draft prices or charges changed. Refresh the draft with manage_draft and confirm the new totals before placement.')
-        configured_currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()
-        draft_currency = conn.execute('SELECT currency FROM order_details WHERE order_id=?', (order_id,)).fetchone()
-        if draft_currency and draft_currency[0] != (configured_currency[0] if configured_currency else 'USD'):
-            raise BillingError('Billing currency changed after this draft. Create a new draft and confirm its currency and totals.')
-        from mcp_server.tools.service_workflows import redeem_credit
-        redeemed = redeem_credit(conn,order)
-        update_totals(conn, order_id, values)
-        invoice = "INV-" + uuid4().hex[:24].upper()
-        conn.execute("UPDATE orders SET order_invoice=?,order_status='placed' WHERE order_id=?", (invoice, order_id))
-        currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()
-        customer = dict(conn.execute("SELECT * FROM customers WHERE customer_id=?", (customer_id,)).fetchone())
-        billing=conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?',(customer_id,)).fetchone()
-        customer.update(billing_address=billing['billing_address'] if billing else '',tax_registration_number=billing['tax_registration_number'] if billing else '')
-        conn.execute("INSERT INTO order_details(order_id,currency,due_date,customer_snapshot) "
-                     "VALUES (?,?,date('now','+30 days'),?) ON CONFLICT(order_id) DO UPDATE SET "
-                     "currency=excluded.currency, customer_snapshot=excluded.customer_snapshot, "
-                     "due_date=COALESCE(order_details.due_date,excluded.due_date)",
-                     (order_id, currency[0] if currency else 'USD', json.dumps(customer)))
-        conn.execute("INSERT INTO order_service(order_id,fulfillment_status) VALUES (?,'placed') "
-                     "ON CONFLICT(order_id) DO UPDATE SET fulfillment_status='placed'", (order_id,))
-        due_date = conn.execute('SELECT due_date FROM order_details WHERE order_id=?', (order_id,)).fetchone()[0]
-    return {"order_id": order_id, "invoice_number": invoice, "status": "placed", 'order_status': 'placed', **values,
-            "currency": currency[0] if currency else 'USD', 'due_date': due_date,
-            "store_credit_applied":str(redeemed),"remaining_invoice_amount":str(money(values["charged_price"])-redeemed),
-            **delivery}
-
-
-def check_return_window(conn, order):
     from config import settings
-    from datetime import date
+    from mcp_server.tools.billing_tools import check_return_window, _refund_items
+    request = conn.execute('SELECT * FROM refund_requests WHERE order_id=?', (order['order_id'],)).fetchone()
+    details = conn.execute('SELECT * FROM refund_details WHERE order_id=?', (order['order_id'],)).fetchone()
+    # Treat missing legacy metadata as an ordinary merchandise return, not a shipping-inclusive
+    # cancellation.
+    kind = details['request_kind'] if details else 'return'
+    result = {'valid': False, 'ready_to_approve': False, 'request_kind': kind,
+              'requested_amount': None, 'eligible_amount': None, 'currency': None,
+              'nonrefundable_shipping': None, 'return_receipt_required': False,
+              'reasons': []}
     try:
-        window_days = int(settings.RETURN_WINDOW_DAYS)
-        if window_days < 0:
-            raise ValueError()
-        ordered = date.fromisoformat(order['order_date'])
-        if ordered.isoformat() != order['order_date']:
-            raise ValueError()
-        today = date.fromisoformat(conn.execute('SELECT CURRENT_DATE').fetchone()[0])
-    except (ValueError, TypeError):
-        raise BillingError('Return-window configuration or order date is invalid; refund rejected for staff review.')
-    age_days = (today - ordered).days
-    if age_days < 0:
-        raise BillingError('Order date is in the future; refund rejected for staff review.')
-    if age_days > window_days:
-        raise BillingError(f'Order is outside the {window_days}-day return window ({age_days} days since order date). Refund rejected.')
-
-
-def _refund_items(encoded):
-    """Read saved request terms without trusting imported JSON to have the right shape."""
-    try:
-        items = json.loads(encoded)
-    except (TypeError, ValueError):
-        raise BillingError('Stored return details are invalid; staff review is required.')
-    if not isinstance(items, list) or any(not isinstance(item, dict) or not isinstance(item.get('item_code'), str) for item in items):
-        raise BillingError('Stored return details are invalid; staff review is required.')
-    return sorted(items, key=lambda item: item['item_code'])
-
-
-@tool_result
-def process_refund(order_id: str, customer_id: str, reason: str = '', amount: str | None = None,
-                   action: str = 'request', confirmed: bool = False, items: list[dict] | None = None,
-                   disposition: str | None = None, target_order_id: str | None = None,
-                   return_received: bool = False, waiver_reason: str = '',
-                   date_from: str | None = None, date_to: str | None = None) -> dict:
-    """Customers request a refund; staff approve an existing pending request with action=approve and confirmed=true in staff mode.
-
-    bulk_preview/bulk_request evaluate all owned orders between inclusive date_from/date_to;
-    bulk_request needs confirmed=true and reason and submits each eligible order for approval.
-    For bulk actions pass order_id=''. No automatic staff approval occurs.
-    action=quote estimates an item/full merchandise return without creating a request; reason may be blank.
-    action=status reads local status; staff also receive current approval eligibility and rejection reasons.
-    Before approval inspect eligibility; shipping on an invoice does not invalidate an otherwise eligible
-    merchandise return. Shipping itself is nonrefundable for returns. escalate records a confirmed review flag.
-    items selects billed item_code/quantity; refund is computed with allocated discount/tax, excluding shipping.
-    disposition=store_credit optionally links target_order_id to an owned draft.
-    Approval requires return_received=true or an admin waiver_reason for physical returns.
-    Customers only request. Cashiers approve within the configured currency/limit;
-    admins approve any valid amount. Pending requests do not change invoice totals.
-    Requests and approvals must be within RETURN_WINDOW_DAYS of order_date (inclusive UTC days).
-    Approval records a local ledger refund, never a payment-provider transfer.
-    """
-    from mcp_server.access import scope
-    from config import settings
-    access = scope.get() or {}
-    role = access.get('mode')
-    if role not in ('customer', 'cashier', 'admin'):
-        raise BillingError('A trusted execution role is required for refunds.')
-    if role == 'customer' and access.get('customer_id') != customer_id:
-        raise BillingError('Select the matching customer first.')
-    if not isinstance(reason, str) or len(reason) > 2000:
-        raise BillingError('A refund reason must be text of at most 2000 characters.')
-    if not isinstance(waiver_reason, str) or len(waiver_reason) > 2000:
-        raise BillingError('A return waiver must be text of at most 2000 characters.')
-    if type(confirmed) is not bool or type(return_received) is not bool:
-        raise BillingError('Confirmation and return receipt must be explicit true or false values.')
-    if disposition is not None and disposition not in ('original_method', 'store_credit'):
-        raise BillingError('Choose original_method or store_credit; another card is not supported.')
-    if target_order_id is not None:
-        identifier(target_order_id, 'target order ID')
-    if action != 'approve' and (return_received or waiver_reason):
-        raise BillingError('Only staff approving an existing request can record a return receipt or waiver.')
-    if action in ('bulk_preview','bulk_request'):
-        if role!='customer': raise BillingError('Only the associated customer can request bulk returns.')
-        from mcp_server.tools.service_workflows import bulk_refunds
-        return bulk_refunds(customer_id,date_from,date_to,action,reason,confirmed,disposition or 'original_method')
-    identifier(order_id, 'order ID')
-    identifier(customer_id, 'customer ID')
-    if action in ('status','escalate'):
-        from mcp_server.tools.service_workflows import refund_status
-        return refund_status(order_id,customer_id,action,reason,confirmed)
-    if action not in ('request', 'approve','quote'):
-        raise BillingError('Use quote, request, approve, status, escalate or a bulk action.')
-    if action == 'request' and role != 'customer':
-        raise BillingError('Only the associated customer can submit a refund request. Staff cannot create their own requests.')
-    if action == 'approve' and role not in ('cashier', 'admin'):
-        raise BillingError('Only a cashier or admin can approve refunds.')
-    if action == 'approve' and confirmed is not True:
-        raise BillingError('Explicit staff confirmation is required before approval.')
-    if action!='quote' and not reason.strip():
-        raise BillingError('A refund reason of 1-2000 characters is required.')
-    with transaction() as conn:
-        order = order_row(conn, order_id, customer_id, allow_cancelled=True)
-        if action == 'approve':
-            from mcp_server.tools.service_workflows import refund_approval_check
-            eligibility = refund_approval_check(conn,order,role,return_received=return_received,waiver_reason=waiver_reason)
-            if not eligibility['ready_to_approve']:
-                raise BillingError(eligibility['reasons'][0])
+        if role not in ('admin', 'cashier'):
+            raise BillingError('Only a cashier or admin can approve refunds.')
         if not is_placed(conn, order):
             raise BillingError('Only placed orders can be refunded.')
         check_return_window(conn, order)
         if order['refund_status'] or order['refund_amount'] is not None:
             raise BillingError('A refund is already recorded; duplicate refunds are blocked.')
-        currency_row = conn.execute("SELECT COALESCE(NULLIF(TRIM(d.currency),''),"
-            "(SELECT value FROM billing_config WHERE key='currency'),'USD') "
-            "FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE o.order_id=?",
-            (order_id,)).fetchone()
-        currency = currency_row[0].strip().upper()
-        pending = conn.execute('SELECT * FROM refund_requests WHERE order_id=?', (order_id,)).fetchone()
-        if order['order_status'] == 'cancelled':
-            cancellation = conn.execute("SELECT 1 FROM refund_details WHERE order_id=? AND request_kind='cancellation'", (order_id,)).fetchone()
-            if action != 'approve' or not pending or not cancellation:
-                raise BillingError('Cancelled orders only allow staff approval of their existing cancellation refund request.')
-        if action == 'approve' and (not pending or pending['status'] != 'pending'):
+        if conn.execute("SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='refund_credit'",
+                        (order['order_id'],)).fetchone():
+            raise BillingError('A store credit refund is already recorded; duplicate refunds are blocked. Staff must reconcile the request history.')
+        if not request or request['status'] != 'pending':
             raise BillingError('An existing pending customer refund request is required before approval.')
-        if pending and pending['status'] != 'pending':
-            raise BillingError('This refund request is no longer pending.')
-        from mcp_server.tools.service_workflows import return_quote, check_target, billed_lines
-        selected = []
-        quoted = None
-        if action in ('request','quote'):
-            disposition = disposition or 'original_method'
-            if disposition=='original_method' and conn.execute("SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='order_redemption'",(order_id,)).fetchone():
-                raise BillingError('This order used store credit. Choose store_credit for the return; no alternative card transfer is supported.')
-            if target_order_id:
-                if disposition != 'store_credit': raise BillingError('Only store credit can be linked to a cart.')
-                check_target(conn,target_order_id,customer_id)
-                from mcp_server.tools.service_workflows import currency_for
-                if currency_for(conn,target_order_id) != currency: raise BillingError('Cart and refund currencies must match.')
-            if items is not None:
-                quoted, selected = return_quote(conn,order,items)
-                if amount is not None and money(amount) != quoted: raise BillingError(f'Returned-item refund must equal the calculated amount {quoted}.')
-            elif amount is None:
-                # Full merchandise return excludes shipping; cancellation refunds have their own workflow.
-                all_items=[{'item_code':r['item_code'],'quantity':r['qty']} for r in conn.execute('SELECT item_code,SUM(qty_billed) qty FROM invoice_lines WHERE order_id=? GROUP BY item_code',(order_id,))]
-                quoted, selected=return_quote(conn,order,all_items)
-            else:
-                billed_lines(conn, order)
-            if pending and action!='quote':
-                prior=conn.execute('SELECT * FROM refund_details WHERE order_id=?',(order_id,)).fetchone()
-                if prior and (prior['disposition']!=disposition or prior['target_order_id']!=target_order_id or _refund_items(prior['items_json'])!=sorted(selected, key=lambda item: item['item_code'])):
-                    raise BillingError('A request already exists with different return or store credit terms.')
-        refund = money(quoted if quoted is not None else (pending['amount'] if pending and amount is None else order['charged_price'] if amount is None else amount))
-        if action in ('request', 'quote') and items is None and amount is not None:
-            ceiling=money(order['charged_price'])-money(order['shipping_amount'])
-            if refund>ceiling: raise BillingError('Return refund exceeds merchandise and tax; shipping is nonrefundable.')
-        if refund <= 0 or refund > money(order['charged_price']):
+        if not isinstance(request['reason'], str) or not request['reason'].strip() or len(request['reason']) > 2000:
+            raise BillingError('The pending refund request has no valid reason. Staff review is required.')
+        currency = currency_for(conn, order['order_id'])
+        if request['currency'].strip().upper() != currency:
+            raise BillingError('The pending refund request currency does not match the invoice currency.')
+        refund = money(request['amount'])
+        total = money(order['charged_price'])
+        # Read original shipping separately because merchandise returns cannot refund it.
+        shipping = money(order['shipping_amount'])
+        result.update(requested_amount=str(refund), currency=currency,
+                      nonrefundable_shipping=str(shipping if kind == 'return' else money(0)))
+        if refund <= 0 or refund > total:
             raise BillingError('Refund must be positive and no greater than the invoice total.')
-        if action=='quote':
-            return {'order_id':order_id,'order_status':order['order_status'],'quoted_amount':str(refund),'currency':currency,'items':selected,
-                    'basis':{'subtotal':str(money(order['subtotal'])),'discount':str(money(order['discount_applied'])),'tax':str(money(order['tax_amount'])),'nonrefundable_shipping':str(money(order['shipping_amount']))},
-                    'note':'Estimate only. No refund request was created or approved.'}
-        if pending and (refund != money(pending['amount']) or currency != pending['currency'].strip().upper()
-                        or reason.strip() != pending['reason']):
-            raise BillingError('A request already exists. Approve its exact amount, currency and reason; do not replace it.')
-        if action == 'approve' and role == 'cashier':
+        if order['order_status'] == 'cancelled' and kind != 'cancellation':
+            raise BillingError('Cancelled orders only allow approval of their existing cancellation refund request.')
+        if kind == 'cancellation' and order['order_status'] != 'cancelled':
+            raise BillingError('A cancellation refund requires an already cancelled order.')
+        if kind not in ('return', 'cancellation', 'billing_adjustment'):
+            raise BillingError('The pending refund request kind is invalid. Staff review is required.')
+        billed_lines(conn, order)
+        eligible = total - shipping if kind == 'return' else total
+        result['eligible_amount'] = str(eligible)
+        requested_items = _refund_items(details['items_json']) if details else []
+        if requested_items:
+            quote, current_items = return_quote(conn, order, requested_items)
+            result['eligible_amount'] = str(quote)
+            if (quote != refund or sorted(current_items, key=lambda item: item['item_code'])
+                    != sorted(requested_items, key=lambda item: item['item_code'])):
+                raise BillingError('Billed return details changed after the customer request. Staff review is required before approval.')
+        elif kind == 'return' and refund > eligible:
+            raise BillingError('Return refund exceeds merchandise and tax; shipping is nonrefundable.')
+        if kind == 'cancellation' and refund != total:
+            raise BillingError('Whole-order cancellation refund must equal the original cancelled invoice total.')
+        disposition = details['disposition'] if details else 'original_method'
+        if disposition not in ('original_method', 'store_credit'):
+            raise BillingError('The pending request has an unsupported refund destination.')
+        if disposition == 'original_method' and conn.execute(
+                "SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='order_redemption'",
+                (order['order_id'],)).fetchone():
+            raise BillingError('This order used store credit. Its return must retain store_credit disposition.')
+        if details and details['target_order_id'] and disposition != 'store_credit':
+            raise BillingError('Only store credit can be linked to a cart.')
+        if details and details['target_order_id']:
+            target = conn.execute('SELECT customer_id FROM orders WHERE order_id=?', (details['target_order_id'],)).fetchone()
+            if not target or target['customer_id'] != order['customer_id']:
+                raise BillingError('The store credit target must belong to the same customer.')
+        if role == 'cashier':
             limit = money(settings.CASHIER_REFUND_LIMIT)
             if currency != settings.CASHIER_REFUND_CURRENCY or refund > limit:
                 raise BillingError(f'Admin approval required. Cashier limit is {limit} {settings.CASHIER_REFUND_CURRENCY}.')
-        if action == 'approve':
-            details=conn.execute('SELECT * FROM refund_details WHERE order_id=?',(order_id,)).fetchone()
-            if not details:
-                conn.execute('INSERT INTO refund_details(order_id) VALUES (?)',(order_id,))
-                details=conn.execute('SELECT * FROM refund_details WHERE order_id=?',(order_id,)).fetchone()
-            if ((disposition is not None and disposition != details['disposition'])
-                    or (target_order_id is not None and target_order_id != details['target_order_id'])):
-                raise BillingError('Approve the customer request as submitted; its refund method and target cart cannot be changed.')
-            requested_items = _refund_items(details['items_json'])
-            if items is not None:
-                _, approval_items = return_quote(conn, order, items)
-                if sorted(approval_items, key=lambda item: item['item_code']) != sorted(requested_items, key=lambda item: item['item_code']):
-                    raise BillingError('Approve only the returned items in the pending customer request.')
-            if requested_items:
-                current_quote, current_items = return_quote(conn, order, requested_items)
-                if current_quote != refund or sorted(current_items, key=lambda item: item['item_code']) != sorted(requested_items, key=lambda item: item['item_code']):
-                    raise BillingError('Billed return details changed after the customer request. Staff review is required before approval.')
-            else:
-                billed_lines(conn, order)
-                if details['request_kind'] == 'return' and refund > money(order['charged_price']) - money(order['shipping_amount']):
-                    raise BillingError('Return refund exceeds merchandise and tax; shipping is nonrefundable.')
-            if details['request_kind']=='return' and not details['return_received']:
-                if waiver_reason:
-                    if role!='admin' or len(waiver_reason.strip())<5 or len(waiver_reason)>2000:
-                        raise BillingError('Only an admin can waive a return with a documented assessment reason.')
-                    conn.execute('UPDATE refund_details SET waiver_reason=? WHERE order_id=?',(waiver_reason.strip(),order_id))
-                elif return_received is True:
-                    conn.execute('UPDATE refund_details SET return_received=1 WHERE order_id=?',(order_id,))
-                else:
-                    raise BillingError('Confirm physical return received, or ask admin for a documented return waiver.')
-        if not pending:
-            conn.execute('INSERT INTO refund_requests(order_id,amount,currency,reason) VALUES (?,?,?,?)',
-                         (order_id, str(refund), currency, reason.strip()))
-            conn.execute('INSERT INTO refund_details(order_id,items_json,disposition,target_order_id,request_kind) VALUES (?,?,?,?,?)',
-                (order_id,json.dumps(selected),disposition,target_order_id,'return'))
-        audit_context.get()['arguments'].update(execution_role=role, currency=currency, resolved_amount=str(refund))
-        if action == 'request':
-            return {'order_id':order_id, 'order_status':order['order_status'], 'requested_amount':str(refund), 'currency':currency,
-                    'refund_status':'pending_approval', 'items':selected, 'disposition':disposition,
-                    'calculation_basis':{'subtotal':str(money(order['subtotal'])),'discount':str(money(order['discount_applied'])),'tax':str(money(order['tax_amount'])),'nonrefundable_shipping':str(money(order['shipping_amount']))}, 'note':'Awaiting staff approval. No refund has been recorded or transferred.'}
+        if kind == 'return' and not (details and details['return_received']):
+            if waiver_reason:
+                if role != 'admin' or not isinstance(waiver_reason,str) or not 5 <= len(waiver_reason.strip()) <= 2000:
+                    raise BillingError('Only an admin can waive a return with a documented assessment reason.')
+            elif return_received is not True:
+                result['return_receipt_required'] = True
+        result['valid'] = True
+        result['ready_to_approve'] = not result['return_receipt_required']
+        if result['return_receipt_required']:
+            result['reasons'].append('Confirm physical return received, or ask admin for a documented return waiver.')
+    except (BillingError, ValueError, TypeError, ArithmeticError) as exc:
+        result['reasons'] = [str(exc) or 'The pending refund request needs staff review.']
+    return result
+
+
+def refund_status(order_id,customer_id,action,reason='',confirmed=False):
+    if action=='escalate' and (confirmed is not True or not reason.strip() or len(reason)>2000):
+        raise BillingError('Confirm escalation and provide a review reason of at most 2000 characters.')
+    with transaction() as conn:
+        order=order_row(conn,order_id,customer_id,allow_cancelled=True)
+        request=conn.execute('SELECT * FROM refund_requests WHERE order_id=?',(order_id,)).fetchone()
+        role = (scope.get() or {}).get('mode')
+        if not request and order['refund_amount'] is None and role not in ('admin','cashier'):
+            raise BillingError('No refund request or recorded refund exists for this order.')
+        if action=='escalate':
+            if not request: raise BillingError('This legacy refund needs manual staff review; no request reference is stored.')
+            conn.execute('INSERT OR IGNORE INTO refund_details(order_id) VALUES (?)',(order_id,))
+            conn.execute('UPDATE refund_details SET escalated_at=COALESCE(escalated_at,CURRENT_TIMESTAMP),escalation_note=? WHERE order_id=?',(reason.strip(),order_id))
         details=conn.execute('SELECT * FROM refund_details WHERE order_id=?',(order_id,)).fetchone()
-        credited_target = None
-        target_allocation = money(0)
-        if details and details['disposition']=='store_credit':
-            conn.execute("INSERT INTO store_credit_ledger(customer_id,order_id,currency,amount,kind) VALUES (?,?,?,?,'refund_credit')",(customer_id,order_id,currency,str(refund)))
-            if details['target_order_id']:
-                target=conn.execute("SELECT * FROM orders WHERE order_id=? AND customer_id=? AND order_status='draft'",(details['target_order_id'],customer_id)).fetchone()
-                from mcp_server.tools.service_workflows import service_action, available_credit, currency_for
-                if target and currency_for(conn,target['order_id'])==currency:
-                    prior_allocation=conn.execute('SELECT credit_requested FROM order_service WHERE order_id=?',(target['order_id'],)).fetchone()
-                    previous=money(prior_allocation[0]) if prior_allocation else money(0)
-                    allocated=min(refund+previous,available_credit(conn,customer_id,currency,target['order_id']),money(target['charged_price']))
-                    if allocated>0 or previous>0:
-                        service_action(conn,target,'apply_store_credit','',str(allocated))
-                    if allocated>0:
-                        credited_target = target['order_id']
-                        target_allocation = allocated
-        conn.execute("UPDATE orders SET refund_amount=?,refund_status='recorded',refund_reason=? WHERE order_id=?",
-                     (str(refund), reason.strip(), order_id))
-        conn.execute("UPDATE refund_requests SET status='approved',approved_at=CURRENT_TIMESTAMP,approved_by_role=? WHERE order_id=?",
-                     (role, order_id))
-    return {'order_id':order_id, 'order_status':order['order_status'], 'refund_amount':str(refund), 'currency':currency,
-            'refund_status':'recorded', 'approved_by_role':role,
+        return {'order_id':order_id,'order_status':order['order_status'],'local_status':request['status'] if request else 'legacy_recorded' if order['refund_amount'] is not None else 'not_requested',
+            'requested_amount':str(money(request['amount'])) if request else None,
+            'recorded_amount':str(money(order['refund_amount'])) if order['refund_amount'] is not None else None,
+            'approved_at':request['approved_at'] if request else None,
+            'requested_at':request['requested_at'] if request else None,
             'disposition':details['disposition'] if details else 'original_method',
-            'credit_target_order_id':credited_target,
-            'credit_target_allocation':str(target_allocation),
-            'requested_credit_target_order_id':details['target_order_id'] if details else None,
-            'note':'Approved and recorded in the local ledger only. No payment-provider refund was sent.'}
+            'request_kind':details['request_kind'] if details else None,
+            'review_reference':f'REVIEW-{order_id}' if details and details['escalated_at'] else None,
+            'escalated_at':details['escalated_at'] if details else None,
+            **({'approval_eligibility':refund_approval_check(conn,order,role)} if role in ('admin','cashier') else {}),
+            'bank_status':'Not available. Local records do not verify funds sent or received.',
+            'policy_estimate':'5-10 business days after staff handles an approved original-method refund.'}
 
 
-@tool_result
-def download_invoice(
-    invoice_number: Annotated[
-        str | None, Field(description='Exact issued invoice number or returned PDF reference. Omit when using order_id.')
-    ] = None,
-    customer_id: Annotated[
-        str | None, Field(description='Exact owner ID if needed. Omit for the verified account or an exact staff lookup.')
-    ] = None,
-    document_type: Literal['invoice', 'tax', 'proforma'] = 'invoice',
-    order_id: Annotated[
-        str | None, Field(description='Exact order ID. For proforma, use an active draft order ID.')
-    ] = None,
-    action: Literal['generate', 'correct_details'] = 'generate',
-    billing_address: str | None = None,
-    company: str | None = None,
-    tax_registration_number: str | None = None,
-    confirmed: bool = False,
-) -> dict:
-    """Generate invoice, tax or proforma PDF; correct_details saves confirmed invoice contact revisions.
+def cancel_placed(conn,order,reason):
+    from mcp_server.tools.billing_tools import check_return_window
+    oid=order['order_id']; service=conn.execute('SELECT * FROM order_service WHERE order_id=?',(oid,)).fetchone()
+    # Unknown shipment evidence is insufficient to authorize stock restoration/cancellation.
+    if not service or service['fulfillment_status']=='unknown': raise BillingError('Shipment status is not recorded. Staff must verify it before cancellation.')
+    state=service['fulfillment_status']
+    if state=='cancelled': return {'order_id':oid,'status':'cancelled','order_status':'cancelled','already_cancelled':True}
+    check_return_window(conn,order)
+    if state in ('shipped','delivered'): raise BillingError('This order has shipped. Cancellation is unavailable; request a return instead.')
+    if order['refund_status'] or order['refund_amount'] is not None or conn.execute('SELECT 1 FROM refund_requests WHERE order_id=?',(oid,)).fetchone():
+        raise BillingError('A refund or return request already exists; staff must review it before cancellation.')
+    if money(order['charged_price'])<=0: raise BillingError('This zero-value order requires staff cancellation review; no positive refund is due.')
+    quantities, _ = billed_lines(conn, order)
+    fulfilled = {}
+    for line in conn.execute('SELECT item_code,quantity FROM order_fulfilled WHERE order_id=?', (oid,)):
+        fulfilled[line['item_code']] = fulfilled.get(line['item_code'], 0) + line['quantity']
+    if quantities != fulfilled:
+        raise BillingError('Fulfilled and billed quantities do not match. Staff review is required before cancellation.')
+    conn.execute("INSERT INTO order_service(order_id,fulfillment_status,cancelled_at,cancellation_restocked) VALUES (?,'cancelled',CURRENT_TIMESTAMP,1) ON CONFLICT(order_id) DO UPDATE SET fulfillment_status='cancelled',cancelled_at=CURRENT_TIMESTAMP,cancellation_restocked=1",(oid,))
+    conn.execute("UPDATE orders SET order_status='cancelled' WHERE order_id=?", (oid,))
+    for line in conn.execute('SELECT item_code,quantity FROM order_fulfilled WHERE order_id=?',(oid,)).fetchall():
+        conn.execute('UPDATE items SET availablequantity=availablequantity+? WHERE item_code=?',(line['quantity'],line['item_code']))
+    currency=currency_for(conn,oid)
+    conn.execute('INSERT INTO refund_requests(order_id,amount,currency,reason) VALUES (?,?,?,?)',(oid,str(money(order['charged_price'])),currency,reason))
+    used_credit=conn.execute("SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='order_redemption'",(oid,)).fetchone()
+    conn.execute("INSERT INTO refund_details(order_id,request_kind,disposition) VALUES (?,'cancellation',?)",(oid,'store_credit' if used_credit else 'original_method'))
+    return {'order_id':oid,'status':'cancelled','order_status':'cancelled','refund_status':'pending_approval','requested_amount':str(money(order['charged_price'])),
+            'currency':currency,'note':'Whole unshipped order cancelled. Invoice retained; refund awaits staff approval. Policy estimate is 5-10 business days after staff handling; no transfer was made.'}
 
-    For an issued invoice, send exactly the known invoice_number or order_id, for example
-    {"order_id":"ORDER-123"}. Both may be sent if they identify the same order. Omit unknown fields.
-    For a draft estimate send {"document_type":"proforma","order_id":"DRAFT-123"}.
-    Tax needs recorded company/address/tax number. Confirmed contact corrections require the exact issued
-    invoice_number and never change billed quantities, monetary values or original snapshots.
-    """
-    from mcp_server.tools.service_workflows import invoice_document
-    return invoice_document(invoice_number,customer_id,document_type,order_id,action,
-                            billing_address,company,tax_registration_number,confirmed)
+
+def service_action(conn,order,action,reason,credit_amount):
+    oid=order['order_id']; currency=currency_for(conn,oid)
+    if action=='report_billing_issue':
+        if not reason.strip() or len(reason)>2000: raise BillingError('Provide a billing review reason of 1-2000 characters.')
+        conn.execute('INSERT INTO order_service(order_id,review_note,review_requested_at) VALUES (?,?,CURRENT_TIMESTAMP) ON CONFLICT(order_id) DO UPDATE SET review_note=excluded.review_note,review_requested_at=CURRENT_TIMESTAMP',(oid,reason.strip()))
+        return {'order_id':oid,'order_status':order['order_status'],'review_reference':f'BILLING-REVIEW-{oid}','note':'Customer-reported issue recorded for staff review. Actual charges are not verified.'}
+    if is_placed(conn,order): raise BillingError('Store credit can only be applied to an active draft.')
+    amount=money(credit_amount) if credit_amount is not None else None
+    if amount is None or amount>money(order['charged_price']): raise BillingError('Credit amount must be nonnegative and no greater than the draft total; use zero to clear it.')
+    if amount>available_credit(conn,order['customer_id'],currency,oid): raise BillingError('Insufficient unreserved store credit in this currency. Reduce another draft allocation first.')
+    conn.execute('INSERT INTO order_service(order_id,credit_requested) VALUES (?,?) ON CONFLICT(order_id) DO UPDATE SET credit_requested=excluded.credit_requested',(oid,str(amount)))
+    return {'order_id':oid,'order_status':'draft','currency':currency,'credit_requested':str(amount), 'remaining_invoice_amount':str(money(order['charged_price'])-amount),
+            'note':'Credit reserved on this draft; unreserved balance is rechecked and redeemed once at placement.'}
+
+
+def redeem_credit(conn,order):
+    row=conn.execute('SELECT credit_requested FROM order_service WHERE order_id=?',(order['order_id'],)).fetchone()
+    amount=money(row[0]) if row else Decimal(0)
+    if amount:
+        currency=currency_for(conn,order['order_id'])
+        if amount>money(order['charged_price']) or amount>available_credit(conn,order['customer_id'],currency,order['order_id']): raise BillingError('Requested store credit exceeds the current draft total or unreserved credit. Refresh the allocation.')
+        conn.execute("INSERT INTO store_credit_ledger(customer_id,order_id,currency,amount,kind) VALUES (?,?,?,?,'order_redemption')",(order['customer_id'],order['order_id'],currency,str(-amount)))
+    return amount
+
+
+def refund_report(report,date_from=None,date_to=None,customer_id=None,order_id=None):
+    clauses=[]; args=[]
+    for name,value in (('customer_id',customer_id),('order_id',order_id)):
+        if value is not None and (not isinstance(value,str) or not value.strip() or len(value)>50):
+            raise BillingError(f'{name} must contain 1-50 characters.')
+    for value,op in ((date_from,'>='),(date_to,'<=')):
+        if value is not None:
+            try:
+                if date.fromisoformat(value).isoformat()!=value: raise ValueError()
+            except (ValueError,TypeError): raise BillingError('Use ISO dates.')
+            clauses.append(f'date(r.approved_at){op}?');args.append(value)
+    if date_from and date_to and date_from>date_to: raise BillingError('Date range is reversed.')
+    from config import settings
+    with closing(connect(readonly=True)) as conn:
+        conn.execute('BEGIN')
+        if report in ('pending_refunds','pending_above_threshold'):
+            rows=[]
+            pending_clauses=[];pending_args=[]
+            for column,value,operator in (('o.customer_id',customer_id,'='),('r.order_id',order_id,'='),('date(r.requested_at)',date_from,'>='),('date(r.requested_at)',date_to,'<=')):
+                if value:
+                    pending_clauses.append(column+operator+'?');pending_args.append(value)
+            pending_where=' AND '+' AND '.join(pending_clauses) if pending_clauses else ''
+            for r in conn.execute("SELECT r.*,o.customer_id FROM refund_requests r JOIN orders o ON o.order_id=r.order_id WHERE r.status='pending'"+pending_where+" ORDER BY r.requested_at,r.order_id",pending_args):
+                if customer_id and r['customer_id']!=customer_id: continue
+                if order_id and r['order_id']!=order_id: continue
+                if date_from and r['requested_at'][:10]<date_from: continue
+                if date_to and r['requested_at'][:10]>date_to: continue
+                role='admin' if r['currency'].strip().upper()!=settings.CASHIER_REFUND_CURRENCY or money(r['amount'])>money(settings.CASHIER_REFUND_LIMIT) else 'cashier_or_admin'
+                if report=='pending_above_threshold' and role!='admin': continue
+                rows.append({**dict(r),'required_approver':role})
+            return {'report':report,'requests':rows,'count':len(rows)}
+        if customer_id: clauses.append('o.customer_id=?'); args.append(customer_id)
+        if order_id: clauses.append('o.order_id=?'); args.append(order_id)
+        where=' AND '+' AND '.join(clauses) if clauses else ''
+        rows=conn.execute("SELECT r.*,o.refund_amount,o.refund_status,o.customer_id,d.disposition,c.amount credit_amount,c.currency credit_currency,c.customer_id credit_customer FROM refund_requests r JOIN orders o ON o.order_id=r.order_id LEFT JOIN refund_details d ON d.order_id=r.order_id LEFT JOIN store_credit_ledger c ON c.order_id=r.order_id AND c.kind='refund_credit' WHERE r.status='approved'"+where,args).fetchall()
+        mismatches=[]
+        for row in rows:
+            if row['refund_amount'] is None or money(row['refund_amount'])!=money(row['amount']) or row['refund_status']!='recorded':
+                mismatches.append({'order_id':row['order_id'],'issue':'Approved request and invoice refund differ'})
+            if row['disposition']=='store_credit' and (row['credit_amount'] is None or money(row['credit_amount'])!=money(row['amount']) or row['credit_currency'].strip().upper()!=row['currency'].strip().upper() or row['credit_customer']!=row['customer_id']):
+                mismatches.append({'order_id':row['order_id'],'issue':'Store credit allocation differs from approved request'})
+            if row['disposition']!='store_credit' and row['credit_amount'] is not None: mismatches.append({'order_id':row['order_id'],'issue':'Unexpected store credit for original-method request'})
+        # Refunds lacking request history are explicit gaps, not assumed bank failures.
+        legacy_clauses=[];legacy_args=[]
+        for column,value in (('o.customer_id',customer_id),('o.order_id',order_id)):
+            if value: legacy_clauses.append(column+'=?');legacy_args.append(value)
+        legacy_where=' AND '+' AND '.join(legacy_clauses) if legacy_clauses else ''
+        undated_records=[]
+        for row in conn.execute("SELECT o.order_id,r.status FROM orders o LEFT JOIN refund_requests r ON r.order_id=o.order_id WHERE (o.refund_amount IS NOT NULL OR NULLIF(o.refund_status,'') IS NOT NULL) AND (r.order_id IS NULL OR r.status!='approved')"+legacy_where,legacy_args):
+            gap={'order_id':row[0],'issue':'Legacy refund has no request/approval history' if row['status'] is None else 'Invoice refund recorded without staff approval'}
+            if not date_from and not date_to: mismatches.append(gap)
+            else: undated_records.append(gap)
+        return {'report':report,'approved_count':len(rows),'mismatches':mismatches,'count':len(mismatches),
+                'undated_records':undated_records,'undated_count':len(undated_records),
+                'scope':'Local approved refunds on approval dates; no bank settlements or transfers verified.'}
+
+
+def _generate_document(invoice_number, customer_id, document_type, order_id):
+    from database.invoice import generate_invoice
+
+    # PDF links pass back their document reference through the same tool.
+    if invoice_number and invoice_number.startswith('PROFORMA-'):
+        referenced_order = invoice_number.removeprefix('PROFORMA-')
+        if document_type == 'tax' or not referenced_order.strip() or (order_id and order_id != referenced_order):
+            raise BillingError('The pro forma reference does not match the requested document or order.')
+        document_type, order_id, invoice_number = 'proforma', referenced_order, None
+    elif invoice_number and invoice_number.startswith('TAX-'):
+        invoice_number = invoice_number.removeprefix('TAX-')
+        if document_type == 'proforma' or not invoice_number.strip():
+            raise BillingError('Provide a valid issued invoice number for a tax document.')
+        document_type = 'tax'
+
+    if document_type == 'proforma' and (not order_id or invoice_number):
+        raise BillingError('For a pro forma estimate, provide an active draft order_id and omit invoice_number.')
+    if not (order_id or invoice_number):
+        raise BillingError('Provide the exact invoice_number or order_id to generate a PDF.')
+    if customer_id is None and (scope.get() or {}).get('mode') not in ('admin', 'cashier'):
+        raise BillingError('A verified customer account is required for invoice access.')
+
+    fields = {'order_id': order_id, 'order_invoice': invoice_number, 'customer_id': customer_id}
+    filters = {column: value for column, value in fields.items() if value is not None}
+    where = ' AND '.join(f'{column}=?' for column in filters)
+    with closing(connect(readonly=True)) as conn:
+        conn.execute('BEGIN')
+        order = conn.execute('SELECT * FROM orders WHERE ' + where, tuple(filters.values())).fetchone()
+        if not order:
+            raise BillingError('No matching order or invoice. Check the identifiers and customer account.')
+        if document_type == 'proforma':
+            document_ref = 'PROFORMA-' + order['order_id']
+        else:
+            if not is_placed(conn, order):
+                raise BillingError('This order has no issued invoice. Pro forma is available for an active draft.')
+            if document_type == 'invoice' and order['order_invoice'].startswith(('TAX-', 'PROFORMA-')):
+                raise BillingError('The stored invoice number conflicts with a reserved PDF reference. Staff review is required.')
+            document_ref = ('TAX-' if document_type == 'tax' else '') + order['order_invoice']
+        return generate_invoice(document_ref, order['customer_id'], connection=conn)
+
+
+def invoice_document(invoice_number,customer_id,document_type,order_id,action,address,company,tax_id,confirmed):
+    from database.invoice import generate_invoice
+    if document_type not in ('invoice','tax','proforma'): raise BillingError('Choose invoice, tax or proforma.')
+    if action not in ('generate','correct_details'): raise BillingError('Choose generate or correct_details.')
+    for value, field in ((invoice_number, 'invoice_number'), (order_id, 'order_id'), (customer_id, 'customer_id')):
+        if value is not None and not isinstance(value, str):
+            raise BillingError(f'{field} must be text.')
+    if invoice_number is not None and not invoice_number.strip():
+        invoice_number = None
+    if order_id is not None and not order_id.strip():
+        raise BillingError('Omit order_id or provide an exact order ID.')
+    if customer_id is not None and not customer_id.strip():
+        raise BillingError('Omit customer_id or provide an exact customer ID.')
+    if action == 'generate':
+        return _generate_document(invoice_number, customer_id, document_type, order_id)
+    # Pro forma contact details come from the live customer profile, not issued-invoice revision records.
+    if document_type=='proforma': raise BillingError('Pro forma billing details come from the customer profile. Update that profile after confirmation.')
+    if confirmed is not True: raise BillingError('Confirm the exact invoice billing corrections first.')
+    if not invoice_number or not customer_id: raise BillingError('Corrections require the exact issued invoice_number and its customer account.')
+    if not any(value is not None for value in (address,company,tax_id)): raise BillingError('Provide the corrected billing fields.')
+    document_ref = ('TAX-' if document_type == 'tax' else '') + invoice_number
+    with transaction() as conn:
+        order=conn.execute('SELECT o.*,d.customer_snapshot FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE o.order_invoice=? AND o.customer_id=?',(invoice_number,customer_id)).fetchone()
+        if not order or (order_id and order_id != order['order_id']):
+            raise BillingError('Issued invoice not found for this order and customer.')
+        original=json.loads(order['customer_snapshot']) if order['customer_snapshot'] else dict(conn.execute('SELECT * FROM customers WHERE customer_id=?',(customer_id,)).fetchone())
+        last=conn.execute('SELECT contact_json FROM invoice_revisions WHERE order_id=? ORDER BY id DESC LIMIT 1',(order['order_id'],)).fetchone()
+        contact=json.loads(last[0]) if last else dict(original)
+        for key,value,maximum in (('billing_address',address,2000),('company',company,200),('tax_registration_number',tax_id,100)):
+            if value is not None:
+                if not isinstance(value,str) or len(value)>maximum or not value.strip(): raise BillingError('Corrected fields must contain valid nonempty text.')
+                contact[key]=value.strip()
+        if contact!= (json.loads(last[0]) if last else original):
+            # Store a contact-only revision, keeping the original invoice facts intact.
+            conn.execute('INSERT INTO invoice_revisions(order_id,contact_json) VALUES (?,?)',(order['order_id'],json.dumps(contact)))
+        return generate_invoice(document_ref,customer_id,connection=conn)
+
+
+def fulfillment_transition(conn,order,action):
+    if not is_placed(conn,order): raise BillingError('Only issued orders can be shipped or delivered.')
+    if order['refund_status'] or order['refund_amount'] is not None: raise BillingError('Refunded orders require staff review and cannot be fulfilled again.')
+    oid=order['order_id']; row=conn.execute('SELECT fulfillment_status FROM order_service WHERE order_id=?',(oid,)).fetchone()
+    state=row[0] if row else 'unknown'
+    if state=='unknown': raise BillingError('Shipment status is unknown. Staff must verify the recorded state before advancing fulfillment.')
+    target='shipped' if action=='ship' else 'delivered'
+    if state==target: return {'order_id':oid,'order_status':order['order_status'],'fulfillment_status':target,'already_recorded':True}
+    if (state,target) not in (('placed','shipped'),('shipped','delivered')): raise BillingError('Invalid fulfillment transition; delivery requires shipment and cancelled orders cannot ship.')
+    if conn.execute("SELECT 1 FROM refund_requests WHERE order_id=? AND status='pending'",(oid,)).fetchone(): raise BillingError('Pending refund must be reviewed before fulfillment.')
+    conn.execute('INSERT OR IGNORE INTO order_service(order_id) VALUES (?)',(oid,))
+    column='shipped_at' if action=='ship' else 'delivered_at'
+    conn.execute(f'UPDATE order_service SET fulfillment_status=?,{column}=CURRENT_TIMESTAMP WHERE order_id=?',(target,oid))
+    return {'order_id':oid,'order_status':order['order_status'],'fulfillment_status':target}
+
+
+def bulk_refunds(customer_id,date_from,date_to,action,reason,confirmed,disposition):
+    from mcp_server.tools.billing_tools import check_return_window,process_refund
+    if not date_from or not date_to: raise BillingError('Bulk return requires an explicit inclusive date range.')
+    try:
+        if date.fromisoformat(date_from).isoformat()!=date_from or date.fromisoformat(date_to).isoformat()!=date_to or date_from>date_to: raise ValueError()
+    except (ValueError,TypeError): raise BillingError('Use a valid inclusive YYYY-MM-DD range.')
+    if disposition not in ('original_method','store_credit'): raise BillingError('Choose original_method or store_credit.')
+    if action=='bulk_request' and (confirmed is not True or not reason.strip() or len(reason)>2000): raise BillingError('Confirm the reviewed bulk return and supply a reason.')
+    with closing(connect(readonly=True)) as conn:
+        orders=conn.execute('SELECT * FROM orders WHERE customer_id=? AND order_date BETWEEN ? AND ? ORDER BY order_date,order_id',(customer_id,date_from,date_to)).fetchall()
+        rows=[]
+        for row in orders:
+            record={'order_id':row['order_id'],'eligible':False}
+            try:
+                order_row(conn,row['order_id'],customer_id)
+                if not is_placed(conn,row): raise BillingError('Draft is not an issued order.')
+                check_return_window(conn,row)
+                if row['refund_status'] or row['refund_amount'] is not None: raise BillingError('Already refunded or recorded refund status needs staff review.')
+                if conn.execute('SELECT 1 FROM refund_requests WHERE order_id=?',(row['order_id'],)).fetchone(): raise BillingError('Refund request already exists.')
+                if disposition=='original_method' and conn.execute("SELECT 1 FROM store_credit_ledger WHERE order_id=? AND kind='order_redemption'",(row['order_id'],)).fetchone(): raise BillingError('Order used credit; choose store_credit.')
+                items=[{'item_code':r['item_code'],'quantity':r['qty']} for r in conn.execute('SELECT item_code,SUM(qty_billed) qty FROM invoice_lines WHERE order_id=? GROUP BY item_code',(row['order_id'],))]
+                value,_=return_quote(conn,row,items)
+                from config import settings
+                currency=currency_for(conn,row['order_id'])
+                approver='admin' if currency!=settings.CASHIER_REFUND_CURRENCY or value>money(settings.CASHIER_REFUND_LIMIT) else 'cashier_or_admin'
+                record.update(eligible=True,amount=str(value),currency=currency,required_approver=approver)
+            except BillingError as exc: record['reason']=str(exc)
+            rows.append(record)
+    submitted=0
+    if action=='bulk_request':
+        for record in rows:
+            if record['eligible']:
+                result=process_refund(record['order_id'],customer_id,reason,action='request',disposition=disposition)
+                record['submitted']=bool(result.get('ok'));submitted+=int(record['submitted'])
+                if not result.get('ok'): record['reason']=result.get('error')
+    return {'action':action,'orders':rows,'matched_count':len(rows),'eligible_count':sum(r['eligible'] for r in rows),
+            'submitted_count':submitted,'note':'Requests require staff approval. No refunds were approved or sent.'}
