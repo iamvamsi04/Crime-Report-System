@@ -1,201 +1,238 @@
-"""Customer and draft workflows. No external money movement or message delivery."""
-from contextlib import contextmanager
-from decimal import Decimal
+"""SQLite parser/authorizer is the security boundary, not a keyword regex."""
+import math
 import re
+import sqlite3
+import time
+from collections import OrderedDict
+from threading import RLock
+from config import settings
+from database.connection import CASE_INSENSITIVE_COLUMNS, connect
+from database.product_search import normalize_product_filters, register_product_search
 
-from database.connection import connect, transaction
-from mcp_server.tools.billing_tools import (BillingError, tool_result, identifier, money,
-    order_row, is_placed, totals, update_totals, price_for)
+TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
+          'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
+          'order_details', 'billing_audit', 'refund_requests', 'refund_details', 'order_service',
+          'customer_billing_details','invoice_revisions','store_credit_ledger',
+          'customer_addresses','order_delivery',
+          'product_details', 'product_attributes', 'product_relations', 'json_each'}
+FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnull '
+                'instr julianday length like lower ltrim max min nullif printf replace '
+                'round rtrim strftime substr substring sum time total trim typeof '
+                'unicode upper row_number rank dense_rank lag lead first_value last_value '
+                'json_extract json_type json_valid json_array_length current_date current_time current_timestamp '
+                'product_text product_matches product_like'.split())
+
+# Use the same whitespace characters as the invoice lifecycle migration.
+CANCELLED_FROM_SQL = (
+    "CASE WHEN o.order_status = 'cancelled' THEN CASE WHEN "
+    "TRIM(COALESCE(o.order_invoice, ''), CAST(X'090A0D20' AS TEXT)) = '' "
+    "THEN 'draft' ELSE 'placed' END END"
+)
+
+# Store schema text only. Each lookup still checks the current database file and
+# SQLite schema version; prices, customers and other business rows are never cached.
+_SCHEMA_CACHE_LIMIT = 12
+_schema_cache = OrderedDict()
+_schema_cache_lock = RLock()
 
 
-def confirm(confirmed):
-    if confirmed is not True:
-        raise BillingError('Show the proposed change and obtain explicit confirmation first.')
+def _database_identity(path):
+    stat = path.stat()
+    return (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns)
 
 
-def text(value, name, maximum=2000):
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
-        raise BillingError(f'{name} must contain 1-{maximum} characters.')
-    return value.strip()
+# Repair bare SQL aliases only; SQLite's read-only authorizer remains the security boundary.
+def quote_reserved_aliases(query):
+    """Quote bare explicit aliases only; never change literals, comments or values.
+
+    This is syntax repair, not an authorization boundary. SQLite still parses the
+    result under the same read-only authorizer and execution deadline.
+    """
+    tokens = re.findall(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[^\w]", query)
+    reserved = {'GROUP','ORDER','LIMIT','OFFSET','SELECT','FROM','WHERE','HAVING',
+                'VALUES','INDEX','TABLE','JOIN','DISTINCT','UNION','CASE','WHEN','END'}
+    previous = None
+    repaired = []
+    for token in tokens:
+        if token.isspace() or token.startswith(('--','/*')):
+            repaired.append(token)
+            continue
+        upper = token.upper()
+        repaired.append('"'+token+'"' if previous == 'AS' and upper in reserved else token)
+        previous = upper
+    return ''.join(repaired)
 
 
-@contextmanager
-def reading():
+def schema_hint(mode='customer'):
+    """Return current, role-scoped schema metadata without reading business rows."""
+    path = settings.BILLING_DB.resolve()
+    identity = _database_identity(path)
     conn = connect(readonly=True)
     try:
+        # Read the version and columns from one snapshot if another process runs
+        # a migration. Replacements at the same path get a different file key.
         conn.execute('BEGIN')
-        yield conn
+        version = conn.execute('PRAGMA schema_version').fetchone()[0]
+        key = (identity, version, mode, tuple(sorted(TABLES)))
+        unchanged = identity == _database_identity(path)
+        if unchanged:
+            with _schema_cache_lock:
+                cached = _schema_cache.get(key)
+                if cached is not None:
+                    _schema_cache.move_to_end(key)
+                    return cached
+        tables = sorted(TABLES - {'json_each'} - ({'billing_audit'} if mode != 'admin' else set()))
+        if mode == 'customer':
+            tables = [table for table in tables if table != 'promotions']
+        elif mode == 'cashier':
+            tables = [table for table in tables if table != 'customer_addresses']
+        columns = {}
+        for table in tables:
+            names = [r['name'] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+            if mode != 'admin' and table == 'items':
+                names = [n for n in names if n in {'sku','item_code','name','sellingprice','availablequantity'}]
+            if names:
+                columns[table] = names
+        lines = ['CURRENT SQL TABLE MAP (metadata only). Qualify columns with table aliases. '
+                 'Join the table that owns each requested column; do not guess column locations.']
+        lines.extend(f'{table}({", ".join(names)})' for table,names in columns.items())
+        joins = []
+        for table in columns:
+            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'):
+                if fk['table'] in columns and fk['from'] in columns[table] and fk['to'] in columns[fk['table']]:
+                    joins.append(f'{table}.{fk["from"]} = {fk["table"]}.{fk["to"]}')
+        lines.append('Declared join keys: ' + '; '.join(joins))
+        insensitive = [f'{table}.{name}' for table, names in columns.items()
+                       for name in names if name.casefold() in CASE_INSENSITIVE_COLUMNS.get(table, ())]
+        lines.append('Case-insensitive descriptive columns (COLLATE NOCASE): ' + ', '.join(insensitive)
+                     + '. Other columns retain their declared comparison rules.')
+        lines.append("Canonical status values: orders.order_status=draft/placed/cancelled; "
+                     "order_details.status=active/cancelled; refund_requests.status=pending/approved; "
+                     "order_service.fulfillment_status=unknown/placed/shipped/delivered/cancelled. "
+                     "Use canonical lowercase values for writes.")
+        if {'order_status', 'order_invoice'} <= set(columns.get('orders', ())):
+            lines.append("Cancellation history: cancelled covers both stages. A cancelled draft never had an "
+                         "issued invoice; a cancellation after placement retains its issued invoice. "
+                         "For cancellation lists or split counts, use orders AS o and project "
+                         f"{CANCELLED_FROM_SQL} AS cancelled_from. This is a derived alias. "
+                         "Use cancelled_from in tool results when present. Describe the stage explicitly. "
+                         "A draft cancellation creates no refund. For a placed cancellation, check the current "
+                         "refund record before stating any refund outcome.")
+        lines.append('Aggregate each one-to-many side before combining totals. Missing columns are unavailable; do not invent them.')
+        lines.append('Product search: product_matches(i.name, ?) or product_matches(d.category, ?) matches words/phrases regardless of case, spaces, underscores, hyphens and common plurals. Use only on product text; IDs, prices and other fields keep exact semantics.')
+        hint = '\n'.join(lines)
+        if unchanged and identity == _database_identity(path):
+            with _schema_cache_lock:
+                _schema_cache[key] = hint
+                _schema_cache.move_to_end(key)
+                while len(_schema_cache) > _SCHEMA_CACHE_LIMIT:
+                    _schema_cache.popitem(last=False)
+        return hint
     finally:
         conn.close()
 
 
-def ensure_customer(conn, customer_id):
-    if not conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (customer_id,)).fetchone():
-        raise BillingError('Customer not found.')
+def authorize(action, arg1, arg2, db, trigger):
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_READ and arg1 in TABLES and db in ('main', None):
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_FUNCTION and (arg2 or '').lower() in FUNCTIONS:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA and arg1 == 'table_info' and arg2 in TABLES:
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
 
 
-@tool_result
-def manage_customer(customer_id: str, name: str = '', company: str | None = None, email: str | None = None,
-                    action: str = 'create', confirmed: bool = False, billing_address: str | None = None,
-                    tax_registration_number: str | None = None, address: dict | None = None,
-                    address_id: str | None = None) -> dict:
-    """Create or update a customer after confirmation. Show the proposed contact changes first.
+def execute_sql_query(query: str | None = None, chart: dict | None = None, parameters: list | None = None) -> dict:
+    """Answer flexible questions with one read-only SELECT/WITH or PRAGMA table_info(table).
 
-    Updates preserve omitted company/email fields. Explicit empty strings clear those fields.
+    Product discovery uses qualified SQL against items and optional product_details.
+    Search names/categories with product_matches(i.name, ?) or product_matches(d.category, ?).
+    It normalizes case, spaces, underscores, hyphens and common plurals; it matches whole words/phrases.
+    Simple name/category equality, IN and LIKE filters are normalized locally, without changing stored labels.
+    Keep item codes, SKUs, customer IDs and financial fields exact. Ambiguous products need clarification.
+    Count all matching products before displaying a page. Use stable ordering and LIMIT/OFFSET.
+    Include out-of-stock products unless explicitly filtered. Preserve scope on next-page requests.
+    Use effective price_history for current prices; overlapping prices are unknown, never guessed.
 
-    Existing issued invoice contact snapshots are preserved. Use SQL to look up a customer before editing.
-    Address actions add_address/update_address/delete_address/set_default_address manage saved delivery
-    addresses, not billing contact details. address contains full_name,phone,address_line1,city,state,
-    postal_code,country (two-letter code); label,address_line2,landmark,is_default are optional.
-    Updates may contain only changed address fields. Supply address_id for every action except add_address.
+    Join/filter/group permitted base tables instead of needing a tool per question.
+    Inspect columns with PRAGMA. No database views exist. External payment records are unavailable;
+    store_credit_ledger records local credit grants and redemptions only.
+    Invoice totals minus recorded refunds are not amounts due or proof of settlement.
+    Use ? placeholders with parameters for user-provided values; never interpolate names into SQL.
+    For requested admin visuals optionally pass chart={"type":"bar","title":"Revenue","x":"month","y":["revenue"]}.
+    Types: bar,grouped_bar,horizontal_bar,stacked_bar,normalized_bar,line,pie,
+    scatter,bubble,histogram,boxplot,heatmap,range,combo,timeline.
+    x/y and optional group, bubble size or timeline end must be returned column aliases.
+    Histogram: numeric x,y:[],bins 2-50. Heatmap: x,group,y:[measure]. Range: y:[low,high].
+    Other types accept the column counts in the chart contract. Optional x_type: categorical,numeric,temporal.
+    Standard bars/lines also accept group with one y, returning one row per x/group pair.
+    Distributions use complete observations; summaries aggregate duplicate coordinates in SQL.
+    Include a currency column for money and query ONE currency per chart; currency is metadata,
+    never an axis or a constant USD series. Order trends chronologically. No chart-count cap.
+    Chart queries allow up to 1000 rows; ordinary reads use SQL_MAX_ROWS. No charts from truncated results. A chart_error leaves query rows usable; correct SQL/spec if needed.
     """
-    confirm(confirmed)
-    identifier(customer_id, 'customer ID')
-    if action in ('add_address', 'update_address', 'delete_address', 'set_default_address'):
-        from database.addresses import save_address, delete_address, set_default_address
-        if name or any(value is not None for value in (company,email,billing_address,tax_registration_number)):
-            raise BillingError('Change saved delivery addresses separately from customer profile and billing details.')
-        if action in ('delete_address','set_default_address') and address is not None:
-            raise BillingError('This address action accepts an address ID, not replacement address fields.')
-        if action == 'add_address' and address_id is not None:
-            raise BillingError('A new address must not supply an existing address ID.')
-        if action != 'add_address' and not address_id:
-            raise BillingError('Choose a saved address before changing it.')
+    if not isinstance(query, str) or not query.strip() or len(query) > 20000:
+        return {'ok': False, 'error': 'Provide one SQL query of at most 20000 characters.'}
+    if parameters is not None and (not isinstance(parameters,list) or len(parameters)>100 or
+            any(value is not None and not isinstance(value,(str,int,float)) for value in parameters)):
+        return {'ok':False,'error':'Parameters must be a list of up to 100 text, numeric or null values.'}
+    if any((isinstance(value, int) and not -(2**63) <= value < 2**63) or
+           (isinstance(value, float) and not math.isfinite(value)) for value in parameters or []):
+        return {'ok':False,'error':'Numeric parameters must be finite and integers must fit the SQLite 64-bit range.'}
+    from mcp_server.access import scope, customer_query_connection
+    access = scope.get()
+    if chart is not None and (not access or access['mode'] != 'admin'):
+        return {'ok': False, 'error': 'Analytics charts require Admin mode.'}
+    conn = (customer_query_connection(access['customer_id'], staff=access['mode'] == 'cashier')
+            if access and access['mode'] in ('customer', 'cashier') else connect(readonly=True))
+    try:
+        register_product_search(conn)
+        conn.execute('PRAGMA query_only=ON')
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1000000)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 20000)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 100)
+        deadline = time.monotonic() + 2
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        conn.set_authorizer(authorize)
+        original_query = query
+        query = normalize_product_filters(query)
+        repaired_aliases = False
         try:
-            if action in ('add_address', 'update_address'):
-                result = save_address(customer_id, address, address_id)
-            elif action == 'delete_address':
-                result = delete_address(customer_id, address_id)
-            else:
-                result = set_default_address(customer_id, address_id)
-        except ValueError as exc:
-            raise BillingError(str(exc)) from exc
-        return {'customer_id': customer_id, 'action': action, **result}
-    if address is not None or address_id is not None:
-        raise BillingError('Use a delivery address action to save or select address details.')
-    name = text(name, 'Name', 200)
-    if company is not None and (not isinstance(company, str) or len(company) > 200):
-        raise BillingError('Company must contain at most 200 characters.')
-    if email is not None and (not isinstance(email, str) or len(email) > 200 or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email))):
-        raise BillingError('Provide a valid email address or leave it empty.')
-    with transaction() as conn:
-        existing = conn.execute('SELECT * FROM customers WHERE customer_id=?', (customer_id,)).fetchone()
-        company = (existing['company'] or '') if company is None and action == 'update' and existing else (company or '')
-        email = (existing['email'] or '') if email is None and action == 'update' and existing else (email or '')
-        if action == 'create':
-            if existing:
-                from mcp_server.access import scope
-                execution = scope.get()
-                if execution and execution.get('mode') == 'customer' and not execution.get('customer_id'):
-                    raise BillingError('Existing customer: start a conversation with that customer selected.')
-                if (existing['name'], existing['company'] or '', existing['email'] or '') != (name, company, email):
-                    raise BillingError('Customer ID exists with different details. Use update after confirmation.')
-                profile = conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?', (customer_id,)).fetchone()
-                for field, value in (('billing_address', billing_address), ('tax_registration_number', tax_registration_number)):
-                    if value is not None and (not isinstance(value, str) or value.strip() != (profile[field] if profile else '')):
-                        raise BillingError('Customer ID exists with different billing details. Use update after confirmation.')
-                return {'customer_id': customer_id, 'already_exists': True}
-            conn.execute('INSERT INTO customers VALUES (?,?,?,?)', (customer_id, name, company, email))
-        elif action == 'update':
-            ensure_customer(conn, customer_id)
-            conn.execute('UPDATE customers SET name=?,company=?,email=? WHERE customer_id=?', (name, company, email, customer_id))
-        else:
-            raise BillingError('Action must be create or update.')
-        if billing_address is not None or tax_registration_number is not None:
-            old=conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?',(customer_id,)).fetchone()
-            address=billing_address if billing_address is not None else old['billing_address'] if old else ''
-            tax_id=tax_registration_number if tax_registration_number is not None else old['tax_registration_number'] if old else ''
-            if not isinstance(address,str) or len(address)>2000 or not isinstance(tax_id,str) or len(tax_id)>100:
-                raise BillingError('Billing address must be at most 2000 characters; tax number at most 100.')
-            conn.execute('INSERT INTO customer_billing_details VALUES (?,?,?) ON CONFLICT(customer_id) DO UPDATE SET billing_address=excluded.billing_address,tax_registration_number=excluded.tax_registration_number',(customer_id,address.strip(),tax_id.strip()))
-    return {'customer_id': customer_id, 'name': name, 'company': company, 'email': email, 'action': action}
-
-
-@tool_result
-def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict] | None = None,
-                 reason: str = '', confirmed: bool = False, credit_amount: str | None = None,
-                 address_id: str | None = None) -> dict:
-    """select_address stages an explicitly chosen saved address_id for an owned active draft.
-    It verifies address ownership/status itself; no prior lookup or separate approval is required for an exact ID.
-    Use it when checkout includes an address choice, then review the full quote/address for placement approval.
-    The sidebar is optional; selection does not place the order. Resolve ambiguous labels/drafts first.
-    After confirmation: replace_items edits drafts; cancel cancels drafts or whole unshipped issued orders.
-    apply_store_credit allocates credit_amount to an owned draft; report_billing_issue stores reason for review.
-    Authenticated admin only: ship/deliver update issued-order fulfillment status.
-
-    items is the complete desired list of item_code and integer quantity. Issued invoice lines and totals are immutable.
-    Cancellation returns cancelled_from (draft or placed) and the retained invoice_number, if issued.
-    Only whole unshipped issued orders restore their fulfilled stock.
-    Set credit_amount to zero to clear a draft's store-credit allocation.
-    """
-    confirm(confirmed)
-    from mcp_server.access import scope
-    role=(scope.get() or {}).get('mode','customer')
-    if role=='admin' and action not in ('ship','deliver'): raise BillingError('Admin order access permits only confirmed shipment/delivery transitions.')
-    if action in ('ship','deliver') and role!='admin': raise BillingError('Only authenticated admin may update fulfillment status.')
-    with transaction() as conn:
-        order = order_row(conn, order_id, customer_id, allow_cancelled=action == 'cancel')
-        if order['order_status'] == 'cancelled':
-            issued = is_placed(conn, order)
-            return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled',
-                    'already_cancelled': True, 'cancelled_from': 'placed' if issued else 'draft',
-                    'invoice_number': order['order_invoice'] if issued else None}
-        if action == 'select_address':
-            from database.addresses import select_order_address_conn
-            if items is not None or credit_amount is not None or reason:
-                raise BillingError('Select the delivery address separately from basket, credit or cancellation changes.')
+            cursor = conn.execute(query, parameters or [])
+        except sqlite3.OperationalError as exc:
+            repaired = quote_reserved_aliases(query) if chart is not None and 'syntax error' in str(exc).lower() else query
+            if repaired == query:
+                raise
+            cursor = conn.execute(repaired, parameters or [])
+            repaired_aliases = True
+        from mcp_server.charts import MAX_CHART_ROWS
+        row_limit = MAX_CHART_ROWS if chart is not None else settings.SQL_MAX_ROWS
+        rows = cursor.fetchmany(row_limit + 1)
+        if any(isinstance(value, float) and not math.isfinite(value) for row in rows for value in row):
+            return {'ok':False,'error':'The query produced a non-finite number. Narrow the calculation or correct its inputs.'}
+        result = {'ok': True, 'columns': [c[0] for c in cursor.description or []],
+                'rows': [list(row) for row in rows[:row_limit]],
+                'row_count': min(len(rows), row_limit),
+                'truncated': len(rows) > row_limit,
+                'coverage_note': 'row_count counts returned SQL rows only. SQL LIMIT and filters may exclude matches even when truncated is false. Count the full matching set separately before claiming completeness, absence or a store-wide total.'}
+        if repaired_aliases:
+            result['query_note'] = 'Quoted reserved SQL aliases locally. Use names such as series_label instead of group/order in future queries.'
+        if query != original_query:
+            result['product_search_note'] = 'Product name/category filters ignore case, separators and common plural endings. IDs and financial filters retain their original semantics.'
+        if chart is not None:
+            from mcp_server.charts import prepare_chart
             try:
-                return select_order_address_conn(conn, order_id, customer_id, address_id)
+                payload = prepare_chart(result['columns'],result['rows'],chart,result['truncated'])
+                result['chart'] = {key:value for key,value in payload.items() if key != 'data'}
             except ValueError as exc:
-                raise BillingError(str(exc)) from exc
-        if action in ('ship','deliver'):
-            from mcp_server.tools.service_workflows import fulfillment_transition
-            return fulfillment_transition(conn,order,action)
-        if action in ('report_billing_issue','apply_store_credit'):
-            from mcp_server.tools.service_workflows import service_action
-            return service_action(conn,order,action,reason,credit_amount)
-        if is_placed(conn, order) and action=='cancel':
-            from mcp_server.tools.service_workflows import cancel_placed
-            return {**cancel_placed(conn,order,text(reason,'Cancellation reason')),
-                    'cancelled_from': 'placed', 'invoice_number': order['order_invoice']}
-        if is_placed(conn, order):
-            raise BillingError('Issued invoices cannot be edited. Review the supported refund workflow with store staff.')
-        # Unplaced draft cancellation records lifecycle/reason but does not restore stock that was never
-        # reserved.
-        if action == 'cancel':
-            reason = text(reason, 'Cancellation reason')
-            currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
-            conn.execute("INSERT INTO order_details(order_id,currency,status,cancellation_reason) VALUES (?,?,'cancelled',?) "
-                         "ON CONFLICT(order_id) DO UPDATE SET status='cancelled',cancellation_reason=excluded.cancellation_reason",
-                         (order_id, currency, reason))
-            conn.execute("UPDATE orders SET order_status='cancelled' WHERE order_id=?", (order_id,))
-            return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled', 'reason': reason,
-                    'cancelled_from': 'draft', 'invoice_number': None}
-        if action != 'replace_items' or not isinstance(items, list) or not 1 <= len(items) <= 100:
-            raise BillingError('Use cancel or replace_items with 1-100 line items.')
-        quantities = {}
-        for line in items:
-            if not isinstance(line, dict):
-                raise BillingError('Each item must contain item_code and quantity.')
-            code = identifier(line.get('item_code'), 'item code')
-            qty = line.get('quantity')
-            if type(qty) is not int or not 1 <= qty <= 100000:
-                raise BillingError('Quantity must be an integer from 1 to 100000.')
-            quantities[code] = quantities.get(code, 0) + qty
-            if quantities[code] > 100000:
-                raise BillingError('Combined quantity exceeds 100000.')
-        subtotal = Decimal(0)
-        for code, qty in quantities.items():
-            item = conn.execute('SELECT * FROM items WHERE item_code=?', (code,)).fetchone()
-            if not item or item['availablequantity'] < qty:
-                raise BillingError(f'Item {code} is unavailable or has insufficient stock.')
-            subtotal += price_for(conn, item, order['order_date']) * qty
-        values = totals(conn, subtotal, order['promo_code'])
-        conn.execute('DELETE FROM order_requests WHERE order_id=?', (order_id,))
-        conn.executemany('INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)',
-                         [(order_id, code, qty) for code, qty in quantities.items()])
-        credit = update_totals(conn, order_id, values)
-        return {'order_id': order_id, 'status': 'draft', 'order_status': 'draft',
-                'estimate': values, **credit}
-
-
+                result['chart_error'] = str(exc)
+        return result
+    except sqlite3.Error as exc:
+        result = {'ok': False, 'error': f'Query rejected or failed: {exc}'}
+        if any(term in str(exc).lower() for term in ('no such column', 'ambiguous column', 'no such table')):
+            result['schema_hint'] = schema_hint(access['mode'] if access else 'admin')
+        return result
+    finally:
+        conn.close()
