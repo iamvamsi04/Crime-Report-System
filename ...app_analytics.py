@@ -1,207 +1,115 @@
-"""Customer shopping comparisons; deterministic prices, no invented specifications."""
-import json
-import re
-import unicodedata
-from decimal import Decimal
-from typing import Annotated
-from pydantic import Field, StrictBool, StrictFloat, StrictInt
-from database.product_search import product_text, register_product_search
-from mcp_server.tools.billing_tools import BillingError, tool_result, money, price_for
-from mcp_server.tools.operations_tools import reading
+"""Trusted API/workbench scope carried over the private local stdio transport."""
+from contextvars import ContextVar
+from contextlib import closing
+from functools import wraps
+import inspect
+import sqlite3
+from database.connection import CASE_INSENSITIVE_COLUMNS, connect
+
+scope = ContextVar('tool_scope', default=None)
+ADMIN_TOOLS = {'execute_sql_query', 'billing_analysis', 'billing_anomalies', 'download_invoice', 'process_refund', 'manage_draft'}
+CASHIER_TOOLS = {'execute_sql_query', 'download_invoice', 'process_refund'}
+CUSTOMER_TOOLS = {'execute_sql_query', 'request_order', 'place_order', 'apply_promotion',
+                  'download_invoice', 'manage_draft', 'manage_customer', 'process_refund',
+                  'compare_products', 'find_cheaper_alternatives'}
+SCOPE_FIELDS = ('execution_mode', 'execution_customer_id', 'execution_coupon_codes')
 
 
-def options(quantity, budget, required_features):
-    if type(quantity) is not int or not 1 <= quantity <= 100000:
-        raise BillingError('Quantity must be an integer from 1 to 100000.')
-    budget = money(budget) if budget is not None else None
-    required_features = required_features or {}
-    if not isinstance(required_features, dict) or len(required_features) > 20 or any(
-        not isinstance(k, str) or not k.strip() or not isinstance(v, (str, int, float, bool))
-        for k, v in required_features.items()
-    ):
-        raise BillingError('Required features must be a dictionary of at most 20 feature/value pairs.')
-    return budget, required_features
+def scoped_tool(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        mode = kwargs.pop('execution_mode', 'customer')
+        # Read the verified customer account supplied by the application, not an ownership claim in chat.
+        customer = kwargs.pop('execution_customer_id', None)
+        coupon_codes = kwargs.pop('execution_coupon_codes', None)
+        allowed = ADMIN_TOOLS if mode == 'admin' else CASHIER_TOOLS if mode == 'cashier' else CUSTOMER_TOOLS if mode == 'customer' else set()
+        if fn.__name__ not in allowed:
+            return {'ok': False, 'error': 'This tool is not available in the current mode.'}
+        bound = inspect.signature(fn).bind(*args, **kwargs)
+        arguments = bound.arguments
+        if fn.__name__ == 'download_invoice':
+            if mode in ('admin', 'cashier') and arguments.get('action', 'generate') != 'generate':
+                return {'ok': False, 'error': 'Staff invoice access is read-only. The customer must confirm corrections in their own conversation.'}
+            requested_owner = arguments.get('customer_id')
+            if (mode == 'customer' and not customer) or (customer and requested_owner not in (None, customer)):
+                return {'ok': False, 'error': 'The invoice must belong to the verified customer account.'}
+            if customer:
+                arguments['customer_id'] = customer
+        if mode == 'customer' and fn.__name__ == 'manage_customer' and arguments.get('action', 'create') == 'create':
+            return {'ok': False, 'error': 'Create your account using the registration form, then sign in. Account credentials must never be sent in chat.'}
+        if mode == 'customer' and 'customer_id' in arguments:
+            if not customer or arguments['customer_id'] != customer:
+                return {'ok': False, 'error': 'Sign in to the matching customer account before accessing its records.'}
+        if mode == 'customer' and fn.__name__ == 'apply_promotion':
+            code = arguments.get('promo_code')
+            supplied = {value.strip().casefold() for value in coupon_codes or []
+                        if isinstance(value, str)} if isinstance(coupon_codes, list) else set()
+            if not isinstance(code, str) or code.strip().casefold() not in supplied:
+                return {'ok': False, 'error': 'Ask the customer to provide a coupon code. '
+                        'Only a code explicitly supplied by that customer can be checked or applied.'}
+        token = scope.set({'mode': mode, 'customer_id': customer})
+        try:
+            return fn(*bound.args, **bound.kwargs)
+        finally:
+            # Restore the prior scope so one tool/request cannot leak its account identity into another.
+            scope.reset(token)
+    run.__signature__ = inspect.signature(fn).replace(parameters=[
+        *inspect.signature(fn).parameters.values(),
+        inspect.Parameter('execution_mode', inspect.Parameter.KEYWORD_ONLY, default='customer', annotation=str),
+        inspect.Parameter('execution_customer_id', inspect.Parameter.KEYWORD_ONLY, default=None, annotation=str | None),
+        inspect.Parameter('execution_coupon_codes', inspect.Parameter.KEYWORD_ONLY, default=None, annotation=list[str] | None)])
+    run.__annotations__ = {**fn.__annotations__, 'execution_mode': str, 'execution_customer_id': str | None,
+                           'execution_coupon_codes': list[str] | None}
+    return run
 
 
-def resolve(conn, reference):
-    if not isinstance(reference, str) or not reference.strip() or len(reference) > 200:
-        raise BillingError('Provide an item code, SKU or product name.')
-    reference = reference.strip()
-    register_product_search(conn)
-    rows = conn.execute('SELECT * FROM items WHERE item_code=? OR sku=?', (reference, reference)).fetchall()
-    if not rows:
-        rows = conn.execute('SELECT * FROM items WHERE product_text(name)=product_text(?)', (reference,)).fetchall()
-    if not rows:
-        rows = conn.execute('SELECT * FROM items WHERE product_matches(name,?) LIMIT 6', (reference,)).fetchall()
-    if len(rows) != 1:
-        choices = ', '.join(f"{r['item_code']} ({r['name']})" for r in rows[:5])
-        raise BillingError('Product not found.' if not rows else 'Product is ambiguous. Ask the customer to choose: ' + choices)
-    return rows[0]
+def customer_query_connection(customer_id, staff=False):
+    """Materialize only public products and associated customer rows in an isolated DB.
 
-
-def feature_key(value):
-    return ' '.join(re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', value).casefold()))
-
-
-def same_feature_value(left, right):
-    if type(left) in (int, float) and type(right) in (int, float):
-        return Decimal(str(left)) == Decimal(str(right))
-    if isinstance(left, str) and isinstance(right, str):
-        return left.casefold() == right.casefold()
-    return type(left) is type(right) and left == right
-
-
-def product(conn, row, today, quantity, budget, requirements):
-    detail = conn.execute('SELECT * FROM product_details WHERE item_code=?', (row['item_code'],)).fetchone()
-    features = json.loads(detail['features_json']) if detail else {}
-    units = {}
-    attributes = conn.execute('SELECT * FROM product_attributes WHERE item_code=?', (row['item_code'],)).fetchall()
-    typed_keys = {feature_key(attribute['attribute']) for attribute in attributes}
-    # Typed records override legacy JSON, but never overwrite a conflicting typed
-    # record simply because its spelling uses a different separator.
-    features = {key: value for key, value in features.items() if feature_key(key) not in typed_keys}
-    for attribute in attributes:
-        key = attribute['attribute']
-        features[key] = attribute['text_value'] if attribute['text_value'] is not None else attribute['number_value']
-        if attribute['unit']:
-            units[key] = attribute['unit']
-    keys = {}
-    for key in features:
-        keys.setdefault(feature_key(key), []).append(key)
-    ambiguous = {name for name, matches in keys.items() if any(
-        not same_feature_value(features[matches[0]], features[key]) or units.get(matches[0]) != units.get(key)
-        for key in matches[1:])}
-    unit = price_for(conn, row, today)
-    total = money(unit * quantity)
-    matched, missing, different = [], [], []
-    for key, value in requirements.items():
-        normalized = feature_key(key)
-        recorded_keys = keys.get(normalized, [])
-        recorded_key = recorded_keys[0] if recorded_keys and normalized not in ambiguous else None
-        if recorded_key is None:
-            missing.append(key)
-        elif (str(features[recorded_key]).casefold() == str(value).casefold() or
-              (type(features[recorded_key]) in (int,float) and type(value) in (int,float)
-               and Decimal(str(features[recorded_key])) == Decimal(str(value)))):
-            matched.append(key)
-        else:
-            different.append(key)
-    return {'item_code': row['item_code'], 'sku': row['sku'], 'name': row['name'],
-            'category': detail['category'] if detail else None,
-            'description': detail['description'] if detail else '', 'features': features, 'feature_units': units,
-            'unit_price': str(unit), 'quantity': quantity, 'merchandise_total': str(total),
-            'available_quantity': row['availablequantity'], 'enough_stock': row['availablequantity'] >= quantity,
-            'within_budget': budget is None or total <= budget,
-            'matched_features': matched, 'unknown_features': missing, 'different_features': different,
-            'ambiguous_features': [key for name, matches in keys.items() if name in ambiguous for key in matches]}
-
-
-def context(conn):
-    config = dict(conn.execute('SELECT key,value FROM billing_config'))
-    return conn.execute('SELECT CURRENT_DATE').fetchone()[0], config.get('currency', 'USD')
-
-
-def eligible(row):
-    return row['enough_stock'] and row['within_budget'] and not row['unknown_features'] and not row['different_features']
-
-
-NOTES = ['Prices use today\'s dated price history, falling back to sellingprice, as in order quoting.',
-         'Budget covers merchandise for the requested quantity, before promotions, tax and shipping. Request an order draft for the final total.',
-         'Conflicting equivalent feature keys remain unknown; verify their recorded values and units before recommending.',
-         'Missing features are unknown. Price and stock do not establish quality, compatibility or suitability. No inventory is reserved.']
-
-
-@tool_result
-def compare_products(
-    products: Annotated[list[Annotated[str, Field(min_length=1, max_length=200)]], Field(
-        min_length=2, max_length=5,
-        description='Two to five distinct catalog references, one string per product. Use an exact item code, SKU or unambiguous product name.')],
-    quantity: Annotated[int, Field(ge=1, le=100000, description='Number of units of each product to compare.')] = 1,
-    budget: Annotated[str | StrictInt | StrictFloat | None, Field(
-        description='Total merchandise budget for quantity, as a number or decimal text without a currency symbol.')] = None,
-    required_features: Annotated[dict[str, str | StrictBool | StrictInt | StrictFloat] | None, Field(
-        max_length=20, description='Recorded feature names mapped to required scalar values.')] = None,
-) -> dict:
-    """Compare 2-5 products by code/SKU/name, price, stock and recorded features.
-
-    Use one string per product, e.g. {"products":["CODE-A","CODE-B"]}. Omit unused optional fields.
-    budget is the TOTAL merchandise budget for quantity. required_features maps recorded feature
-    names to desired values (e.g. {"connection":"wireless"}); key case/separators are ignored,
-    values and units are preserved, and missing or conflicting features stay unknown.
-    Suggests the lowest-priced available match, never an unsupported overall quality winner.
-    Ask what 'better' means for the customer. Product names can be ambiguous; ask instead of guessing.
+    User SQL never touches the source connection, preventing joins, CTEs and main.table
+    qualification from bypassing a row filter. Original column names and selected
+    descriptive-text collations are preserved; identifiers retain binary matching.
     """
-    budget, requirements = options(quantity, budget, required_features)
-    if not isinstance(products, list) or not 2 <= len(products) <= 5:
-        raise BillingError('Compare between 2 and 5 products.')
-    with reading() as conn:
-        today, currency = context(conn)
-        rows = []
-        for index, reference in enumerate(products):
-            try:
-                item = resolve(conn, reference)
-            except BillingError as exc:
-                raise BillingError(f'products[{index}]: {exc}') from exc
-            rows.append(product(conn, item, today, quantity, budget, requirements))
-        if len({r['item_code'] for r in rows}) != len(rows):
-            raise BillingError('Choose distinct products to compare.')
-        matches = [r for r in rows if eligible(r)]
-        lowest = min((Decimal(r['unit_price']) for r in matches), default=None)
-        winners = [r['item_code'] for r in matches if Decimal(r['unit_price']) == lowest]
-        categories = {product_text(r['category']) for r in rows}
-        return {'currency': currency, 'as_of': today, 'products': rows,
-                'lowest_price_matching_items': winners,
-                'recommendation_basis': 'Lowest current price among in-stock products meeting budget and every recorded requirement; ties retained.',
-                'same_recorded_category': len(categories) == 1 and None not in categories,
-                'notes': NOTES + ['Different or missing categories require checking that the products serve the same purpose.']}
-
-
-def words(name):
-    return {word for word in product_text(name).split() if word.isalpha()} - {
-        'a', 'an', 'the', 'for', 'with', 'and', 'inch', 'cm', 'gb', 'tb', 'hd',
-        'black', 'white', 'red', 'blue', 'premium', 'basic', 'pro', 'model', 'variant', 'wireless', 'usb'}
-
-
-@tool_result
-def find_cheaper_alternatives(product_reference: str, quantity: int = 1, budget: str | None = None,
-                              required_features: dict | None = None, limit: int = 5) -> dict:
-    """Find cheaper in-stock alternatives within the same recorded category.
-
-    Without a source category, uses shared meaningful name words and labels matches tentative.
-    Never treats a cheaper unrelated item as equivalent. Required features must be recorded and
-    match; key case/separators are ignored, while values and units are preserved. Budget is total
-    merchandise cost for quantity, before tax/shipping/promotions.
-    """
-    budget, requirements = options(quantity, budget, required_features)
-    if type(limit) is not int or not 1 <= limit <= 10:
-        raise BillingError('Limit must be from 1 to 10.')
-    with reading() as conn:
-        today, currency = context(conn)
-        source = product(conn, resolve(conn, product_reference), today, quantity, budget, requirements)
-        if source['category']:
-            candidates = conn.execute('SELECT i.* FROM items i JOIN product_details d ON d.item_code=i.item_code '
-                'WHERE product_text(d.category)=product_text(?) AND i.item_code<>? AND i.availablequantity>=?',
-                (source['category'], source['item_code'], quantity)).fetchall()
-        else:
-            candidates = conn.execute('SELECT * FROM items WHERE item_code<>? AND availablequantity>=?',
-                                      (source['item_code'], quantity)).fetchall()
-        choices, unavailable_prices = [], []
-        for row in candidates:
-            if not source['category'] and not words(source['name']).intersection(words(row['name'])):
-                continue
-            try:
-                candidate = product(conn, row, today, quantity, budget, requirements)
-            except BillingError:
-                unavailable_prices.append(row['item_code'])
-                continue
-            if not eligible(candidate) or Decimal(candidate['unit_price']) >= Decimal(source['unit_price']):
-                continue
-            candidate['savings_for_quantity'] = str(money(Decimal(source['merchandise_total']) - Decimal(candidate['merchandise_total'])))
-            candidate['match_basis'] = 'recorded_category' if source['category'] else 'shared_name_words_only'
-            choices.append(candidate)
-        choices.sort(key=lambda r: (Decimal(r['unit_price']), r['item_code']))
-        return {'currency': currency, 'as_of': today, 'source': source, 'alternatives': choices[:limit],
-                'matched_count': len(choices), 'truncated': len(choices) > limit,
-                'items_with_unusable_prices': unavailable_prices,
-                'notes': NOTES + ['Name-based matches are possible alternatives only; verify purpose and compatibility before recommending.',
-                                 'No matches means no qualifying cheaper option was found; do not invent alternatives.']}
+    source, target = connect(readonly=True), sqlite3.connect(':memory:')
+    target.row_factory = sqlite3.Row
+    queries = {
+        'billing_config': "SELECT key,value FROM billing_config WHERE key IN ('currency','tax_rate','shipping_amount')",
+        'items': 'SELECT sku,item_code,name,sellingprice,availablequantity FROM items',
+        'product_details': 'SELECT * FROM product_details',
+        'product_attributes': 'SELECT * FROM product_attributes',
+        'product_relations': 'SELECT * FROM product_relations',
+        'price_history': 'SELECT * FROM price_history',
+        'customers': 'SELECT * FROM customers WHERE customer_id=?',
+        'orders': 'SELECT * FROM orders WHERE customer_id=?',
+        'customer_billing_details':'SELECT * FROM customer_billing_details WHERE customer_id=?',
+        'store_credit_ledger':'SELECT * FROM store_credit_ledger WHERE customer_id=?',
+    }
+    # Coupons are private codes supplied by a customer, not public products.
+    # Keep this table out of customer SQL entirely; row filters or LIMITs would
+    # still let a model enumerate codes in follow-up queries.
+    if staff:
+        queries['promotions'] = 'SELECT * FROM promotions'
+    else:
+        queries['customer_addresses'] = 'SELECT * FROM customer_addresses WHERE customer_id=? AND active=1'
+    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','refund_requests','refund_details','order_service','invoice_revisions','order_delivery'):
+        # Join each child table to orders so an alternate SQL join cannot evade the original customer
+        # restriction.
+        queries[table] = f'SELECT t.* FROM {table} t JOIN orders o ON o.order_id=t.order_id WHERE o.customer_id=?'
+    try:
+        source.execute('BEGIN')
+        for table, sql in queries.items():
+            if staff:
+                sql = sql.replace(' WHERE customer_id=?', '').replace(' WHERE o.customer_id=?', '')
+            cursor = source.execute(sql, (customer_id,) if '?' in sql else ())
+            columns = [c[0] for c in cursor.description]
+            nocase = CASE_INSENSITIVE_COLUMNS.get(table, ())
+            declarations = ['"'+c+'"' + (' COLLATE NOCASE' if c.casefold() in nocase else '') for c in columns]
+            target.execute('CREATE TABLE '+table+' ('+', '.join(declarations)+')')
+            target.executemany('INSERT INTO '+table+' VALUES ('+','.join('?' for _ in columns)+')', cursor.fetchall())
+        target.commit()
+        return target
+    except BaseException:
+        target.close()
+        raise
+    finally:
+        source.close()
