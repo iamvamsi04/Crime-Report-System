@@ -1,254 +1,237 @@
-"""Customer and draft workflows. No external money movement or message delivery."""
+"""Owned saved delivery addresses and immutable checkout address snapshots."""
 from contextlib import contextmanager
-from decimal import Decimal
-import re
+import hashlib
+import json
+from uuid import uuid4
 
-from database.connection import connect, transaction
-from database.addresses import customer_record_fingerprint, ACCOUNT_RECORD_CHANGED
-from mcp_server.tools.billing_tools import (BillingError, tool_result, identifier, money,
-    order_row, is_placed, totals, update_totals, price_for)
+from database.connection import audit_context, connect, transaction
 
 
-def confirm(confirmed):
-    if confirmed is not True:
-        raise BillingError('Show the proposed change and obtain explicit confirmation first.')
+REQUIRED_FIELDS = ('full_name', 'phone', 'address_line1', 'city', 'state', 'postal_code', 'country')
+DELIVERY_FIELDS = (*REQUIRED_FIELDS, 'address_line2', 'landmark')
+LIMITS = {'label': 50, 'full_name': 200, 'phone': 30, 'address_line1': 200,
+          'address_line2': 200, 'city': 100, 'state': 100, 'postal_code': 20,
+          'country': 2, 'landmark': 200}
+ACCOUNT_RECORD_CHANGED = 'The customer or address details changed. Review the current details before confirming.'
 
 
-def text(value, name, maximum=2000):
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
-        raise BillingError(f'{name} must contain 1-{maximum} characters.')
-    return value.strip()
+def customer_record_fingerprint(customer_id, record):
+    return hashlib.sha256(json.dumps({'customer_id': customer_id, 'record': record},
+                                    sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def _check_address_review(conn, customer_id, expected_account_fingerprint):
+    if expected_account_fingerprint is None:
+        return
+    rows = [dict(row) for row in conn.execute('SELECT * FROM customer_addresses '
+        'WHERE customer_id=? AND active=1 ORDER BY address_id', (customer_id,))]
+    if expected_account_fingerprint != customer_record_fingerprint(customer_id, rows):
+        raise ValueError(ACCOUNT_RECORD_CHANGED)
+
+
+def _identifier(value, label):
+    if (not isinstance(value, str) or not 1 <= len(value) <= 50
+            or not all(c.isascii() and (c.isalnum() or c in '_-') for c in value)):
+        raise ValueError(f'Invalid {label}.')
+    return value
+
+
+def _validate(fields, old=None):
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError('Provide the address fields.')
+    unknown = set(fields) - set(LIMITS) - {'is_default'}
+    if unknown:
+        raise ValueError('Only the supported address fields may be changed.')
+    values = {name: old[name] if old else '' for name in LIMITS}
+    for name, value in fields.items():
+        if name == 'is_default':
+            if type(value) is not bool:
+                raise ValueError('Default address must be true or false.')
+            continue
+        if (not isinstance(value, str) or len(value) > LIMITS[name]
+                or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+            raise ValueError(f'{name.replace("_", " ").capitalize()} must contain at most {LIMITS[name]} characters without line breaks.')
+        values[name] = value.strip()
+    missing = [name.replace('_', ' ') for name in REQUIRED_FIELDS if not values[name]]
+    if missing:
+        raise ValueError('Required address fields: ' + ', '.join(missing) + '.')
+    country = values['country']
+    if len(country) != 2 or not country.isascii() or not country.isalpha():
+        raise ValueError('Country must be a two-letter country code, such as US or IN.')
+    values['country'] = country.upper()
+    phone = values['phone']
+    digits = ''.join(c for c in phone if c.isascii() and c.isdigit())
+    if not 7 <= len(digits) <= 15 or any(c not in '0123456789+()- ' for c in phone):
+        raise ValueError('Phone must contain 7 to 15 digits; spaces, +, hyphens and parentheses are allowed.')
+    postal = values['postal_code']
+    if not any(c.isalnum() for c in postal) or any(not (c.isalnum() or c in ' -') for c in postal):
+        raise ValueError('Postal code must contain letters or digits, with optional spaces or hyphens.')
+    return values
+
+
+def _customer(conn, customer_id):
+    _identifier(customer_id, 'customer ID')
+    if not conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (customer_id,)).fetchone():
+        raise ValueError('Customer not found.')
+
+
+def _owned(conn, customer_id, address_id):
+    _identifier(address_id, 'address ID')
+    row = conn.execute('SELECT * FROM customer_addresses WHERE address_id=? AND customer_id=? AND active=1',
+                       (address_id, customer_id)).fetchone()
+    if row is None:
+        raise ValueError('Saved address not found for this customer.')
+    return row
+
+
+def _result(row):
+    result = dict(row)
+    result['is_default'] = bool(result['is_default'])
+    result['active'] = bool(result['active'])
+    return result
+
+
+def address_snapshot(row):
+    """Delivery facts only; changing a nickname/default does not change a quote."""
+    return {name: row[name] for name in DELIVERY_FIELDS}
 
 
 @contextmanager
-def reading():
+def _audit(action, customer_id, address_id=None, order_id=None):
+    # Avoid storing recipient, telephone or street fields in billing audit payloads.
+    arguments = {'customer_id': customer_id}
+    if address_id:
+        arguments['address_id'] = address_id
+    if order_id:
+        arguments['order_id'] = order_id
+    token = audit_context.set({'action': action, 'arguments': arguments})
+    try:
+        yield
+    finally:
+        audit_context.reset(token)
+
+
+def list_addresses(customer_id):
     conn = connect(readonly=True)
     try:
-        conn.execute('BEGIN')
-        yield conn
+        _customer(conn, customer_id)
+        return [_result(row) for row in conn.execute(
+            'SELECT * FROM customer_addresses WHERE customer_id=? AND active=1 ORDER BY is_default DESC,address_id',
+            (customer_id,))]
     finally:
         conn.close()
 
 
-def ensure_customer(conn, customer_id):
-    if not conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (customer_id,)).fetchone():
-        raise BillingError('Customer not found.')
+def _invalidate_drafts(conn, customer_id, address_id):
+    conn.execute('DELETE FROM order_delivery WHERE customer_id=? AND address_id=? '
+                 "AND order_id IN (SELECT order_id FROM orders WHERE customer_id=? AND order_status='draft')",
+                 (customer_id, address_id, customer_id))
 
 
-def customer_profile_values(conn, customer_id, **changes):
-    """Resolve and validate a profile patch without writing customer records."""
-    identifier(customer_id, 'customer ID')
-    allowed = {'name', 'company', 'email', 'billing_address', 'tax_registration_number'}
-    if set(changes) - allowed:
-        raise BillingError('Only supported customer profile fields may be changed.')
-    customer = conn.execute('SELECT name,company,email FROM customers WHERE customer_id=?',
-                            (customer_id,)).fetchone()
-    if customer is None:
-        raise BillingError('Customer not found.')
-    billing = conn.execute('SELECT billing_address,tax_registration_number FROM customer_billing_details '
-                           'WHERE customer_id=?', (customer_id,)).fetchone()
-    values = {'name': customer['name'], 'company': customer['company'] or '', 'email': customer['email'] or '',
-              'billing_address': billing['billing_address'] if billing else '',
-              'tax_registration_number': billing['tax_registration_number'] if billing else ''}
-    values.update({field: value for field, value in changes.items() if value is not None})
-    valid_name = text(values['name'], 'Name', 200)
-    if changes.get('name') is not None:
-        values['name'] = valid_name
-    if changes.get('company') is not None and (not isinstance(values['company'], str) or len(values['company']) > 200):
-        raise BillingError('Company must contain at most 200 characters.')
-    email = values['email']
-    if changes.get('email') is not None and (not isinstance(email, str) or len(email) > 200
-            or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email))):
-        raise BillingError('Provide a valid email address or leave it empty.')
-    if changes.get('billing_address') is not None or changes.get('tax_registration_number') is not None:
-        address, tax_id = values['billing_address'], values['tax_registration_number']
-        if not isinstance(address, str) or len(address) > 2000 or not isinstance(tax_id, str) or len(tax_id) > 100:
-            raise BillingError('Billing address must be at most 2000 characters; tax number at most 100.')
-        values['billing_address'] = address.strip()
-        values['tax_registration_number'] = tax_id.strip()
-    return values
+def _draft_order(conn, order_id, customer_id):
+    order = conn.execute('SELECT order_status,order_invoice FROM orders WHERE order_id=? AND customer_id=?',
+                         (order_id, customer_id)).fetchone()
+    if order is None:
+        raise ValueError('Order not found for this customer.')
+    if order['order_status'] != 'draft' or (order['order_invoice'] or '').strip():
+        raise ValueError('Delivery addresses can only be selected for an active draft.')
+    if conn.execute("SELECT 1 FROM order_details WHERE order_id=? AND status='cancelled'", (order_id,)).fetchone():
+        raise ValueError('This order was cancelled. Select an active draft instead.')
+    service = conn.execute('SELECT fulfillment_status FROM order_service WHERE order_id=?', (order_id,)).fetchone()
+    if service and service[0] != 'unknown':
+        raise ValueError('This draft has inconsistent fulfillment records. Ask store staff to review it before checkout.')
 
 
-@tool_result
-def manage_customer(customer_id: str, name: str | None = None, company: str | None = None, email: str | None = None,
-                    action: str = 'create', confirmed: bool = False, billing_address: str | None = None,
-                    tax_registration_number: str | None = None, address: dict | None = None,
-                    address_id: str | None = None, expected_account_fingerprint: str | None = None) -> dict:
-    """Create or update a customer after confirmation. Show the proposed contact changes first.
-
-    Updates preserve omitted profile fields. Explicit empty strings clear optional fields; name cannot be empty.
-
-    Existing issued invoice contact snapshots are preserved. Use SQL to look up a customer before editing.
-    Address actions add_address/update_address/delete_address/set_default_address manage saved delivery
-    addresses, not billing contact details. address contains full_name,phone,address_line1,city,state,
-    postal_code,country (two-letter code); label,address_line2,landmark,is_default are optional.
-    Updates may contain only changed address fields. Supply address_id for every action except add_address.
-    """
-    confirm(confirmed)
-    identifier(customer_id, 'customer ID')
-    if action == 'create' and expected_account_fingerprint is not None:
-        raise BillingError('Customer creation cannot use an existing-account review.')
-    if action in ('add_address', 'update_address', 'delete_address', 'set_default_address'):
-        from database.addresses import save_address, delete_address, set_default_address
-        if name or any(value is not None for value in (company,email,billing_address,tax_registration_number)):
-            raise BillingError('Change saved delivery addresses separately from customer profile and billing details.')
-        if action in ('delete_address','set_default_address') and address is not None:
-            raise BillingError('This address action accepts an address ID, not replacement address fields.')
-        if action == 'add_address' and address_id is not None:
-            raise BillingError('A new address must not supply an existing address ID.')
-        if action != 'add_address' and not address_id:
-            raise BillingError('Choose a saved address before changing it.')
-        try:
-            if action in ('add_address', 'update_address'):
-                result = save_address(customer_id, address, address_id,
-                                      expected_account_fingerprint=expected_account_fingerprint)
-            elif action == 'delete_address':
-                result = delete_address(customer_id, address_id,
-                                        expected_account_fingerprint=expected_account_fingerprint)
-            else:
-                result = set_default_address(customer_id, address_id,
-                                             expected_account_fingerprint=expected_account_fingerprint)
-        except ValueError as exc:
-            raise BillingError(str(exc)) from exc
-        return {'customer_id': customer_id, 'action': action, **result}
-    if address is not None or address_id is not None:
-        raise BillingError('Use a delivery address action to save or select address details.')
-    if action == 'update':
-        with transaction() as conn:
-            if expected_account_fingerprint is not None:
-                current = customer_profile_values(conn, customer_id)
-                if expected_account_fingerprint != customer_record_fingerprint(customer_id, current):
-                    raise BillingError(ACCOUNT_RECORD_CHANGED)
-            profile = customer_profile_values(conn, customer_id, name=name, company=company, email=email,
-                billing_address=billing_address, tax_registration_number=tax_registration_number)
-            conn.execute('UPDATE customers SET name=?,company=?,email=? WHERE customer_id=?',
-                         (profile['name'], profile['company'], profile['email'], customer_id))
-            if billing_address is not None or tax_registration_number is not None:
-                conn.execute('INSERT INTO customer_billing_details VALUES (?,?,?) ON CONFLICT(customer_id) '
-                             'DO UPDATE SET billing_address=excluded.billing_address,'
-                             'tax_registration_number=excluded.tax_registration_number',
-                             (customer_id, profile['billing_address'], profile['tax_registration_number']))
-        return {'customer_id': customer_id, 'action': action, **profile}
-    name = text(name, 'Name', 200)
-    if company is not None and (not isinstance(company, str) or len(company) > 200):
-        raise BillingError('Company must contain at most 200 characters.')
-    if email is not None and (not isinstance(email, str) or len(email) > 200 or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email))):
-        raise BillingError('Provide a valid email address or leave it empty.')
-    with transaction() as conn:
-        existing = conn.execute('SELECT * FROM customers WHERE customer_id=?', (customer_id,)).fetchone()
-        company = company or ''
-        email = email or ''
-        if action == 'create':
-            if existing:
-                from mcp_server.access import scope
-                execution = scope.get()
-                if execution and execution.get('mode') == 'customer' and not execution.get('customer_id'):
-                    raise BillingError('Existing customer: start a conversation with that customer selected.')
-                if (existing['name'], existing['company'] or '', existing['email'] or '') != (name, company, email):
-                    raise BillingError('Customer ID exists with different details. Use update after confirmation.')
-                profile = conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?', (customer_id,)).fetchone()
-                for field, value in (('billing_address', billing_address), ('tax_registration_number', tax_registration_number)):
-                    if value is not None and (not isinstance(value, str) or value.strip() != (profile[field] if profile else '')):
-                        raise BillingError('Customer ID exists with different billing details. Use update after confirmation.')
-                return {'customer_id': customer_id, 'already_exists': True}
-            conn.execute('INSERT INTO customers VALUES (?,?,?,?)', (customer_id, name, company, email))
-        else:
-            raise BillingError('Action must be create or update.')
-        if billing_address is not None or tax_registration_number is not None:
-            old=conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?',(customer_id,)).fetchone()
-            address=billing_address if billing_address is not None else old['billing_address'] if old else ''
-            tax_id=tax_registration_number if tax_registration_number is not None else old['tax_registration_number'] if old else ''
-            if not isinstance(address,str) or len(address)>2000 or not isinstance(tax_id,str) or len(tax_id)>100:
-                raise BillingError('Billing address must be at most 2000 characters; tax number at most 100.')
-            conn.execute('INSERT INTO customer_billing_details VALUES (?,?,?) ON CONFLICT(customer_id) DO UPDATE SET billing_address=excluded.billing_address,tax_registration_number=excluded.tax_registration_number',(customer_id,address.strip(),tax_id.strip()))
-    return {'customer_id': customer_id, 'name': name, 'company': company, 'email': email, 'action': action}
+def save_address(customer_id, fields, address_id=None, *, expected_account_fingerprint: str | None = None):
+    updating = address_id is not None
+    if address_id is not None:
+        _identifier(address_id, 'address ID')
+    address_id = address_id or 'ADDR-' + uuid4().hex[:24]
+    with _audit('save_address', customer_id, address_id), transaction() as conn:
+        _customer(conn, customer_id)
+        _check_address_review(conn, customer_id, expected_account_fingerprint)
+        existing = _owned(conn, customer_id, address_id) if updating else None
+        values = _validate(fields, existing)
+        first = not conn.execute('SELECT 1 FROM customer_addresses WHERE customer_id=? AND active=1', (customer_id,)).fetchone()
+        default = fields.get('is_default', bool(existing['is_default']) if existing else False) or first
+        # If actual delivery facts changed, clear affected draft choices so checkout must review fresh
+        # facts.
+        if existing is not None and address_snapshot(existing) != address_snapshot(values):
+            _invalidate_drafts(conn, customer_id, address_id)
+        if default:
+            conn.execute('UPDATE customer_addresses SET is_default=0 WHERE customer_id=? AND is_default=1', (customer_id,))
+        conn.execute('INSERT INTO customer_addresses(address_id,customer_id,' + ','.join(LIMITS)
+                     + ',is_default,active) VALUES (' + ','.join('?' for _ in range(len(LIMITS) + 4)) + ') '
+                     'ON CONFLICT(address_id) DO UPDATE SET '
+                     + ','.join(name + '=excluded.' + name for name in LIMITS) + ',is_default=excluded.is_default',
+                     (address_id, customer_id, *(values[name] for name in LIMITS), int(default), 1))
+        # Repair the no-default case after an explicit default removal while retaining an active address.
+        if not conn.execute('SELECT 1 FROM customer_addresses WHERE customer_id=? AND active=1 AND is_default=1', (customer_id,)).fetchone():
+            conn.execute('UPDATE customer_addresses SET is_default=1 WHERE address_id='
+                         '(SELECT address_id FROM customer_addresses WHERE customer_id=? AND active=1 '
+                         'ORDER BY (address_id=?),address_id LIMIT 1)', (customer_id,address_id))
+        return _result(_owned(conn, customer_id, address_id))
 
 
-@tool_result
-def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict] | None = None,
-                 reason: str = '', confirmed: bool = False, credit_amount: str | None = None,
-                 address_id: str | None = None) -> dict:
-    """select_address stages an explicitly chosen saved address_id for an owned active draft.
-    It verifies address ownership/status itself; no prior lookup or separate approval is required for an exact ID.
-    Use it when checkout includes an address choice, then review the full quote/address for placement approval.
-    The sidebar is optional; selection does not place the order. Resolve ambiguous labels/drafts first.
-    After confirmation: replace_items edits drafts; cancel cancels drafts or whole unshipped issued orders.
-    apply_store_credit allocates credit_amount to an owned draft; report_billing_issue stores reason for review.
-    Authenticated admin only: ship/deliver update issued-order fulfillment status.
-
-    items is the complete desired list of item_code and integer quantity. Issued invoice lines and totals are immutable.
-    Cancellation returns cancelled_from (draft or placed) and the retained invoice_number, if issued.
-    Only whole unshipped issued orders restore their fulfilled stock.
-    Set credit_amount to zero to clear a draft's store-credit allocation.
-    """
-    confirm(confirmed)
-    from mcp_server.access import scope
-    role=(scope.get() or {}).get('mode','customer')
-    if role=='admin' and action not in ('ship','deliver'): raise BillingError('Admin order access permits only confirmed shipment/delivery transitions.')
-    if action in ('ship','deliver') and role!='admin': raise BillingError('Only authenticated admin may update fulfillment status.')
-    with transaction() as conn:
-        order = order_row(conn, order_id, customer_id, allow_cancelled=action == 'cancel')
-        if order['order_status'] == 'cancelled':
-            issued = is_placed(conn, order)
-            return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled',
-                    'already_cancelled': True, 'cancelled_from': 'placed' if issued else 'draft',
-                    'invoice_number': order['order_invoice'] if issued else None}
-        if action == 'select_address':
-            from database.addresses import select_order_address_conn
-            if items is not None or credit_amount is not None or reason:
-                raise BillingError('Select the delivery address separately from basket, credit or cancellation changes.')
-            try:
-                return select_order_address_conn(conn, order_id, customer_id, address_id)
-            except ValueError as exc:
-                raise BillingError(str(exc)) from exc
-        if action in ('ship','deliver'):
-            from mcp_server.tools.service_workflows import fulfillment_transition
-            return fulfillment_transition(conn,order,action)
-        if action in ('report_billing_issue','apply_store_credit'):
-            from mcp_server.tools.service_workflows import service_action
-            return service_action(conn,order,action,reason,credit_amount)
-        if is_placed(conn, order) and action=='cancel':
-            from mcp_server.tools.service_workflows import cancel_placed
-            return {**cancel_placed(conn,order,text(reason,'Cancellation reason')),
-                    'cancelled_from': 'placed', 'invoice_number': order['order_invoice']}
-        if is_placed(conn, order):
-            raise BillingError('Issued invoices cannot be edited. Review the supported refund workflow with store staff.')
-        # Unplaced draft cancellation records lifecycle/reason but does not restore stock that was never
-        # reserved.
-        if action == 'cancel':
-            reason = text(reason, 'Cancellation reason')
-            currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
-            conn.execute("INSERT INTO order_details(order_id,currency,status,cancellation_reason) VALUES (?,?,'cancelled',?) "
-                         "ON CONFLICT(order_id) DO UPDATE SET status='cancelled',cancellation_reason=excluded.cancellation_reason",
-                         (order_id, currency, reason))
-            conn.execute("UPDATE orders SET order_status='cancelled' WHERE order_id=?", (order_id,))
-            return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled', 'reason': reason,
-                    'cancelled_from': 'draft', 'invoice_number': None}
-        if action != 'replace_items' or not isinstance(items, list) or not 1 <= len(items) <= 100:
-            raise BillingError('Use cancel or replace_items with 1-100 line items.')
-        quantities = {}
-        for line in items:
-            if not isinstance(line, dict):
-                raise BillingError('Each item must contain item_code and quantity.')
-            code = identifier(line.get('item_code'), 'item code')
-            qty = line.get('quantity')
-            if type(qty) is not int or not 1 <= qty <= 100000:
-                raise BillingError('Quantity must be an integer from 1 to 100000.')
-            quantities[code] = quantities.get(code, 0) + qty
-            if quantities[code] > 100000:
-                raise BillingError('Combined quantity exceeds 100000.')
-        subtotal = Decimal(0)
-        for code, qty in quantities.items():
-            item = conn.execute('SELECT * FROM items WHERE item_code=?', (code,)).fetchone()
-            if not item or item['availablequantity'] < qty:
-                raise BillingError(f'Item {code} is unavailable or has insufficient stock.')
-            subtotal += price_for(conn, item, order['order_date']) * qty
-        values = totals(conn, subtotal, order['promo_code'])
-        conn.execute('DELETE FROM order_requests WHERE order_id=?', (order_id,))
-        conn.executemany('INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)',
-                         [(order_id, code, qty) for code, qty in quantities.items()])
-        credit = update_totals(conn, order_id, values)
-        return {'order_id': order_id, 'status': 'draft', 'order_status': 'draft',
-                'estimate': values, **credit}
+def delete_address(customer_id, address_id, *, expected_account_fingerprint: str | None = None):
+    with _audit('delete_address', customer_id, address_id), transaction() as conn:
+        _customer(conn, customer_id)
+        _check_address_review(conn, customer_id, expected_account_fingerprint)
+        row = _owned(conn, customer_id, address_id)
+        _invalidate_drafts(conn, customer_id, address_id)
+        conn.execute('UPDATE customer_addresses SET active=0,is_default=0 WHERE address_id=? AND customer_id=?',
+                     (address_id, customer_id))
+        if row['is_default']:
+            conn.execute('UPDATE customer_addresses SET is_default=1 WHERE address_id='
+                         '(SELECT address_id FROM customer_addresses WHERE customer_id=? AND active=1 ORDER BY address_id LIMIT 1)',
+                         (customer_id,))
+        return {'address_id': address_id, 'deleted': True}
 
 
+def set_default_address(customer_id, address_id, *, expected_account_fingerprint: str | None = None):
+    with _audit('set_default_address', customer_id, address_id), transaction() as conn:
+        _customer(conn, customer_id)
+        _check_address_review(conn, customer_id, expected_account_fingerprint)
+        _owned(conn, customer_id, address_id)
+        conn.execute('UPDATE customer_addresses SET is_default=0 WHERE customer_id=? AND is_default=1', (customer_id,))
+        conn.execute('UPDATE customer_addresses SET is_default=1 WHERE address_id=? AND customer_id=?', (address_id, customer_id))
+        return _result(_owned(conn, customer_id, address_id))
+
+
+def select_order_address_conn(conn, order_id, customer_id, address_id):
+    _customer(conn, customer_id)
+    _identifier(order_id, 'order ID')
+    row = _owned(conn, customer_id, address_id)
+    _draft_order(conn, order_id, customer_id)
+    snapshot = address_snapshot(_validate(address_snapshot(row)))
+    conn.execute('INSERT INTO order_delivery(order_id,customer_id,address_id,address_snapshot) VALUES (?,?,?,?) '
+                 'ON CONFLICT(order_id) DO UPDATE SET address_id=excluded.address_id,address_snapshot=excluded.address_snapshot',
+                 (order_id, customer_id, address_id, json.dumps(snapshot, sort_keys=True)))
+    return {'order_id': order_id, 'address_id': address_id, 'delivery_address': snapshot, 'order_status': 'draft'}
+
+
+def select_order_address(order_id, customer_id, address_id):
+    with _audit('select_order_address', customer_id, address_id, order_id), transaction() as conn:
+        return select_order_address_conn(conn, order_id, customer_id, address_id)
+
+
+def selected_address(conn, order_id, customer_id, *, require_current=False):
+    if require_current:
+        _draft_order(conn, order_id, customer_id)
+    row = conn.execute('SELECT * FROM order_delivery WHERE order_id=? AND customer_id=?', (order_id, customer_id)).fetchone()
+    if row is None:
+        if require_current:
+            raise ValueError('Select a saved delivery address for this order before checkout, then review and confirm the order.')
+        return None
+    try:
+        snapshot = json.loads(row['address_snapshot'])
+        # Revalidate decoded data so malformed historical snapshots are never passed through silently.
+        validated = _validate(snapshot)
+    except (ValueError, TypeError):
+        raise ValueError('The selected delivery address is invalid. Select a valid saved address and review the order again.') from None
+    # For checkout, verify both the currently active owned address and its exact delivery facts.
+    if require_current:
+        current = _owned(conn, customer_id, row['address_id'])
+        if address_snapshot(current) != address_snapshot(validated):
+            raise ValueError('The selected delivery address changed. Select it again and review the current order before checkout.')
+    return {'address_id': row['address_id'], 'delivery_address': address_snapshot(validated)}
