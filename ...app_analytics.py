@@ -1,87 +1,86 @@
-"""UTC price windows. Stored timestamps use a space and six fractional digits.
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS billing_config (
+    key VARCHAR(50) PRIMARY KEY, value VARCHAR(100) NOT NULL
+);
+CREATE TABLE IF NOT EXISTS customers (
+-- Keep customer IDs exact while allowing case-insensitive descriptive name comparisons.
+    customer_id VARCHAR(50) PRIMARY KEY, name VARCHAR(200) COLLATE NOCASE NOT NULL,
+    company VARCHAR(200), email VARCHAR(200)
+);
+CREATE TABLE IF NOT EXISTS items (
+    sku VARCHAR(50) PRIMARY KEY, item_code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(200) COLLATE NOCASE NOT NULL,
+-- Keep current merchandise base cost nonnegative; it is not historical audited expense evidence.
+    baseprice DECIMAL(10,2) NOT NULL CHECK(baseprice >= 0),
+    sellingprice DECIMAL(10,2) NOT NULL CHECK(sellingprice >= 0),
+    availablequantity INTEGER NOT NULL DEFAULT 0 CHECK(availablequantity >= 0)
+);
+CREATE TABLE IF NOT EXISTS promotions (
+    promo_code VARCHAR(50) PRIMARY KEY, description VARCHAR(300),
+    discount_type VARCHAR(20) NOT NULL CHECK(discount_type IN ('percent','flat')),
+    discount_value DECIMAL(10,2) NOT NULL CHECK(discount_value >= 0),
+    expires_on DATE NOT NULL CHECK(length(expires_on)=10 AND expires_on GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(expires_on,'+0 days') IS NOT NULL AND date(expires_on,'+0 days')=expires_on),
+    CHECK(discount_type != 'percent' OR discount_value <= 100)
+);
+CREATE TABLE IF NOT EXISTS orders (
+    order_id VARCHAR(50) PRIMARY KEY,
+    order_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    customer_id VARCHAR(50) NOT NULL REFERENCES customers(customer_id),
+    order_invoice VARCHAR(100),
+    order_status TEXT COLLATE NOCASE NOT NULL DEFAULT 'draft' CHECK(order_status COLLATE BINARY IN ('draft','placed','cancelled')),
+    subtotal DECIMAL(10,2) NOT NULL CHECK(subtotal >= 0),
+    tax_amount DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(tax_amount >= 0),
+    shipping_amount DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(shipping_amount >= 0),
+    discount_applied DECIMAL(10,2) NOT NULL DEFAULT 0 CHECK(discount_applied >= 0),
+    charged_price DECIMAL(10,2) NOT NULL CHECK(charged_price >= 0),
+    promo_code VARCHAR(50) REFERENCES promotions(promo_code),
+    refund_amount DECIMAL(10,2), refund_status VARCHAR(20) COLLATE NOCASE, refund_reason TEXT,
+    CHECK(refund_amount IS NULL OR (refund_amount > 0 AND refund_amount <= charged_price))
+);
+CREATE TABLE IF NOT EXISTS order_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id VARCHAR(50) NOT NULL REFERENCES orders(order_id),
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    quantity INTEGER NOT NULL CHECK(quantity > 0), UNIQUE(order_id,item_code)
+);
+CREATE TABLE IF NOT EXISTS order_fulfilled (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id VARCHAR(50) NOT NULL REFERENCES orders(order_id),
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    quantity INTEGER NOT NULL CHECK(quantity > 0), UNIQUE(order_id,item_code)
+);
+CREATE TABLE IF NOT EXISTS invoice_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id VARCHAR(50) NOT NULL REFERENCES orders(order_id),
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    qty_billed INTEGER NOT NULL CHECK(qty_billed > 0),
+    unit_price_billed DECIMAL(10,2) NOT NULL CHECK(unit_price_billed >= 0),
+    line_total DECIMAL(10,2) NOT NULL CHECK(line_total >= 0), UNIQUE(order_id,item_code)
+);
+CREATE TABLE IF NOT EXISTS price_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_code VARCHAR(50) NOT NULL REFERENCES items(item_code),
+    unit_price DECIMAL(10,2) NOT NULL CHECK(unit_price >= 0),
+    effective_from TIMESTAMP NOT NULL, effective_to TIMESTAMP,
+    CHECK(julianday(effective_from) IS NOT NULL AND (
+        effective_to IS NULL OR (julianday(effective_to) IS NOT NULL AND (
+            julianday(effective_to) + CASE WHEN length(effective_to)=10 THEN 1 ELSE 0 END > julianday(effective_from)
+            OR (julianday(effective_to)=julianday(effective_from) AND effective_to<>effective_from AND (
+                NOT (length(effective_from)=26 AND substr(effective_from,11,1)=' ' AND substr(effective_from,20,1)='.'
+                     AND substr(effective_from,21) NOT GLOB '*[^0-9]*'
+                     AND length(effective_to)=26 AND substr(effective_to,11,1)=' ' AND substr(effective_to,20,1)='.'
+                     AND substr(effective_to,21) NOT GLOB '*[^0-9]*')
+                OR effective_to>effective_from))))))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_invoice_number ON orders(order_invoice)
+    WHERE order_invoice IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_customer_orders ON orders(customer_id,order_date);
+CREATE INDEX IF NOT EXISTS ix_price_dates ON price_history(item_code,effective_from,effective_to);
 
-Naive input timestamps are UTC. Legacy date-only ends include the entire day.
-"""
-from datetime import date, datetime, time, timedelta, timezone
-import re
-
-
-def as_datetime(value):
-    if isinstance(value, datetime):
-        result = value
-    elif isinstance(value, date):
-        result = datetime.combine(value, time.min)
-    elif isinstance(value, str) and value.strip():
-        value = value.strip()
-        if any(len(match) > 6 for match in re.findall(r'[.,](\d+)', value)):
-            raise ValueError('Price timestamps support at most six fractional digits.')
-        try:
-            result = datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise ValueError('Use a valid ISO date or timestamp for pricing.') from exc
-    else:
-        raise ValueError('Use a valid ISO date or timestamp for pricing.')
-    if result.tzinfo is None:
-        result = result.replace(tzinfo=timezone.utc)
-    try:
-        return result.astimezone(timezone.utc)
-    except (ValueError, OverflowError) as exc:
-        raise ValueError('Price timestamp is outside the supported UTC range.') from exc
-
-
-def normalize_timestamp(value):
-    return as_datetime(value).replace(tzinfo=None).isoformat(sep=' ', timespec='microseconds')
-
-
-def utc_now():
-    return normalize_timestamp(datetime.now(timezone.utc))
-
-
-def price_window(effective_from, effective_to):
-    start = as_datetime(effective_from)
-    end = None
-    if effective_to is not None:
-        end = as_datetime(effective_to)
-        date_only = (isinstance(effective_to, date) and not isinstance(effective_to, datetime)
-                     or isinstance(effective_to, str) and len(effective_to.strip()) == 10)
-        if date_only:
-            try:
-                end += timedelta(days=1)
-            except OverflowError as exc:
-                raise ValueError('Price window end is outside the supported UTC range.') from exc
-        if end <= start:
-            raise ValueError('Price window end must be later than its start.')
-    return start, end
-
-
-def matching_prices(conn, item_code, as_of):
-    instant = as_datetime(as_of)
-    matches = []
-    for row in conn.execute('SELECT * FROM price_history WHERE item_code=? ORDER BY effective_from,id', (item_code,)):
-        start, end = price_window(row['effective_from'], row['effective_to'])
-        if start <= instant and (end is None or instant < end):
-            matches.append(row)
-    return matches
-
-
-def order_price_time(conn, order):
-    fields = dict(order)
-    instant = fields.get('price_as_of')
-    if instant is None:
-        row = conn.execute('SELECT price_as_of FROM order_details WHERE order_id=?',
-                           (fields['order_id'],)).fetchone()
-        instant = row[0] if row else None
-    return normalize_timestamp(instant if instant is not None else fields['order_date'])
-
-
-# SQLite dates have millisecond precision. Canonical UTC values retain an exact
-# microsecond tie-break; Python validates mixed ISO forms before price lookup.
-PRICE_WINDOW_CHECK = """julianday(effective_from) IS NOT NULL AND (
-    effective_to IS NULL OR (julianday(effective_to) IS NOT NULL AND (
-        julianday(effective_to) + CASE WHEN length(effective_to)=10 THEN 1 ELSE 0 END > julianday(effective_from)
-        OR (julianday(effective_to)=julianday(effective_from) AND effective_to<>effective_from AND (
-            NOT (length(effective_from)=26 AND substr(effective_from,11,1)=' ' AND substr(effective_from,20,1)='.'
-                 AND substr(effective_from,21) NOT GLOB '*[^0-9]*'
-                 AND length(effective_to)=26 AND substr(effective_to,11,1)=' ' AND substr(effective_to,20,1)='.'
-                 AND substr(effective_to,21) NOT GLOB '*[^0-9]*')
-            OR effective_to>effective_from)))))"""
+CREATE TABLE IF NOT EXISTS product_details (
+    item_code TEXT PRIMARY KEY REFERENCES items(item_code),
+    category TEXT COLLATE NOCASE NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    features_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(features_json) AND json_type(features_json)='object')
+);
+CREATE INDEX IF NOT EXISTS ix_product_category ON product_details(category);
