@@ -1,260 +1,208 @@
-"""Customer and draft workflows. No external money movement or message delivery."""
-from contextlib import contextmanager
-from decimal import Decimal
+"""Customer shopping comparisons; deterministic prices, no invented specifications."""
+import json
 import re
-
-from database.connection import connect, transaction
+import unicodedata
+from decimal import Decimal
+from typing import Annotated
+from pydantic import Field, StrictBool, StrictFloat, StrictInt
+from database.product_search import product_text, register_product_search
 from database import pricing
-from database.addresses import customer_record_fingerprint, ACCOUNT_RECORD_CHANGED
-from mcp_server.tools.billing_tools import (BillingError, tool_result, identifier, money,
-    order_row, is_placed, totals, update_totals, price_for)
+from mcp_server.tools.billing_tools import BillingError, tool_result, money, price_for
+from mcp_server.tools.operations_tools import reading
 
 
-def confirm(confirmed):
-    if confirmed is not True:
-        raise BillingError('Show the proposed change and obtain explicit confirmation first.')
+def options(quantity, budget, required_features):
+    if type(quantity) is not int or not 1 <= quantity <= 100000:
+        raise BillingError('Quantity must be an integer from 1 to 100000.')
+    budget = money(budget) if budget is not None else None
+    required_features = required_features or {}
+    if not isinstance(required_features, dict) or len(required_features) > 20 or any(
+        not isinstance(k, str) or not k.strip() or not isinstance(v, (str, int, float, bool))
+        for k, v in required_features.items()
+    ):
+        raise BillingError('Required features must be a dictionary of at most 20 feature/value pairs.')
+    return budget, required_features
 
 
-def text(value, name, maximum=2000):
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
-        raise BillingError(f'{name} must contain 1-{maximum} characters.')
-    return value.strip()
+def resolve(conn, reference):
+    if not isinstance(reference, str) or not reference.strip() or len(reference) > 200:
+        raise BillingError('Provide an item code, SKU or product name.')
+    reference = reference.strip()
+    register_product_search(conn)
+    rows = conn.execute('SELECT * FROM items WHERE item_code=? OR sku=?', (reference, reference)).fetchall()
+    if not rows:
+        rows = conn.execute('SELECT * FROM items WHERE product_text(name)=product_text(?)', (reference,)).fetchall()
+    if not rows:
+        rows = conn.execute('SELECT * FROM items WHERE product_matches(name,?) LIMIT 6', (reference,)).fetchall()
+    if len(rows) != 1:
+        choices = ', '.join(f"{r['item_code']} ({r['name']})" for r in rows[:5])
+        raise BillingError('Product not found.' if not rows else 'Product is ambiguous. Ask the customer to choose: ' + choices)
+    return rows[0]
 
 
-@contextmanager
-def reading():
-    conn = connect(readonly=True)
-    try:
-        conn.execute('BEGIN')
-        yield conn
-    finally:
-        conn.close()
+def feature_key(value):
+    return ' '.join(re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', value).casefold()))
 
 
-def ensure_customer(conn, customer_id):
-    if not conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (customer_id,)).fetchone():
-        raise BillingError('Customer not found.')
+def same_feature_value(left, right):
+    if type(left) in (int, float) and type(right) in (int, float):
+        return Decimal(str(left)) == Decimal(str(right))
+    if isinstance(left, str) and isinstance(right, str):
+        return left.casefold() == right.casefold()
+    return type(left) is type(right) and left == right
 
 
-def customer_profile_values(conn, customer_id, **changes):
-    """Resolve and validate a profile patch without writing customer records."""
-    identifier(customer_id, 'customer ID')
-    allowed = {'name', 'company', 'email', 'billing_address', 'tax_registration_number'}
-    if set(changes) - allowed:
-        raise BillingError('Only supported customer profile fields may be changed.')
-    customer = conn.execute('SELECT name,company,email FROM customers WHERE customer_id=?',
-                            (customer_id,)).fetchone()
-    if customer is None:
-        raise BillingError('Customer not found.')
-    billing = conn.execute('SELECT billing_address,tax_registration_number FROM customer_billing_details '
-                           'WHERE customer_id=?', (customer_id,)).fetchone()
-    values = {'name': customer['name'], 'company': customer['company'] or '', 'email': customer['email'] or '',
-              'billing_address': billing['billing_address'] if billing else '',
-              'tax_registration_number': billing['tax_registration_number'] if billing else ''}
-    values.update({field: value for field, value in changes.items() if value is not None})
-    valid_name = text(values['name'], 'Name', 200)
-    if changes.get('name') is not None:
-        values['name'] = valid_name
-    if changes.get('company') is not None and (not isinstance(values['company'], str) or len(values['company']) > 200):
-        raise BillingError('Company must contain at most 200 characters.')
-    email = values['email']
-    if changes.get('email') is not None and (not isinstance(email, str) or len(email) > 200
-            or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email))):
-        raise BillingError('Provide a valid email address or leave it empty.')
-    if changes.get('billing_address') is not None or changes.get('tax_registration_number') is not None:
-        address, tax_id = values['billing_address'], values['tax_registration_number']
-        if not isinstance(address, str) or len(address) > 2000 or not isinstance(tax_id, str) or len(tax_id) > 100:
-            raise BillingError('Billing address must be at most 2000 characters; tax number at most 100.')
-        values['billing_address'] = address.strip()
-        values['tax_registration_number'] = tax_id.strip()
-    return values
-
-
-@tool_result
-def manage_customer(customer_id: str, name: str | None = None, company: str | None = None, email: str | None = None,
-                    action: str = 'create', confirmed: bool = False, billing_address: str | None = None,
-                    tax_registration_number: str | None = None, address: dict | None = None,
-                    address_id: str | None = None, expected_account_fingerprint: str | None = None) -> dict:
-    """Create or update a customer after confirmation. Show the proposed contact changes first.
-
-    Updates preserve omitted profile fields. Explicit empty strings clear optional fields; name cannot be empty.
-
-    Existing issued invoice contact snapshots are preserved. Use SQL to look up a customer before editing.
-    Address actions add_address/update_address/delete_address/set_default_address manage saved delivery
-    addresses, not billing contact details. address contains full_name,phone,address_line1,city,state,
-    postal_code,country (two-letter code); label,address_line2,landmark,is_default are optional.
-    Updates may contain only changed address fields. Supply address_id for every action except add_address.
-    """
-    confirm(confirmed)
-    identifier(customer_id, 'customer ID')
-    if action == 'create' and expected_account_fingerprint is not None:
-        raise BillingError('Customer creation cannot use an existing-account review.')
-    if action in ('add_address', 'update_address', 'delete_address', 'set_default_address'):
-        from database.addresses import save_address, delete_address, set_default_address
-        if name or any(value is not None for value in (company,email,billing_address,tax_registration_number)):
-            raise BillingError('Change saved delivery addresses separately from customer profile and billing details.')
-        if action in ('delete_address','set_default_address') and address is not None:
-            raise BillingError('This address action accepts an address ID, not replacement address fields.')
-        if action == 'add_address' and address_id is not None:
-            raise BillingError('A new address must not supply an existing address ID.')
-        if action != 'add_address' and not address_id:
-            raise BillingError('Choose a saved address before changing it.')
-        try:
-            if action in ('add_address', 'update_address'):
-                result = save_address(customer_id, address, address_id,
-                                      expected_account_fingerprint=expected_account_fingerprint)
-            elif action == 'delete_address':
-                result = delete_address(customer_id, address_id,
-                                        expected_account_fingerprint=expected_account_fingerprint)
-            else:
-                result = set_default_address(customer_id, address_id,
-                                             expected_account_fingerprint=expected_account_fingerprint)
-        except ValueError as exc:
-            raise BillingError(str(exc)) from exc
-        return {'customer_id': customer_id, 'action': action, **result}
-    if address is not None or address_id is not None:
-        raise BillingError('Use a delivery address action to save or select address details.')
-    if action == 'update':
-        with transaction() as conn:
-            if expected_account_fingerprint is not None:
-                current = customer_profile_values(conn, customer_id)
-                if expected_account_fingerprint != customer_record_fingerprint(customer_id, current):
-                    raise BillingError(ACCOUNT_RECORD_CHANGED)
-            profile = customer_profile_values(conn, customer_id, name=name, company=company, email=email,
-                billing_address=billing_address, tax_registration_number=tax_registration_number)
-            conn.execute('UPDATE customers SET name=?,company=?,email=? WHERE customer_id=?',
-                         (profile['name'], profile['company'], profile['email'], customer_id))
-            if billing_address is not None or tax_registration_number is not None:
-                conn.execute('INSERT INTO customer_billing_details VALUES (?,?,?) ON CONFLICT(customer_id) '
-                             'DO UPDATE SET billing_address=excluded.billing_address,'
-                             'tax_registration_number=excluded.tax_registration_number',
-                             (customer_id, profile['billing_address'], profile['tax_registration_number']))
-        return {'customer_id': customer_id, 'action': action, **profile}
-    name = text(name, 'Name', 200)
-    if company is not None and (not isinstance(company, str) or len(company) > 200):
-        raise BillingError('Company must contain at most 200 characters.')
-    if email is not None and (not isinstance(email, str) or len(email) > 200 or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email))):
-        raise BillingError('Provide a valid email address or leave it empty.')
-    with transaction() as conn:
-        existing = conn.execute('SELECT * FROM customers WHERE customer_id=?', (customer_id,)).fetchone()
-        company = company or ''
-        email = email or ''
-        if action == 'create':
-            if existing:
-                from mcp_server.access import scope
-                execution = scope.get()
-                if execution and execution.get('mode') == 'customer' and not execution.get('customer_id'):
-                    raise BillingError('Existing customer: start a conversation with that customer selected.')
-                if (existing['name'], existing['company'] or '', existing['email'] or '') != (name, company, email):
-                    raise BillingError('Customer ID exists with different details. Use update after confirmation.')
-                profile = conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?', (customer_id,)).fetchone()
-                for field, value in (('billing_address', billing_address), ('tax_registration_number', tax_registration_number)):
-                    if value is not None and (not isinstance(value, str) or value.strip() != (profile[field] if profile else '')):
-                        raise BillingError('Customer ID exists with different billing details. Use update after confirmation.')
-                return {'customer_id': customer_id, 'already_exists': True}
-            conn.execute('INSERT INTO customers VALUES (?,?,?,?)', (customer_id, name, company, email))
+def product(conn, row, today, quantity, budget, requirements):
+    detail = conn.execute('SELECT * FROM product_details WHERE item_code=?', (row['item_code'],)).fetchone()
+    features = json.loads(detail['features_json']) if detail else {}
+    units = {}
+    attributes = conn.execute('SELECT * FROM product_attributes WHERE item_code=?', (row['item_code'],)).fetchall()
+    typed_keys = {feature_key(attribute['attribute']) for attribute in attributes}
+    # Typed records override legacy JSON, but never overwrite a conflicting typed
+    # record simply because its spelling uses a different separator.
+    features = {key: value for key, value in features.items() if feature_key(key) not in typed_keys}
+    for attribute in attributes:
+        key = attribute['attribute']
+        features[key] = attribute['text_value'] if attribute['text_value'] is not None else attribute['number_value']
+        if attribute['unit']:
+            units[key] = attribute['unit']
+    keys = {}
+    for key in features:
+        keys.setdefault(feature_key(key), []).append(key)
+    ambiguous = {name for name, matches in keys.items() if any(
+        not same_feature_value(features[matches[0]], features[key]) or units.get(matches[0]) != units.get(key)
+        for key in matches[1:])}
+    unit = price_for(conn, row, today)
+    total = money(unit * quantity)
+    matched, missing, different = [], [], []
+    for key, value in requirements.items():
+        normalized = feature_key(key)
+        recorded_keys = keys.get(normalized, [])
+        recorded_key = recorded_keys[0] if recorded_keys and normalized not in ambiguous else None
+        if recorded_key is None:
+            missing.append(key)
+        elif (str(features[recorded_key]).casefold() == str(value).casefold() or
+              (type(features[recorded_key]) in (int,float) and type(value) in (int,float)
+               and Decimal(str(features[recorded_key])) == Decimal(str(value)))):
+            matched.append(key)
         else:
-            raise BillingError('Action must be create or update.')
-        if billing_address is not None or tax_registration_number is not None:
-            old=conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?',(customer_id,)).fetchone()
-            address=billing_address if billing_address is not None else old['billing_address'] if old else ''
-            tax_id=tax_registration_number if tax_registration_number is not None else old['tax_registration_number'] if old else ''
-            if not isinstance(address,str) or len(address)>2000 or not isinstance(tax_id,str) or len(tax_id)>100:
-                raise BillingError('Billing address must be at most 2000 characters; tax number at most 100.')
-            conn.execute('INSERT INTO customer_billing_details VALUES (?,?,?) ON CONFLICT(customer_id) DO UPDATE SET billing_address=excluded.billing_address,tax_registration_number=excluded.tax_registration_number',(customer_id,address.strip(),tax_id.strip()))
-    return {'customer_id': customer_id, 'name': name, 'company': company, 'email': email, 'action': action}
+            different.append(key)
+    return {'item_code': row['item_code'], 'sku': row['sku'], 'name': row['name'],
+            'category': detail['category'] if detail else None,
+            'description': detail['description'] if detail else '', 'features': features, 'feature_units': units,
+            'unit_price': str(unit), 'quantity': quantity, 'merchandise_total': str(total),
+            'available_quantity': row['availablequantity'], 'enough_stock': row['availablequantity'] >= quantity,
+            'within_budget': budget is None or total <= budget,
+            'matched_features': matched, 'unknown_features': missing, 'different_features': different,
+            'ambiguous_features': [key for name, matches in keys.items() if name in ambiguous for key in matches]}
+
+
+def context(conn):
+    config = dict(conn.execute('SELECT key,value FROM billing_config'))
+    return pricing.utc_now(), config.get('currency', 'USD')
+
+
+def eligible(row):
+    return row['enough_stock'] and row['within_budget'] and not row['unknown_features'] and not row['different_features']
+
+
+NOTES = ['Prices use the current UTC timestamp and price history, falling back to sellingprice, as in order quoting.',
+         'Budget covers merchandise for the requested quantity, before promotions, tax and shipping. Request an order draft for the final total.',
+         'Conflicting equivalent feature keys remain unknown; verify their recorded values and units before recommending.',
+         'Missing features are unknown. Price and stock do not establish quality, compatibility or suitability. No inventory is reserved.']
 
 
 @tool_result
-def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict] | None = None,
-                 reason: str = '', confirmed: bool = False, credit_amount: str | None = None,
-                 address_id: str | None = None) -> dict:
-    """select_address stages an explicitly chosen saved address_id for an owned active draft.
-    It verifies address ownership/status itself; no prior lookup or separate approval is required for an exact ID.
-    Use it when checkout includes an address choice, then review the full quote/address for placement approval.
-    The sidebar is optional; selection does not place the order. Resolve ambiguous labels/drafts first.
-    After confirmation: replace_items edits drafts; cancel cancels drafts or whole unshipped issued orders.
-    apply_store_credit allocates credit_amount to an owned draft; report_billing_issue stores reason for review.
-    Authenticated admin only: ship/deliver update issued-order fulfillment status.
+def compare_products(
+    products: Annotated[list[Annotated[str, Field(min_length=1, max_length=200)]], Field(
+        min_length=2, max_length=5,
+        description='Two to five distinct catalog references, one string per product. Use an exact item code, SKU or unambiguous product name.')],
+    quantity: Annotated[int, Field(ge=1, le=100000, description='Number of units of each product to compare.')] = 1,
+    budget: Annotated[str | StrictInt | StrictFloat | None, Field(
+        description='Total merchandise budget for quantity, as a number or decimal text without a currency symbol.')] = None,
+    required_features: Annotated[dict[str, str | StrictBool | StrictInt | StrictFloat] | None, Field(
+        max_length=20, description='Recorded feature names mapped to required scalar values.')] = None,
+) -> dict:
+    """Compare 2-5 products by code/SKU/name, price, stock and recorded features.
 
-    items is the complete desired list of item_code and integer quantity. Issued invoice lines and totals are immutable.
-    Cancellation returns cancelled_from (draft or placed) and the retained invoice_number, if issued.
-    Only whole unshipped issued orders restore their fulfilled stock.
-    Set credit_amount to zero to clear a draft's store-credit allocation.
+    Use one string per product, e.g. {"products":["CODE-A","CODE-B"]}. Omit unused optional fields.
+    budget is the TOTAL merchandise budget for quantity. required_features maps recorded feature
+    names to desired values (e.g. {"connection":"wireless"}); key case/separators are ignored,
+    values and units are preserved, and missing or conflicting features stay unknown.
+    Suggests the lowest-priced available match, never an unsupported overall quality winner.
+    Ask what 'better' means for the customer. Product names can be ambiguous; ask instead of guessing.
     """
-    confirm(confirmed)
-    from mcp_server.access import scope
-    role=(scope.get() or {}).get('mode','customer')
-    if role=='admin' and action not in ('ship','deliver'): raise BillingError('Admin order access permits only confirmed shipment/delivery transitions.')
-    if action in ('ship','deliver') and role!='admin': raise BillingError('Only authenticated admin may update fulfillment status.')
-    with transaction() as conn:
-        order = order_row(conn, order_id, customer_id, allow_cancelled=action == 'cancel')
-        if order['order_status'] == 'cancelled':
-            issued = is_placed(conn, order)
-            return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled',
-                    'already_cancelled': True, 'cancelled_from': 'placed' if issued else 'draft',
-                    'invoice_number': order['order_invoice'] if issued else None}
-        if action == 'select_address':
-            from database.addresses import select_order_address_conn
-            if items is not None or credit_amount is not None or reason:
-                raise BillingError('Select the delivery address separately from basket, credit or cancellation changes.')
+    budget, requirements = options(quantity, budget, required_features)
+    if not isinstance(products, list) or not 2 <= len(products) <= 5:
+        raise BillingError('Compare between 2 and 5 products.')
+    with reading() as conn:
+        today, currency = context(conn)
+        rows = []
+        for index, reference in enumerate(products):
             try:
-                return select_order_address_conn(conn, order_id, customer_id, address_id)
-            except ValueError as exc:
-                raise BillingError(str(exc)) from exc
-        if action in ('ship','deliver'):
-            from mcp_server.tools.service_workflows import fulfillment_transition
-            return fulfillment_transition(conn,order,action)
-        if action in ('report_billing_issue','apply_store_credit'):
-            from mcp_server.tools.service_workflows import service_action
-            return service_action(conn,order,action,reason,credit_amount)
-        if is_placed(conn, order) and action=='cancel':
-            from mcp_server.tools.service_workflows import cancel_placed
-            return {**cancel_placed(conn,order,text(reason,'Cancellation reason')),
-                    'cancelled_from': 'placed', 'invoice_number': order['order_invoice']}
-        if is_placed(conn, order):
-            raise BillingError('Issued invoices cannot be edited. Review the supported refund workflow with store staff.')
-        # Unplaced draft cancellation records lifecycle/reason but does not restore stock that was never
-        # reserved.
-        if action == 'cancel':
-            reason = text(reason, 'Cancellation reason')
-            currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
-            conn.execute("INSERT INTO order_details(order_id,currency,status,cancellation_reason) VALUES (?,?,'cancelled',?) "
-                         "ON CONFLICT(order_id) DO UPDATE SET status='cancelled',cancellation_reason=excluded.cancellation_reason",
-                         (order_id, currency, reason))
-            conn.execute("UPDATE orders SET order_status='cancelled' WHERE order_id=?", (order_id,))
-            return {'order_id': order_id, 'status': 'cancelled', 'order_status': 'cancelled', 'reason': reason,
-                    'cancelled_from': 'draft', 'invoice_number': None}
-        if action != 'replace_items' or not isinstance(items, list) or not 1 <= len(items) <= 100:
-            raise BillingError('Use cancel or replace_items with 1-100 line items.')
-        quantities = {}
-        for line in items:
-            if not isinstance(line, dict):
-                raise BillingError('Each item must contain item_code and quantity.')
-            code = identifier(line.get('item_code'), 'item code')
-            qty = line.get('quantity')
-            if type(qty) is not int or not 1 <= qty <= 100000:
-                raise BillingError('Quantity must be an integer from 1 to 100000.')
-            quantities[code] = quantities.get(code, 0) + qty
-            if quantities[code] > 100000:
-                raise BillingError('Combined quantity exceeds 100000.')
-        subtotal = Decimal(0)
-        price_as_of = pricing.utc_now()
-        for code, qty in quantities.items():
-            item = conn.execute('SELECT * FROM items WHERE item_code=?', (code,)).fetchone()
-            if not item or item['availablequantity'] < qty:
-                raise BillingError(f'Item {code} is unavailable or has insufficient stock.')
-            subtotal += price_for(conn, item, price_as_of) * qty
-        values = totals(conn, subtotal, order['promo_code'])
-        conn.execute('DELETE FROM order_requests WHERE order_id=?', (order_id,))
-        conn.executemany('INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)',
-                         [(order_id, code, qty) for code, qty in quantities.items()])
-        credit = update_totals(conn, order_id, values)
-        conn.execute("INSERT INTO order_details(order_id,currency,price_as_of) VALUES (?,COALESCE("
-                     "(SELECT value FROM billing_config WHERE key='currency'),'USD'),?) "
-                     'ON CONFLICT(order_id) DO UPDATE SET price_as_of=excluded.price_as_of',
-                     (order_id, price_as_of))
-        return {'order_id': order_id, 'status': 'draft', 'order_status': 'draft',
-                'estimate': values, **credit}
+                item = resolve(conn, reference)
+            except BillingError as exc:
+                raise BillingError(f'products[{index}]: {exc}') from exc
+            rows.append(product(conn, item, today, quantity, budget, requirements))
+        if len({r['item_code'] for r in rows}) != len(rows):
+            raise BillingError('Choose distinct products to compare.')
+        matches = [r for r in rows if eligible(r)]
+        lowest = min((Decimal(r['unit_price']) for r in matches), default=None)
+        winners = [r['item_code'] for r in matches if Decimal(r['unit_price']) == lowest]
+        categories = {product_text(r['category']) for r in rows}
+        return {'currency': currency, 'as_of': today, 'products': rows,
+                'lowest_price_matching_items': winners,
+                'recommendation_basis': 'Lowest current price among in-stock products meeting budget and every recorded requirement; ties retained.',
+                'same_recorded_category': len(categories) == 1 and None not in categories,
+                'notes': NOTES + ['Different or missing categories require checking that the products serve the same purpose.']}
 
 
+def words(name):
+    return {word for word in product_text(name).split() if word.isalpha()} - {
+        'a', 'an', 'the', 'for', 'with', 'and', 'inch', 'cm', 'gb', 'tb', 'hd',
+        'black', 'white', 'red', 'blue', 'premium', 'basic', 'pro', 'model', 'variant', 'wireless', 'usb'}
+
+
+@tool_result
+def find_cheaper_alternatives(product_reference: str, quantity: int = 1, budget: str | None = None,
+                              required_features: dict | None = None, limit: int = 5) -> dict:
+    """Find cheaper in-stock alternatives within the same recorded category.
+
+    Without a source category, uses shared meaningful name words and labels matches tentative.
+    Never treats a cheaper unrelated item as equivalent. Required features must be recorded and
+    match; key case/separators are ignored, while values and units are preserved. Budget is total
+    merchandise cost for quantity, before tax/shipping/promotions.
+    """
+    budget, requirements = options(quantity, budget, required_features)
+    if type(limit) is not int or not 1 <= limit <= 10:
+        raise BillingError('Limit must be from 1 to 10.')
+    with reading() as conn:
+        today, currency = context(conn)
+        source = product(conn, resolve(conn, product_reference), today, quantity, budget, requirements)
+        if source['category']:
+            candidates = conn.execute('SELECT i.* FROM items i JOIN product_details d ON d.item_code=i.item_code '
+                'WHERE product_text(d.category)=product_text(?) AND i.item_code<>? AND i.availablequantity>=?',
+                (source['category'], source['item_code'], quantity)).fetchall()
+        else:
+            candidates = conn.execute('SELECT * FROM items WHERE item_code<>? AND availablequantity>=?',
+                                      (source['item_code'], quantity)).fetchall()
+        choices, unavailable_prices = [], []
+        for row in candidates:
+            if not source['category'] and not words(source['name']).intersection(words(row['name'])):
+                continue
+            try:
+                candidate = product(conn, row, today, quantity, budget, requirements)
+            except BillingError:
+                unavailable_prices.append(row['item_code'])
+                continue
+            if not eligible(candidate) or Decimal(candidate['unit_price']) >= Decimal(source['unit_price']):
+                continue
+            candidate['savings_for_quantity'] = str(money(Decimal(source['merchandise_total']) - Decimal(candidate['merchandise_total'])))
+            candidate['match_basis'] = 'recorded_category' if source['category'] else 'shared_name_words_only'
+            choices.append(candidate)
+        choices.sort(key=lambda r: (Decimal(r['unit_price']), r['item_code']))
+        return {'currency': currency, 'as_of': today, 'source': source, 'alternatives': choices[:limit],
+                'matched_count': len(choices), 'truncated': len(choices) > limit,
+                'items_with_unusable_prices': unavailable_prices,
+                'notes': NOTES + ['Name-based matches are possible alternatives only; verify purpose and compatibility before recommending.',
+                                 'No matches means no qualifying cheaper option was found; do not invent alternatives.']}
