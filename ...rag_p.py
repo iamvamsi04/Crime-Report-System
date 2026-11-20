@@ -1,298 +1,168 @@
-# This module validates executed result shapes and evidence; it never routes a request by matching human
-# wording.
-"""Validate and present executed report results without classifying user wording.
+"""Validated complete report datasets for downloads, outside model history."""
 
-The model chooses the relevant tools and presentation from the conversation.
-These helpers operate only on structured tool arguments and verified results;
-they never turn a word in the user's message into a tool call or dashboard.
-"""
-from dataclasses import dataclass
-from datetime import date
+import csv
+import hashlib
+import io
+import json
 import re
+from collections.abc import Mapping
+from typing import Literal, get_args
 
-from context.reports import validate_overview_sections
+from context.tables import MAX_COLUMNS, _cell, _encoded, _label
 
-READ_TOOLS = frozenset({'execute_sql_query', 'billing_analysis', 'billing_anomalies',
-                        'compare_products', 'find_cheaper_alternatives'})
-FILTER_KEYS = ('customer_id', 'order_id', 'date_from', 'date_to')
-CATEGORY_EXPRESSION = "COALESCE(NULLIF(TRIM(d.category),''),'Uncategorised')"
-INVENTORY_QUERY = (f'SELECT {CATEGORY_EXPRESSION} AS category, COUNT(*) AS products, '
-    'SUM(CASE WHEN i.availablequantity>0 THEN 1 ELSE 0 END) AS in_stock_products '
-    'FROM items i LEFT JOIN product_details d ON d.item_code=i.item_code '
-    f'GROUP BY {CATEGORY_EXPRESSION} ORDER BY category')
+MAX_DATASETS = 16
+MAX_REPORT_ROWS = 10_000
+MAX_REPORT_BYTES = 8_000_000
 
-
-@dataclass(frozen=True)
-class ResponseContract:
-    """The shape of an executed result, not an interpretation of a question."""
-    kind: str = 'conversation'
-    scoped: bool = False
-    domains: frozenset[str] = frozenset()
-    filter_items: tuple[tuple[str, str], ...] = ()
-    chart_mode: str = 'overview'
-    sections: tuple[str, ...] = ()
-
-    @property
-    def needs_evidence(self):
-        return self.kind != 'conversation'
-
-    @property
-    def report(self):
-        return self.kind in ('inventory_overview', 'store_overview')
-
-    @property
-    def tool(self):
-        return {'inventory_overview': 'execute_sql_query', 'store_overview': 'billing_analysis'}.get(self.kind)
-
-    @property
-    def expected_filters(self):
-        return {key: dict(self.filter_items).get(key) for key in FILTER_KEYS}
-
-    def prompt(self):
-        # Retained for callers using older policy builders. An observed report
-        # must never become instructions to execute a different request.
-        return ''
+OverviewSection = Literal[
+    'invoice_totals', 'order_status', 'monthly_sales', 'category_sales',
+    'product_sales', 'customer_sales', 'inventory', 'inventory_categories',
+    'order_observations', 'refund_requests', 'refund_status', 'refund_approvals',
+    'recorded_refunds', 'store_credit_activity', 'cancelled_invoice_totals',
+    'invoice_line_observations',
+]
+OVERVIEW_SECTIONS = frozenset(get_args(OverviewSection))
 
 
-# Legacy compatibility helpers.
-# def request_contract(*args, **kwargs):
-#     return ResponseContract()
-#
-# def chart_intent(*args, **kwargs):
-#     return None
-#
-# def table_intent(*args, **kwargs):
-#     return False
-#
-# def general_explanation(*args, **kwargs):
-#     return True
+def validate_overview_sections(sections):
+    if not isinstance(sections, list) or not sections:
+        raise ValueError('Select one or more store overview sections.')
+    if any(not isinstance(name, str) or name not in OVERVIEW_SECTIONS for name in sections):
+        raise ValueError('Unknown store overview section.')
+    if len(set(sections)) != len(sections):
+        raise ValueError('Store overview sections must be unique.')
+    return list(sections)
 
 
-def result_contract(name, arguments, data):
-    """Recognize complete report shapes from the exact read that actually ran.
-
-    This can be used to format trustworthy report summaries locally. It grants
-    no authority to dispatch tools, expand scope, force chart modes, or replace
-    a model's interpretation of the user's current request.
-    """
-    if not isinstance(arguments, dict) or not isinstance(data, dict) or data.get('ok') is not True:
-        return ResponseContract()
-    if name == 'execute_sql_query' and inventory_rows(arguments, data) is not None:
-        return ResponseContract('inventory_overview', domains=frozenset({'products'}))
-    if name != 'billing_analysis' or data.get('report') != 'store_overview':
-        return ResponseContract()
-    if arguments.get('report') != 'store_overview':
-        return ResponseContract()
-    coverage = data.get('coverage')
-    filters = data.get('filters')
-    mode = data.get('chart_mode')
-    summary = data.get('summary')
-    if (not isinstance(coverage, dict) or coverage.get('complete') is not True
-            or not isinstance(filters, dict) or set(filters) != set(FILTER_KEYS)
-            or mode not in ('overview', 'dashboard', 'all', 'none')
-            or mode != arguments.get('chart_mode', 'overview')
-            or not isinstance(summary, dict)):
-        return ResponseContract()
-    sections = ()
-    if arguments.get('sections') is not None:
-        try:
-            selected = validate_overview_sections(arguments['sections'])
-        except ValueError:
-            return ResponseContract()
-        datasets = data.get('datasets')
-        if (mode != 'none' or coverage.get('sections') != selected or not isinstance(datasets, list)
-                or len(datasets) != len(selected)
-                or [source.get('name') for source in datasets if isinstance(source, dict)] != selected):
-            return ResponseContract()
-        sections = tuple(selected)
-    elif 'sections' in coverage:
-        return ResponseContract()
-    for key in ('matched_orders','invoice_count','draft_count','cancelled_count'):
-        if type(summary.get(key)) is not int or summary[key] < 0:
-            return ResponseContract()
-    for key, value in filters.items():
-        if value != arguments.get(key):
-            return ResponseContract()
-        if value is None:
-            continue
-        if not isinstance(value, str):
-            return ResponseContract()
-        if key.startswith('date_'):
-            try:
-                if date.fromisoformat(value).isoformat() != value:
-                    return ResponseContract()
-            except ValueError:
-                return ResponseContract()
-        elif not re.fullmatch(r'[A-Za-z0-9_-]{1,50}', value):
-            return ResponseContract()
-    if (filters['date_from'] or '') > (filters['date_to'] or '9999-12-31'):
-        return ResponseContract()
-    values = tuple((key, filters[key]) for key in FILTER_KEYS if filters[key] is not None)
-    return ResponseContract('store_overview', bool(values or sections), frozenset({'finance'}), values, mode, sections)
+def _metadata(value, depth=0, budget=None):
+    if budget is None:
+        budget = [0]
+    budget[0] += 1
+    if depth > 4 or budget[0] > 2048:
+        raise ValueError('Report metadata is too deeply nested.')
+    if isinstance(value, Mapping):
+        if len(value) > 64:
+            raise ValueError('Too much report metadata.')
+        return {_label(key, 100, 'metadata field'): _metadata(item, depth + 1, budget)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        if len(value) > 1024:
+            raise ValueError('Too much report metadata.')
+        return [_metadata(item, depth + 1, budget) for item in value]
+    return _cell(value)
 
 
-def sql_text(query):
-    """Remove data literals/comments before reading referenced SQL table names."""
-    return re.sub(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'", ' ', str(query)).casefold()
-
-
-def _inventory_recipe(query, columns):
-    # Prove a small family of equivalent one-row-per-item queries. Arbitrary
-    # joins or CTEs cannot establish complete inventory from aliases alone.
-    tokens = re.findall(r"'(?:''|[^'])*'|--[^\n]*|/\*[\s\S]*?\*/|[^']+?", str(query))
-    clean = ''.join(token for token in tokens if not token.startswith(('--', '/*')))
-    clean = re.sub(r'\s+', '', clean).casefold().rstrip(';')
-    clean = re.sub(r'["`\[\]]', '', clean)
-    expression = r"coalesce\((?:nullif\((?:trim\(d\.category\)|d\.category),''\)|d\.category),'uncategorised'\)"
-    count = r'count\((?:\*|distincti\.item_code)\)'
-    projection = (rf'{count}asproduct_count' if columns == ['category', 'product_count'] else
-        rf'{count}asproducts,sum\(casewheni\.availablequantity>0then1else0end\)asin_stock_products')
-    pattern = (rf'select{expression}ascategory,{projection}'
-        r'fromitems(?:as)?ileft(?:outer)?joinproduct_details(?:as)?dond\.item_code=i\.item_code'
-        rf'groupby(?:category|{expression})orderbycategory(?:asc)?')
-    # Only a full SQL syntax match establishes complete inventory coverage; user wording is never inspected.
-    return re.fullmatch(pattern, clean) is not None
-
-
-def category_rows(data):
-    """Validate displayed category rows independently of full-inventory coverage."""
-    if (not isinstance(data, dict) or data.get('ok') is not True
-            or type(data.get('truncated', False)) is not bool):
-        return None
-    columns = data.get('columns')
-    if (columns not in (['category', 'product_count'], ['category', 'products', 'in_stock_products'])
-            or not isinstance(data.get('rows'), list)):
-        return None
-    result, seen = [], set()
-    for row in data['rows']:
-        if not isinstance(row, list) or len(row) != len(columns):
-            return None
-        category, count = row[:2]
-        if (not isinstance(category, str) or not category.strip()
-                or len(category) > 2000 or category in seen):
-            return None
-        if type(count) is not int or count < 0:
-            return None
-        if len(row) == 3 and (type(row[2]) is not int or not 0 <= row[2] <= count):
-            return None
-        seen.add(category)
-        result.append(list(row))
+def report_artifact(title, datasets, *, coverage=None, notes=None):
+    """Keep complete, bounded scalar datasets returned by a trusted report tool."""
+    if not isinstance(datasets, (list, tuple)) or not 1 <= len(datasets) <= MAX_DATASETS:
+        raise ValueError('Invalid report datasets.')
+    result = {'title': _label(title, 160, 'report title'), 'datasets': []}
+    if coverage is not None:
+        result['coverage'] = _metadata(coverage)
+    if notes is not None:
+        if not isinstance(notes, (list, tuple)) or len(notes) > 30:
+            raise ValueError('Invalid report notes.')
+        result['notes'] = [_label(note, 1000, 'report note') for note in notes]
+    names, size = set(), len(_encoded(result))
+    for value in datasets:
+        if not isinstance(value, Mapping):
+            raise ValueError('Invalid report dataset.')
+        name = value.get('name')
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', name) or name in names:
+            raise ValueError('Report datasets need unique names.')
+        names.add(name)
+        columns = value.get('columns')
+        if not isinstance(columns, (list, tuple)) or not 1 <= len(columns) <= MAX_COLUMNS:
+            raise ValueError('Invalid report columns.')
+        columns = [_label(column, 100, 'report column') for column in columns]
+        if len(set(columns)) != len(columns):
+            raise ValueError('Report columns must be unique.')
+        source = value.get('rows')
+        if not isinstance(source, (list, tuple)) or len(source) > MAX_REPORT_ROWS:
+            raise ValueError('Report dataset exceeds the row limit.')
+        total = value.get('total_rows', len(source))
+        if type(total) is not int or not len(source) <= total <= 1_000_000_000:
+            raise ValueError('Invalid report total row count.')
+        truncated = value.get('truncated', False)
+        if type(truncated) is not bool:
+            raise ValueError('Invalid report truncation flag.')
+        dataset = {'name': name, 'title': _label(value.get('title'), 160, 'report dataset title'),
+                   'columns': columns, 'rows': [], 'row_count': len(source),
+                   'total_rows': total, 'truncated': truncated or total > len(source)}
+        for field in ('scope', 'grain'):
+            if value.get(field) is not None:
+                dataset[field] = _label(value[field], 1000, 'report ' + field)
+        for row in source:
+            if isinstance(row, Mapping) and set(row) == set(columns):
+                clean = {column: _cell(row[column]) for column in columns}
+            elif isinstance(row, (list, tuple)) and len(row) == len(columns):
+                clean = {column: _cell(cell) for column, cell in zip(columns, row)}
+            else:
+                raise ValueError('Report row columns do not match.')
+            size += len(_encoded(clean))
+            if size > MAX_REPORT_BYTES:
+                raise ValueError('Report exceeds the download size limit.')
+            dataset['rows'].append(clean)
+        size += len(_encoded({key: val for key, val in dataset.items() if key != 'rows'}))
+        result['datasets'].append(dataset)
+    if any(dataset['truncated'] for dataset in result['datasets']) and isinstance(result.get('coverage'), dict):
+        result['coverage'].update(complete=False, truncated=True)
+    if len(_encoded(result)) > MAX_REPORT_BYTES:
+        raise ValueError('Report exceeds the download size limit.')
     return result
 
 
-def inventory_rows(arguments, data):
-    if data.get('truncated') or not _inventory_recipe(arguments.get('query', ''), data.get('columns')):
-        return None
-    result = category_rows(data)
-    if result is None:
-        return None
-    return sorted(result, key=lambda row: row[0].casefold())
+def sanitize_reports(reports, *, strict=False):
+    """Preserve distinct complete artifacts within one shared download budget.
+
+    Trusted assembly uses strict mode to report attachment failures to the model.
+    Saved/untrusted collections may skip malformed entries, but an oversized
+    collection is rejected as a whole rather than silently losing valid reports.
+    """
+    if not isinstance(reports, (list, tuple)):
+        if strict:
+            raise ValueError('Invalid report attachments.')
+        return []
+    result, seen, size = [], set(), 2
+    for report in reports:
+        try:
+            if not isinstance(report, Mapping):
+                raise ValueError('Invalid report attachment.')
+            prepared = report_artifact(report.get('title'), report.get('datasets'),
+                                       coverage=report.get('coverage'), notes=report.get('notes'))
+        except (TypeError, ValueError, OverflowError):
+            if strict:
+                raise
+            continue
+        encoded = json.dumps(prepared, ensure_ascii=False, allow_nan=False,
+                             sort_keys=True, separators=(',', ':')).encode('utf-8')
+        identity = hashlib.sha256(encoded).digest()
+        if identity in seen:
+            continue
+        size += len(encoded) + bool(result)
+        if size > MAX_REPORT_BYTES:
+            if strict:
+                raise ValueError('The combined report attachments exceed the download size limit. '
+                                 'Narrow the report scopes before retrying.')
+            return []
+        result.append(prepared)
+        seen.add(identity)
+    return result
 
 
-def _receipt_domains(name, arguments, data):
-    if not data.get('ok'):
-        return frozenset()
-    if name == 'billing_analysis':
-        report = data.get('report')
-        if report == 'store_overview':
-            return frozenset({'finance', 'orders', 'invoices', 'refunds', 'refund_requests', 'customers', 'products'})
-        if report in ('pending_refunds', 'pending_above_threshold'):
-            return frozenset({'orders', 'refunds', 'refund_requests'})
-        if report == 'refund_reconciliation':
-            return frozenset({'refunds'})
-        return frozenset({'finance', 'orders', 'invoices', 'refunds'})
-    if name == 'billing_anomalies':
-        return frozenset({'anomalies'})
-    if name in ('compare_products', 'find_cheaper_alternatives'):
-        return frozenset({'products'})
-    if name != 'execute_sql_query':
-        return frozenset()
-    query = sql_text(arguments.get('query', ''))
-    if re.match(r'\s*pragma\b', query):
-        return frozenset()
-    tables = set(re.findall(r'\b(?:from|join)\s+["`\[]?(?:main\.)?([a-z_][a-z_0-9]*)', query))
-    owners = {
-        'products': {'items','product_details','product_attributes','product_relations','price_history'},
-        'orders': {'orders','order_details','order_service','order_requests','order_fulfilled'},
-        'invoices': {'orders','invoice_lines','invoice_revisions'},
-        'refunds': {'refund_requests','refund_details'},
-        'refund_requests': {'refund_requests'},
-        'finance': {'orders','invoice_lines'},
-        'customers': {'customers','customer_billing_details'},
-        'credit': {'store_credit_ledger'}, 'anomalies': {'billing_audit'},
-    }
-    result = {domain for domain, sources in owners.items() if sources & tables}
-    refund_fields = {'refund_amount', 'refund_status', 'refund_reason'}
-    columns = data.get('columns', [])
-    if 'orders' in tables and (re.search(r'\brefund_(?:amount|status|reason)\b', query) or
-            isinstance(columns, list) and any(isinstance(column, str) and column.casefold() in refund_fields for column in columns)):
-        result.add('refunds')
-    business_tables = set().union(*owners.values(), {'billing_config', 'promotions'})
-    if business_tables & tables:
-        result.add('records')
-    return frozenset(result)
-
-
-def evidence_for(contract, name, arguments, data):
-    if not data.get('ok'):
-        return False
-    if contract.kind == 'inventory_overview':
-        return name == 'execute_sql_query' and inventory_rows(arguments, data) is not None
-    if contract.kind == 'store_overview':
-        if contract.sections:
-            return result_contract(name, arguments, data) == contract
-        actual = data.get('filters', {})
-        return (name == 'billing_analysis' and data.get('report') == 'store_overview'
-                and data.get('coverage', {}).get('complete') is True
-                and 'sections' not in data.get('coverage', {}) and isinstance(actual, dict)
-                and {key: actual.get(key) for key in FILTER_KEYS} == contract.expected_filters
-                and not any(value for key, value in actual.items() if key not in FILTER_KEYS)
-                and data.get('chart_mode', 'overview') == contract.chart_mode)
-    observed = _receipt_domains(name, arguments, data)
-    return bool(observed & contract.domains) if contract.domains else bool(observed)
-
-
-def evidence_satisfied(contract, receipts):
-    if contract.kind != 'data':
-        return any(evidence_for(contract, *receipt) for receipt in receipts)
-    observed = frozenset().union(*(_receipt_domains(*receipt) for receipt in receipts))
-    return contract.domains <= observed if contract.domains else bool(observed)
-
-
-def report_reply(contract, receipt):
-    """Stable presentation of verified reports; never reuse model-made numbers."""
-    name, arguments, data = receipt
-    if contract.kind == 'inventory_overview':
-        rows = inventory_rows(arguments, data)
-        total = sum(row[1] for row in rows)
-        if not rows:
-            return 'There are no products in the store. The category table is empty.'
-        stock = ''
-        if data['columns'] == ['category', 'products', 'in_stock_products']:
-            available = sum(row[2] for row in rows)
-            stock = f'{available} product' + ('s are' if available != 1 else ' is') + ' currently in stock. '
-        return (f'The store has {total} product' + ('s' if total != 1 else '')
-                + f' across {len(rows)} categor' + ('ies' if len(rows) != 1 else 'y') + '. '
-                + stock + 'The table lists every category. Product counts refer to distinct products, not stock units.')
-    if contract.sections:
-        names = ', '.join(source['title'] for source in data['datasets'])
-        return f'The report includes {names}. The selected datasets are available in the report.'
-    summary = data['summary']
-    reply = (f"The report covers {summary['matched_orders']} orders: {summary['invoice_count']} active issued invoices, "
-            f"{summary['draft_count']} drafts and {summary['cancelled_count']} cancelled orders. "
-            'It includes invoice totals, monthly sales, product and category sales, '
-            'customer summaries, inventory and refund activity. Monetary totals are separated by currency. '
-            'The tables show current results; complete datasets are available with the report. '
-            'Product revenue is before order-level discounts, tax, shipping and refunds. '
-            'Inventory is a current full-store snapshot.').strip()
-    if contract.chart_mode in ('dashboard', 'all'):
-        delivery = data.get('chart_delivery', {})
-        count = delivery.get('attached_this_call', 0)
-        reply += (f' {count} charts are attached.' if count else ' No charts could be generated from the matching data.')
-        omissions = data.get('coverage', {}).get('chart_omissions', [])
-        reasons = list(dict.fromkeys(f"{item.get('type', 'view')}: {item['reason']}" for item in omissions
-                                    if isinstance(item, dict) and item.get('reason')))
-        errors = delivery.get('errors', [])
-        if reasons or errors:
-            reply += ' Unavailable views: ' + '; '.join(dict.fromkeys([*reasons, *errors])) + '.'
-    return reply
+# Produce Excel-friendly UTF-8 CSV and escape text that could otherwise execute a spreadsheet formula.
+def csv_bytes(dataset):
+    """Excel-friendly UTF-8 CSV; text values cannot execute spreadsheet formulas."""
+    # Keep decimal money numeric while quoting nonnumeric spreadsheet formula prefixes.
+    def safe(value):
+        # Exact decimal strings are how billing tools carry money. Keep negative
+        # adjustments numeric in spreadsheets without permitting expressions.
+        decimal = isinstance(value, str) and re.fullmatch(r'[+-]?\d+(?:\.\d+)?', value)
+        if isinstance(value, str) and not decimal and value.lstrip(' \t\r\n').startswith(('=', '+', '-', '@')):
+            return "'" + value
+        return value
+    target = io.StringIO(newline='')
+    writer = csv.writer(target)
+    writer.writerow([safe(column) for column in dataset['columns']])
+    writer.writerows([[safe(row[column]) for column in dataset['columns']] for row in dataset['rows']])
+    return target.getvalue().encode('utf-8-sig')
