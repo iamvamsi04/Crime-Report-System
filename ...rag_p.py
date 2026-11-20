@@ -1,168 +1,395 @@
-"""Validated complete report datasets for downloads, outside model history."""
-
-import csv
-import hashlib
-import io
 import json
+import math
 import re
-from collections.abc import Mapping
-from typing import Literal, get_args
-
-from context.tables import MAX_COLUMNS, _cell, _encoded, _label
-
-MAX_DATASETS = 16
-MAX_REPORT_ROWS = 10_000
-MAX_REPORT_BYTES = 8_000_000
-
-OverviewSection = Literal[
-    'invoice_totals', 'order_status', 'monthly_sales', 'category_sales',
-    'product_sales', 'customer_sales', 'inventory', 'inventory_categories',
-    'order_observations', 'refund_requests', 'refund_status', 'refund_approvals',
-    'recorded_refunds', 'store_credit_activity', 'cancelled_invoice_totals',
-    'invoice_line_observations',
-]
-OVERVIEW_SECTIONS = frozenset(get_args(OverviewSection))
+import sqlite3
+from datetime import date
+from contextlib import contextmanager
+from uuid import uuid4
+from config import settings
+from context.tables import sanitize_tables
+from context.reports import sanitize_reports, validate_overview_sections
 
 
-def validate_overview_sections(sections):
-    if not isinstance(sections, list) or not sections:
-        raise ValueError('Select one or more store overview sections.')
-    if any(not isinstance(name, str) or name not in OVERVIEW_SECTIONS for name in sections):
-        raise ValueError('Unknown store overview section.')
-    if len(set(sections)) != len(sections):
-        raise ValueError('Store overview sections must be unique.')
-    return list(sections)
+@contextmanager
+def connection():
+    conn = sqlite3.connect(settings.CONTEXT_DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def _metadata(value, depth=0, budget=None):
-    if budget is None:
-        budget = [0]
-    budget[0] += 1
-    if depth > 4 or budget[0] > 2048:
-        raise ValueError('Report metadata is too deeply nested.')
-    if isinstance(value, Mapping):
-        if len(value) > 64:
-            raise ValueError('Too much report metadata.')
-        return {_label(key, 100, 'metadata field'): _metadata(item, depth + 1, budget)
-                for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        if len(value) > 1024:
-            raise ValueError('Too much report metadata.')
-        return [_metadata(item, depth + 1, budget) for item in value]
-    return _cell(value)
+def initialize():
+    settings.CONTEXT_DB.parent.mkdir(parents=True, exist_ok=True)
+    with connection() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            conversation_id TEXT PRIMARY KEY, customer_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+            request_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'done', response_json TEXT,
+            may_have_changed INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(conversation_id,request_id,role));
+        CREATE INDEX IF NOT EXISTS ix_messages_conversation ON messages(conversation_id,id);
+        CREATE TABLE IF NOT EXISTS shopping_states (
+            conversation_id TEXT PRIMARY KEY REFERENCES conversations(conversation_id),
+            state_json TEXT NOT NULL CHECK(json_valid(state_json)),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        """)
+        columns = {r['name'] for r in conn.execute('PRAGMA table_info(conversations)')}
+        if 'mode' not in columns:
+            # Older transcripts may contain store-wide data; require admin to resume them.
+            conn.execute("ALTER TABLE conversations ADD COLUMN mode TEXT NOT NULL DEFAULT 'admin'")
+        columns = {r['name'] for r in conn.execute('PRAGMA table_info(messages)')}
+        if 'may_have_changed' not in columns:
+            # Existing failures have no dispatch evidence and cannot be replayed.
+            conn.execute("ALTER TABLE messages ADD COLUMN may_have_changed INTEGER NOT NULL DEFAULT 1")
 
 
-def report_artifact(title, datasets, *, coverage=None, notes=None):
-    """Keep complete, bounded scalar datasets returned by a trusted report tool."""
-    if not isinstance(datasets, (list, tuple)) or not 1 <= len(datasets) <= MAX_DATASETS:
-        raise ValueError('Invalid report datasets.')
-    result = {'title': _label(title, 160, 'report title'), 'datasets': []}
-    if coverage is not None:
-        result['coverage'] = _metadata(coverage)
-    if notes is not None:
-        if not isinstance(notes, (list, tuple)) or len(notes) > 30:
-            raise ValueError('Invalid report notes.')
-        result['notes'] = [_label(note, 1000, 'report note') for note in notes]
-    names, size = set(), len(_encoded(result))
-    for value in datasets:
-        if not isinstance(value, Mapping):
-            raise ValueError('Invalid report dataset.')
-        name = value.get('name')
-        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', name) or name in names:
-            raise ValueError('Report datasets need unique names.')
-        names.add(name)
-        columns = value.get('columns')
-        if not isinstance(columns, (list, tuple)) or not 1 <= len(columns) <= MAX_COLUMNS:
-            raise ValueError('Invalid report columns.')
-        columns = [_label(column, 100, 'report column') for column in columns]
-        if len(set(columns)) != len(columns):
-            raise ValueError('Report columns must be unique.')
-        source = value.get('rows')
-        if not isinstance(source, (list, tuple)) or len(source) > MAX_REPORT_ROWS:
-            raise ValueError('Report dataset exceeds the row limit.')
-        total = value.get('total_rows', len(source))
-        if type(total) is not int or not len(source) <= total <= 1_000_000_000:
-            raise ValueError('Invalid report total row count.')
-        truncated = value.get('truncated', False)
-        if type(truncated) is not bool:
-            raise ValueError('Invalid report truncation flag.')
-        dataset = {'name': name, 'title': _label(value.get('title'), 160, 'report dataset title'),
-                   'columns': columns, 'rows': [], 'row_count': len(source),
-                   'total_rows': total, 'truncated': truncated or total > len(source)}
-        for field in ('scope', 'grain'):
-            if value.get(field) is not None:
-                dataset[field] = _label(value[field], 1000, 'report ' + field)
-        for row in source:
-            if isinstance(row, Mapping) and set(row) == set(columns):
-                clean = {column: _cell(row[column]) for column in columns}
-            elif isinstance(row, (list, tuple)) and len(row) == len(columns):
-                clean = {column: _cell(cell) for column, cell in zip(columns, row)}
-            else:
-                raise ValueError('Report row columns do not match.')
-            size += len(_encoded(clean))
-            if size > MAX_REPORT_BYTES:
-                raise ValueError('Report exceeds the download size limit.')
-            dataset['rows'].append(clean)
-        size += len(_encoded({key: val for key, val in dataset.items() if key != 'rows'}))
-        result['datasets'].append(dataset)
-    if any(dataset['truncated'] for dataset in result['datasets']) and isinstance(result.get('coverage'), dict):
-        result['coverage'].update(complete=False, truncated=True)
-    if len(_encoded(result)) > MAX_REPORT_BYTES:
-        raise ValueError('Report exceeds the download size limit.')
-    return result
+def conversation(conversation_id=None, customer_id=None, mode='customer'):
+    with connection() as conn:
+        if conversation_id:
+            row = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+            if not row:
+                raise ValueError("Conversation not found.")
+            if customer_id != row["customer_id"]:
+                raise ValueError("Customer association cannot change. Start a new conversation.")
+            return conversation_id
+        conversation_id = str(uuid4())
+        conn.execute("INSERT INTO conversations(conversation_id,customer_id,mode) VALUES (?,?,?)", (conversation_id, customer_id, mode))
+        return conversation_id
 
 
-def sanitize_reports(reports, *, strict=False):
-    """Preserve distinct complete artifacts within one shared download budget.
+def get_conversation(conversation_id):
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+        return dict(row) if row else None
 
-    Trusted assembly uses strict mode to report attachment failures to the model.
-    Saved/untrusted collections may skip malformed entries, but an oversized
-    collection is rejected as a whole rather than silently losing valid reports.
+
+def _analytics_filter(key, value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError('Invalid analytics scope.')
+    if key in ('date_from', 'date_to'):
+        if date.fromisoformat(value).isoformat() != value:
+            raise ValueError('Invalid analytics date.')
+    elif not re.fullmatch(r'[A-Za-z0-9_-]{1,50}', value):
+        raise ValueError('Invalid analytics account or order.')
+    return value
+
+
+def sanitize_analytics_context(value):
+    """Keep read recipes, never saved business values or a claimed permission.
+
+    These recipes are only conversation context. A follow-up must execute a new
+    authorized read before presenting figures or charts.
     """
-    if not isinstance(reports, (list, tuple)):
-        if strict:
-            raise ValueError('Invalid report attachments.')
-        return []
-    result, seen, size = [], set(), 2
-    for report in reports:
-        try:
-            if not isinstance(report, Mapping):
-                raise ValueError('Invalid report attachment.')
-            prepared = report_artifact(report.get('title'), report.get('datasets'),
-                                       coverage=report.get('coverage'), notes=report.get('notes'))
-        except (TypeError, ValueError, OverflowError):
-            if strict:
-                raise
-            continue
-        encoded = json.dumps(prepared, ensure_ascii=False, allow_nan=False,
-                             sort_keys=True, separators=(',', ':')).encode('utf-8')
-        identity = hashlib.sha256(encoded).digest()
-        if identity in seen:
-            continue
-        size += len(encoded) + bool(result)
-        if size > MAX_REPORT_BYTES:
-            if strict:
-                raise ValueError('The combined report attachments exceed the download size limit. '
-                                 'Narrow the report scopes before retrying.')
-            return []
-        result.append(prepared)
-        seen.add(identity)
-    return result
+    filters = ('customer_id', 'order_id', 'date_from', 'date_to')
+    if not isinstance(value, dict):
+        return None
+    try:
+        if len(json.dumps(value).encode('utf-8')) > 250_000:
+            return None
+        kind = value.get('kind')
+        if kind == 'store_overview':
+            if set(value) - {'kind', 'filters', 'chart_mode', 'sections'}:
+                return None
+            raw = value.get('filters')
+            if not isinstance(raw, dict) or set(raw) != set(filters):
+                return None
+            result = {'kind': kind, 'filters': {key: _analytics_filter(key, raw[key]) for key in filters}}
+            if value.get('chart_mode') not in (None, 'overview', 'dashboard', 'all', 'none'):
+                return None
+            if value.get('chart_mode') is not None:
+                result['chart_mode'] = value['chart_mode']
+            if 'sections' in value:
+                if result.get('chart_mode') != 'none':
+                    return None
+                result['sections'] = validate_overview_sections(value['sections'])
+            selected = result['filters']
+        elif kind in ('invoice_trend', 'billing_analysis'):
+            if set(value) != {'kind', 'arguments'} or not isinstance(value.get('arguments'), dict):
+                return None
+            arguments = value['arguments']
+            allowed = set(filters) | {'report', 'top_n', 'trend_period', 'trend_metric', 'chart_type', 'chart_mode'}
+            if set(arguments) - allowed:
+                return None
+            clean = {}
+            for key, item in arguments.items():
+                if key in filters:
+                    clean[key] = _analytics_filter(key, item)
+                elif key == 'top_n':
+                    if type(item) is not int or not 1 <= item <= 100:
+                        return None
+                    clean[key] = item
+                elif item is None or isinstance(item, str) and 0 < len(item) <= 100:
+                    clean[key] = item
+                else:
+                    return None
+            if clean.get('chart_mode') not in (None, 'overview', 'dashboard', 'all', 'none'):
+                return None
+            result = {'kind': kind, 'arguments': clean}
+            selected = clean
+        elif kind == 'sql':
+            if set(value) != {'kind', 'sources'} or not isinstance(value.get('sources'), list) or not value['sources']:
+                return None
+            sources = []
+            for source in value['sources']:
+                if not isinstance(source, dict) or set(source) != {'query', 'parameters', 'columns'}:
+                    return None
+                query, parameters, columns = (source[key] for key in ('query', 'parameters', 'columns'))
+                if not isinstance(query, str) or not query.strip() or len(query) > 20_000:
+                    return None
+                if not isinstance(parameters, list) or len(parameters) > 1000:
+                    return None
+                if any(item is not None and (not isinstance(item, (str, int, float))
+                       or isinstance(item, float) and not math.isfinite(item)) for item in parameters):
+                    return None
+                if not isinstance(columns, list) or not 1 <= len(columns) <= 100 or any(
+                        not isinstance(column, str) or not column or len(column) > 100 for column in columns):
+                    return None
+                if len(set(columns)) != len(columns):
+                    return None
+                sources.append({'query': query, 'parameters': parameters, 'columns': columns})
+            return {'kind': kind, 'sources': sources}
+        else:
+            return None
+        if (selected.get('date_from') or '') > (selected.get('date_to') or '9999-12-31'):
+            return None
+        return result
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
-# Produce Excel-friendly UTF-8 CSV and escape text that could otherwise execute a spreadsheet formula.
-def csv_bytes(dataset):
-    """Excel-friendly UTF-8 CSV; text values cannot execute spreadsheet formulas."""
-    # Keep decimal money numeric while quoting nonnumeric spreadsheet formula prefixes.
-    def safe(value):
-        # Exact decimal strings are how billing tools carry money. Keep negative
-        # adjustments numeric in spreadsheets without permitting expressions.
-        decimal = isinstance(value, str) and re.fullmatch(r'[+-]?\d+(?:\.\d+)?', value)
-        if isinstance(value, str) and not decimal and value.lstrip(' \t\r\n').startswith(('=', '+', '-', '@')):
-            return "'" + value
-        return value
-    target = io.StringIO(newline='')
-    writer = csv.writer(target)
-    writer.writerow([safe(column) for column in dataset['columns']])
-    writer.writerows([[safe(row[column]) for column in dataset['columns']] for row in dataset['rows']])
-    return target.getvalue().encode('utf-8-sig')
+def latest_analytics_context(conversation_id):
+    """Read the latest completed admin reply's recipe, within this chat only."""
+    with connection() as conn:
+        row = conn.execute('''SELECT m.response_json FROM messages m
+            JOIN conversations c ON c.conversation_id=m.conversation_id
+            WHERE c.conversation_id=? AND c.mode='admin' AND m.role='user'
+            AND m.status='done' ORDER BY m.id DESC LIMIT 1''', (conversation_id,)).fetchone()
+    if not row or not row['response_json']:
+        return None
+    try:
+        response = json.loads(row['response_json'])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(response, dict):
+        return None
+    recipe = sanitize_analytics_context(response.get('analytics_context'))
+    reports = response.get('reports')
+    if recipe and recipe['kind'] == 'store_overview' and recipe.get('chart_mode') == 'none' and isinstance(reports, list):
+        # Attachments retain the executed selection. Multiple reports with the same
+        # filters can make the last selection ambiguous after attachment deduplication.
+        matching = [report['coverage'] for report in reports if isinstance(report, dict)
+                    and isinstance(report.get('coverage'), dict)
+                    and report['coverage'].get('filters') == recipe['filters']]
+        if any('sections' in coverage for coverage in matching):
+            if len(matching) != 1 or matching[0].get('complete') is not True:
+                return None
+            return sanitize_analytics_context({**recipe, 'sections': matching[0]['sections']})
+    return recipe
+
+
+def latest_action_context(conversation_id, exclude_request_id=None):
+    """Read only the latest trusted staff approval, never an older proposal."""
+    with connection() as conn:
+        row = conn.execute('''SELECT CASE WHEN json_valid(m.response_json)
+            THEN json_extract(m.response_json,'$.pending_staff_action') END AS proposal,m.status
+            FROM messages m JOIN conversations c ON c.conversation_id=m.conversation_id
+            WHERE c.conversation_id=? AND c.mode IN ('admin','cashier')
+            AND m.role='user' AND (? IS NULL OR m.request_id<>?) ORDER BY m.id DESC LIMIT 1''',
+            (conversation_id,exclude_request_id,exclude_request_id)).fetchone()
+    if not row or row['status'] != 'done' or not isinstance(row['proposal'], str) or len(row['proposal']) > 12000:
+        return None
+    try:
+        value = json.loads(row['proposal'])
+    except (ValueError, TypeError):
+        return None
+    fields = {'kind','action','order_id','order_fingerprint','arguments'}
+    if (not isinstance(value,dict) or set(value) != fields
+            or value['kind'] not in ('staff_refund','staff_action')
+            or value['action'] not in ('approve','escalate','ship','deliver')
+            or not isinstance(value['arguments'],dict)):
+        return None
+    return value
+
+
+def shopping_state(conversation_id):
+    from context.shopping_state import empty_state
+    with connection() as conn:
+        row = conn.execute('SELECT state_json FROM shopping_states WHERE conversation_id=?',
+                           (conversation_id,)).fetchone()
+        defaults = empty_state()
+        saved = json.loads(row[0]) if row else {}
+        return {**defaults, **{key: value for key, value in saved.items() if key in defaults}}
+
+
+def write_shopping_state(conn, conversation_id, state):
+    conn.execute('''INSERT INTO shopping_states(conversation_id,state_json) VALUES (?,?)
+        ON CONFLICT(conversation_id) DO UPDATE SET state_json=excluded.state_json,
+        updated_at=CURRENT_TIMESTAMP''', (conversation_id, json.dumps(state)))
+
+
+def checkpoint_shopping(conversation_id, request_id, state, customer_id):
+    """Persist observed tool facts even if a later model call fails or times out."""
+    with connection() as conn:
+        record = conn.execute('''SELECT c.customer_id FROM conversations c JOIN messages m
+            ON m.conversation_id=c.conversation_id WHERE c.conversation_id=? AND c.mode='customer'
+            AND m.request_id=? AND m.role='user' AND m.status='pending' ''',
+            (conversation_id, request_id)).fetchone()
+        if record is None or record['customer_id'] != customer_id:
+            raise ValueError('Shopping checkpoint does not match the active conversation.')
+        write_shopping_state(conn, conversation_id, state)
+
+
+def history(conversation_id, include_artifacts=False):
+    with connection() as conn:
+        if include_artifacts:
+            rows = conn.execute("SELECT m.role,m.content,u.response_json FROM messages m LEFT JOIN messages u "
+                                "ON m.role='assistant' AND u.role='user' AND u.conversation_id=m.conversation_id "
+                                "AND u.request_id=m.request_id WHERE m.conversation_id=? "
+                                "AND m.status='done' ORDER BY m.id DESC LIMIT 40", (conversation_id,)).fetchall()
+        else:
+            # Model history needs transcript text only. Saved responses can hold
+            # complete reports and charts; do not read those blobs on each turn.
+            rows = conn.execute("SELECT role,content FROM messages WHERE conversation_id=? "
+                                "AND status='done' ORDER BY id DESC LIMIT 40", (conversation_id,)).fetchall()
+        result = []
+        for row in reversed(rows):
+            message = {'role':row['role'],'content':row['content']}
+            if include_artifacts and row['role']=='assistant' and row['response_json']:
+                saved = json.loads(row['response_json'])
+                message.update(charts=saved.get('charts',[]),invoices=saved.get('invoices',[]))
+                message['tables'] = sanitize_tables(saved.get('tables', []))
+                message['reports'] = sanitize_reports(saved.get('reports', []))
+            result.append(message)
+        return result
+
+
+def completed_response(conversation_id, request_id, message):
+    """Read an immutable completed reply without starting or retrying a turn.
+
+    Callers must verify conversation access first. Pending/failed requests remain
+    subject to begin() under the execution lock; they never return a cached reply.
+    """
+    with connection() as conn:
+        row = conn.execute("SELECT content,status,response_json FROM messages WHERE "
+                           "conversation_id=? AND request_id=? AND role='user'",
+                           (conversation_id, request_id)).fetchone()
+    if row is None:
+        return None
+    if row['content'] != message:
+        raise ValueError('Request ID was already used with different content.')
+    if row['status'] == 'done' and row['response_json']:
+        return json.loads(row['response_json'])
+    return None
+
+
+def begin(conversation_id, request_id, message, may_have_changed=True):
+    with connection() as conn:
+        # Reserve the SQLite write transaction before checking request state, closing the duplicate-submit race.
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute("SELECT * FROM messages WHERE conversation_id=? AND request_id=? AND role='user'",
+                           (conversation_id, request_id)).fetchone()
+        if row:
+            if row["content"] != message:
+                raise ValueError("Request ID was already used with different content.")
+            if row['status'] == 'done' and row["response_json"]:
+                return json.loads(row["response_json"])
+            newer = conn.execute("SELECT 1 FROM messages WHERE conversation_id=? AND role='user' AND id>? LIMIT 1",
+                                 (conversation_id, row['id'])).fetchone()
+            if row['status'] == 'failed' and row['may_have_changed'] == 0 and not newer:
+                conn.execute("UPDATE messages SET status='pending',may_have_changed=? WHERE id=?",
+                             (int(bool(may_have_changed)), row['id']))
+                return None
+            raise ValueError("This turn is pending or failed. Check order state before sending a new mutation.")
+        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content,status,may_have_changed) "
+                     "VALUES (?,?,'user',?,'pending',?)",
+                     (conversation_id, request_id, message, int(bool(may_have_changed))))
+        return None
+
+
+def mark_request_changed(conversation_id, request_id):
+    """Persist uncertainty before dispatching a change, never after its result."""
+    with connection() as conn:
+        # Mark the pending request as potentially changed before mutation dispatch, preventing an unsafe
+        # automatic replay. Store the result in changed.
+        changed = conn.execute("UPDATE messages SET may_have_changed=1,response_json=NULL WHERE conversation_id=? "
+                               "AND request_id=? AND role='user' AND status='pending'",
+                               (conversation_id, request_id))
+        if changed.rowcount != 1:
+            raise ValueError('The billing change does not match an active request.')
+
+
+def customer_turn_state(conversation_id, request_id, customer_id):
+    """Expire global approval while retaining input for this request's safe retry.
+
+    begin() must first admit the request. It alone permits reopening a failed
+    read with the same message and no newer turn; pending or uncertain writes
+    cannot reach this input again. Never copy it into a different request.
+    """
+    from context.shopping_state import clear_confirmation, empty_state
+    with connection() as conn:
+        # Reserve the SQLite write transaction before checking request state, closing the duplicate-submit race.
+        conn.execute('BEGIN IMMEDIATE')
+        record = conn.execute('''SELECT m.response_json FROM messages m
+            JOIN conversations c ON c.conversation_id=m.conversation_id
+            WHERE c.conversation_id=? AND c.mode='customer' AND c.customer_id IS ?
+              AND m.request_id=? AND m.role='user' AND m.status='pending' ''',
+            (conversation_id, customer_id, request_id)).fetchone()
+        if record is None:
+            raise ValueError('Shopping input does not match the active customer request.')
+        saved = json.loads(record['response_json']) if record['response_json'] else None
+        if isinstance(saved, dict) and set(saved) == {'shopping_input'} and isinstance(saved['shopping_input'], dict):
+            state = saved['shopping_input']
+        else:
+            row = conn.execute('SELECT state_json FROM shopping_states WHERE conversation_id=?',
+                               (conversation_id,)).fetchone()
+            defaults = empty_state()
+            current = json.loads(row[0]) if row else {}
+            state = {**defaults, **{key:value for key,value in current.items() if key in defaults}}
+            conn.execute("UPDATE messages SET response_json=? WHERE conversation_id=? "
+                         "AND request_id=? AND role='user' AND status='pending'",
+                         (json.dumps({'shopping_input':state}), conversation_id, request_id))
+        write_shopping_state(conn, conversation_id, clear_confirmation(state))
+        return state
+
+
+def finish(conversation_id, request_id, response):
+    with connection() as conn:
+        if 'shopping_state' in response:
+            record = conn.execute('SELECT mode FROM conversations WHERE conversation_id=?',
+                                  (conversation_id,)).fetchone()
+            if not record or record['mode'] != 'customer':
+                raise ValueError('Only customer conversations have shopping state.')
+            write_shopping_state(conn, conversation_id, response['shopping_state'])
+        conn.execute("UPDATE messages SET status='done',response_json=? WHERE conversation_id=? AND request_id=? AND role='user'",
+                     (json.dumps(response), conversation_id, request_id))
+        conn.execute("INSERT INTO messages(conversation_id,request_id,role,content) VALUES (?,?,'assistant',?)",
+                     (conversation_id, request_id, response["response"]))
+
+
+def fail(conversation_id, request_id, before_execution=False):
+    with connection() as conn:
+        conn.execute("UPDATE messages SET status='failed',may_have_changed=CASE WHEN ? THEN 0 ELSE may_have_changed END "
+                     "WHERE conversation_id=? AND request_id=? AND role='user' AND status='pending'",
+                     (int(bool(before_execution)), conversation_id, request_id))
+
+
+def discard_pending(conversation_id, request_id):
+    """Only used for configuration rejection before any model/tool execution."""
+    with connection() as conn:
+        conn.execute("DELETE FROM messages WHERE conversation_id=? AND request_id=? "
+                     "AND role='user' AND status='pending'", (conversation_id, request_id))
