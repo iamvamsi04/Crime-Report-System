@@ -1,282 +1,227 @@
-"""Complete invoice-grain store reports for the existing billing analysis tool."""
-from collections import Counter, defaultdict
-from contextlib import closing
-from datetime import date
+"""Native business tables from known, authorized tool result fields."""
 import re
+import unicodedata
 
-from context.reports import validate_overview_sections
-from database.connection import connect
-from mcp_server.tools.analytics_tools import LIMIT, ZERO, cash, dec, filters, summary
-
-
-def dataset(name, title, grain, rows, columns, scope):
-    return {'name': name, 'title': title, 'grain': grain, 'columns': columns,
-            'rows': [[row.get(column) for column in columns] for row in rows],
-            'row_count': len(rows), 'truncated': False, 'scope': scope}
+from context.tables import table_artifact
 
 
-def category(value):
-    """Normalize only presentation category labels; keep identifiers untouched."""
-    return re.sub(r'[\s_-]+', ' ', str(value or '').strip()).casefold() or 'Uncategorised'
+AMOUNTS = ('subtotal','discount_applied','tax_amount','shipping_amount','charged_price',
+           'refund_amount','net_billed_after_ledger_refunds')
 
 
-def currency(value, fallback):
-    code = (str(value or '').strip() or str(fallback or '').strip()).upper()
-    if len(code) != 3 or not code.isascii() or not code.isalpha():
-        raise ValueError('A report record has missing or invalid currency. Correct it before analyzing totals.')
-    return code
+def title(key):
+    return key.replace('_', ' ').capitalize()
 
 
-def month(value):
-    return date.fromisoformat(value).replace(day=1).isoformat()
+def evidence_text(value, depth=0):
+    """Readable evidence cells, without turning a tool payload into visible JSON."""
+    if depth > 3:
+        return 'Additional detail requires review'
+    if isinstance(value, dict):
+        return '; '.join(f'{title(str(key))}: {evidence_text(cell,depth+1)}'
+                         for key,cell in value.items())
+    if isinstance(value, list):
+        return '; '.join(evidence_text(cell,depth+1) for cell in value)
+    return 'Not recorded' if value is None else str(value)
 
 
-def amount_rows(groups, dimension_names):
+def comparison_table(data):
+    """Put each product in one column and each comparable fact in one row."""
+    products = data.get('products')
+    if not isinstance(products, list) or not 2 <= len(products) <= 5 or any(
+            not isinstance(product, dict) for product in products):
+        raise ValueError('A comparison needs two to five distinct products.')
+    codes = [product.get('item_code') for product in products]
+    if any(not isinstance(code, str) or not code for code in codes) or len(set(codes)) != len(codes):
+        raise ValueError('Comparison products must have distinct recorded identities.')
+
+    names = [str(product.get('name') or f'Product {index}').strip()[:85]
+             for index, product in enumerate(products, 1)]
+    columns = ['Feature']
+    used = {'feature'}
+    for index, name in enumerate(names, 1):
+        heading = name
+        hidden_heading = name.casefold().replace('_', '').replace('-', '').replace(' ', '') in {'sku', 'itemcode'}
+        if not heading or hidden_heading or heading.casefold() == 'feature' or sum(
+                candidate.casefold() == name.casefold() for candidate in names) > 1:
+            heading = f'{name or "Product"} (Product {index})'
+        suffix = 1
+        while heading.casefold() in used:
+            heading = f'{name or "Product"} (Product {index}, {suffix})'
+            suffix += 1
+        columns.append(heading)
+        used.add(heading.casefold())
+
     rows = []
-    for dimensions, orders in sorted(groups.items()):
-        rows.append({**dict(zip(dimension_names, dimensions)), 'invoice_count': len(orders),
-                     **summary(orders),
-                     'average_invoice_total': cash(sum((dec(o['charged_price']) for o in orders), ZERO) / len(orders))})
-    return rows
+    if any(len(str(product.get('name') or '').strip()) > 85 for product in products):
+        rows.append(['Full product name', *[product.get('name') or 'Not recorded' for product in products]])
+    for label, field in (
+        ('Category', 'category'), ('Description', 'description'), ('Unit price', 'unit_price'),
+        ('Quantity', 'quantity'), ('Merchandise total', 'merchandise_total'),
+        ('Available units', 'available_quantity'), ('Enough stock', 'enough_stock'),
+        ('Within merchandise budget', 'within_budget'),
+    ):
+        rows.append([label, *[product.get(field) if product.get(field) is not None else 'Not recorded'
+                              for product in products]])
+    rows.append(['Currency', *[data.get('currency') or 'Not recorded' for _ in products]])
+
+    def normal(value):
+        return ' '.join(re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', str(value)).casefold()))
+
+    features = {}
+    for product in products:
+        for key in product.get('features', {}):
+            features.setdefault(normal(key), key)
+    labels = {row[0].casefold() for row in rows}
+    for feature_key, feature in sorted(features.items()):
+        label = title(str(feature))
+        if label.casefold() in labels:
+            label = 'Recorded ' + label
+        while label.casefold() in labels:
+            label += ' (recorded)'
+        labels.add(label.casefold())
+        values = []
+        for product in products:
+            recorded = product.get('features', {})
+            key = next((key for key in recorded if normal(key) == feature_key), None)
+            ambiguous = {normal(key) for key in product.get('ambiguous_features', [])}
+            if feature_key in ambiguous:
+                value = 'Conflicting records'
+            elif key is None or recorded[key] is None:
+                value = 'Not recorded'
+            else:
+                value = recorded[key]
+                unit = product.get('feature_units', {}).get(key)
+                if unit:
+                    value = f'{evidence_text(value)} {unit}'
+                elif isinstance(value, (dict, list)):
+                    value = evidence_text(value)
+            values.append(value)
+        rows.append([label, *values])
+    for label, field in (('Matched requirements', 'matched_features'),
+                         ('Unrecorded requirements', 'unknown_features'),
+                         ('Different requirements', 'different_features')):
+        rows.append([label, *[', '.join(product.get(field, [])) or 'None' for product in products]])
+    return table_artifact('Product comparison', columns, rows,
+        coverage='Current merchandise prices before discounts, tax and shipping. Stock and budget checks use '
+                 'the requested quantity. Missing or conflicting specifications stay explicit, and recorded '
+                 'units are preserved without conversion. Price does not establish overall quality or compatibility.')
 
 
-def checked_rows(cursor, label):
-    rows = [dict(row) for row in cursor.fetchmany(LIMIT + 1)]
-    if len(rows) > LIMIT:
-        raise ValueError(f'More than {LIMIT} {label} match. Narrow the report scope for a complete report.')
-    return rows
+def tool_tables(name, data, arguments=None):
+    """Display whitelisted records only. Never query, convert units or infer totals."""
+    if not isinstance(data, dict) or not data.get('ok'):
+        return []
+    if name == 'compare_products':
+        return [comparison_table(data)]
+    tables = []
 
+    def add(label, columns, rows, *, coverage=None, total=None, truncated=False):
+        tables.append(table_artifact(label, columns, rows, coverage=coverage,
+                                     total_rows=total, truncated=truncated))
 
-def store_overview(customer_id=None, order_id=None, date_from=None, date_to=None, *, sections=None):
-    """Read one snapshot; aggregate order and line grains independently."""
-    from mcp_server.access import scope as execution_scope
-    execution = execution_scope.get()
-    if execution is not None and execution.get('mode') != 'admin':
-        raise ValueError('Store-wide analytics is available only in admin mode.')
-    if sections is not None:
-        sections = validate_overview_sections(sections)
-    # Reuse strict filter validation, but keep cancelled rows in operational datasets.
-    # Sales below explicitly use placed invoices; cancellation requests must remain visible.
-    filters(customer_id, order_id, date_from, date_to)
-    clauses, args = [], []
-    for field, value, operator in (('customer_id', customer_id, '='), ('order_id', order_id, '='),
-                                   ('order_date', date_from, '>='), ('order_date', date_to, '<=')):
-        if value is not None:
-            clauses.append(f'o.{field}{operator}?')
-            args.append(value)
-    where = ' AND '.join(clauses) or '1=1'
-    with closing(connect(readonly=True)) as conn:
-        conn.execute('PRAGMA query_only=ON')
-        conn.execute('BEGIN')
-        config = dict(conn.execute('SELECT key,value FROM billing_config'))
-        stock_currency = currency(config.get('currency'), 'USD')
-        orders = checked_rows(conn.execute(
-            'SELECT o.*,c.name AS customer_name,d.currency AS invoice_currency,'
-            'd.status AS legacy_status,s.fulfillment_status,s.shipped_at,s.delivered_at FROM orders o '
-            'LEFT JOIN customers c ON c.customer_id=o.customer_id '
-            'LEFT JOIN order_details d ON d.order_id=o.order_id '
-            'LEFT JOIN order_service s ON s.order_id=o.order_id '
-            f'WHERE {where} ORDER BY o.order_date,o.order_id', args), 'orders')
-        lines = checked_rows(conn.execute('SELECT l.* FROM invoice_lines l JOIN orders o '
-                                          f'ON o.order_id=l.order_id WHERE {where} ORDER BY l.order_id,l.id', args), 'invoice lines')
-        inventory = checked_rows(conn.execute('SELECT i.*,d.category FROM items i LEFT JOIN product_details d '
-                                              'ON d.item_code=i.item_code ORDER BY i.item_code'), 'inventory products')
-        requests = checked_rows(conn.execute('SELECT r.*,d.request_kind,d.disposition FROM refund_requests r '
-                                             'JOIN orders o ON o.order_id=r.order_id LEFT JOIN refund_details d '
-                                             f'ON d.order_id=r.order_id WHERE {where} ORDER BY r.requested_at,r.order_id', args), 'refund requests')
-        credits = checked_rows(conn.execute('SELECT l.* FROM store_credit_ledger l JOIN orders o '
-                                            f'ON o.order_id=l.order_id WHERE {where} ORDER BY l.created_at,l.id', args), 'store credit entries')
+    def records(label, rows, fields, *, coverage=None, total=None, truncated=False):
+        add(label, [title(field) for field in fields],
+            [[row.get(field) for field in fields] for row in rows],
+            coverage=coverage,total=total,truncated=truncated)
 
-    by_id = {row['order_id']: row for row in orders}
-    products = {row['item_code']: row for row in inventory}
-    sales, cancelled, order_currencies = [], [], {}
-    for row in orders:
-        order_currencies[row['order_id']] = currency(row['invoice_currency'], stock_currency)
-        legacy_cancelled = row['legacy_status'] == 'cancelled' or row['fulfillment_status'] == 'cancelled'
-        if row['order_status'] == 'placed' and not legacy_cancelled:
-            if not str(row['order_invoice'] or '').strip():
-                raise ValueError('A placed order has no invoice number. Correct it before analyzing totals.')
-            sales.append(row)
-        elif (row['order_status'] == 'cancelled' or legacy_cancelled) and str(row['order_invoice'] or '').strip():
-            cancelled.append(row)
-    sales_ids = {row['order_id'] for row in sales}
-    per_currency, cancelled_currency, per_month, per_customer = (defaultdict(list) for _ in range(4))
-    for row in sales:
-        code = order_currencies[row['order_id']]
-        per_currency[(code,)].append(row)
-        per_month[(code, month(row['order_date']))].append(row)
-        per_customer[(code, row['customer_id'], row['customer_name'])].append(row)
-    for row in cancelled:
-        cancelled_currency[(order_currencies[row['order_id']],)].append(row)
-    totals = amount_rows(per_currency, ['currency'])
-    cancelled_totals = amount_rows(cancelled_currency, ['currency'])
-    periods = amount_rows(per_month, ['currency', 'period'])
-    customer_rows = amount_rows(per_customer, ['currency', 'customer_id', 'customer_name'])
+    if name == 'find_cheaper_alternatives':
+        products = data.get('alternatives', [])
+        price_fields = ('item_code','name','unit_price','quantity','merchandise_total','available_quantity')
 
-    # Never join one-to-many lines into invoice totals; these metrics are explicitly line-grain.
-    product_sales, category_sales, line_observations = {}, {}, []
-    line_counts = defaultdict(lambda: {'line_count': 0, 'units_billed': 0, 'cost': ZERO})
-    for line in lines:
-        oid = line['order_id']
-        if oid not in sales_ids:
-            continue
-        item = products.get(line['item_code'])
-        if item is None:
-            raise ValueError('A billed item is missing from inventory. Correct it before analyzing costs.')
-        code, label = order_currencies[oid], category(item['category'])
-        key = (code, line['item_code'])
-        row = product_sales.setdefault(key, {'currency': code, 'item_code': line['item_code'], 'name': item['name'],
-            'category': label, 'units_billed': 0, 'billed_revenue': ZERO, 'estimated_product_cost': ZERO, 'orders': set()})
-        cost = dec(item['baseprice']) * line['qty_billed']
-        line_observations.append({'order_id': oid, 'order_date': by_id[oid]['order_date'],
-            'customer_id': by_id[oid]['customer_id'], 'currency': code, 'item_code': line['item_code'],
-            'name': item['name'], 'category': label, 'units_billed': line['qty_billed'],
-            'unit_price_billed': cash(line['unit_price_billed']), 'billed_revenue': cash(line['line_total']),
-            'estimated_product_cost': cash(cost)})
-        row['units_billed'] += line['qty_billed']
-        row['billed_revenue'] += dec(line['line_total'])
-        row['estimated_product_cost'] += cost
-        row['orders'].add(oid)
-        counts = line_counts[oid]
-        counts['line_count'] += 1
-        counts['units_billed'] += line['qty_billed']
-        counts['cost'] += cost
-        c = category_sales.setdefault((code, label), {'currency': code, 'category': label, 'units_billed': 0,
-            'billed_revenue': ZERO, 'estimated_product_cost': ZERO, 'orders': set(), 'products': set()})
-        c['units_billed'] += line['qty_billed']
-        c['billed_revenue'] += dec(line['line_total'])
-        c['estimated_product_cost'] += cost
-        c['orders'].add(oid)
-        c['products'].add(line['item_code'])
-    def sales_rows(groups):
-        rows = []
-        for _, source in sorted(groups.items()):
-            row = {k: v for k, v in source.items() if k not in ('orders', 'products')}
-            row['invoice_count'] = len(source['orders'])
-            if 'products' in source:
-                row['product_count'] = len(source['products'])
-            row['estimated_margin_before_order_adjustments'] = cash(source['billed_revenue'] - source['estimated_product_cost'])
-            for field in ('billed_revenue', 'estimated_product_cost'):
-                row[field] = cash(row[field])
-            rows.append(row)
-        return rows
-    product_rows, category_rows = sales_rows(product_sales), sales_rows(category_sales)
-    observations = []
-    for row in sales:
-        counts = line_counts[row['order_id']]
-        observations.append({'order_id': row['order_id'], 'order_date': row['order_date'],
-            'customer_id': row['customer_id'], 'currency': order_currencies[row['order_id']],
-            'fulfillment_status': row['fulfillment_status'] or 'unknown',
-            'line_count': counts['line_count'], 'units_billed': counts['units_billed'],
-            **{field: cash(row[field]) for field in ('subtotal', 'discount_applied', 'tax_amount', 'shipping_amount', 'charged_price', 'refund_amount')},
-            'net_billed_after_ledger_refunds': cash(dec(row['charged_price']) - dec(row['refund_amount'])),
-            'estimated_product_cost': cash(counts['cost']) if counts['line_count'] else None})
+        def prices(label, rows, **kwargs):
+            add(label, ['Item code','Product','Currency','Unit price','Quantity','Merchandise total','Available units'],
+                [[p.get('item_code'),p.get('name'),data.get('currency'),
+                  *[p.get(field) for field in price_fields[2:]]] for p in rows], **kwargs)
 
-    stock_rows, stock_categories = [], {}
-    for item in inventory:
-        label = category(item['category'])
-        qty, cost, price = item['availablequantity'], dec(item['baseprice']), dec(item['sellingprice'])
-        stock_rows.append({'item_code': item['item_code'], 'name': item['name'], 'category': label,
-            'available_quantity': qty, 'current_unit_cost': cash(cost), 'selling_price': cash(price),
-            'inventory_value_at_current_cost': cash(cost * qty), 'inventory_value_at_selling_price': cash(price * qty),
-            'currency': stock_currency})
-        row = stock_categories.setdefault(label, {'category': label, 'product_count': 0, 'in_stock_products': 0,
-            'out_of_stock_products': 0, 'available_units': 0, 'inventory_value_at_current_cost': ZERO,
-            'inventory_value_at_selling_price': ZERO, 'currency': stock_currency})
-        row['product_count'] += 1
-        row['in_stock_products' if qty > 0 else 'out_of_stock_products'] += 1
-        row['available_units'] += qty
-        row['inventory_value_at_current_cost'] += cost * qty
-        row['inventory_value_at_selling_price'] += price * qty
-    stock_category_rows = []
-    for _, row in sorted(stock_categories.items()):
-        stock_category_rows.append({**row, **{field: cash(row[field]) for field in ('inventory_value_at_current_cost', 'inventory_value_at_selling_price')}})
-
-    refund_rows, refund_groups, approval_groups = [], {}, {}
-    for source in requests:
-        code = currency(source['currency'], None)
-        row = {**source, 'currency': code, 'amount': cash(source['amount']),
-               'order_status': by_id[source['order_id']]['order_status'],
-               'customer_id': by_id[source['order_id']]['customer_id'],
-               'request_kind': source['request_kind'] or 'unspecified', 'disposition': source['disposition'] or 'unspecified'}
-        refund_rows.append(row)
-        group = refund_groups.setdefault((code, source['status']), {'currency': code, 'request_status': source['status'],
-            'request_count': 0, 'requested_amount': ZERO})
-        group['request_count'] += 1
-        group['requested_amount'] += dec(source['amount'])
-        if source['status'] == 'approved':
-            if not source['approved_at']:
-                raise ValueError('An approved refund has no approval timestamp. Correct it before reporting.')
-            # Group approved refunds by their recorded approval month, not the invoice's order month.
-            period = month(source['approved_at'][:10])
-            key = (code, period, source['approved_by_role'] or 'unknown')
-            group = approval_groups.setdefault(key, {'currency': code, 'period': period,
-                'approved_by_role': source['approved_by_role'] or 'unknown', 'approved_count': 0, 'approved_amount': ZERO})
-            group['approved_count'] += 1
-            group['approved_amount'] += dec(source['amount'])
-    refund_summary = [{**row, 'requested_amount': cash(row['requested_amount'])} for _, row in sorted(refund_groups.items())]
-    approvals = [{**row, 'approved_amount': cash(row['approved_amount'])} for _, row in sorted(approval_groups.items())]
-    request_statuses = {row['order_id']: row['status'] for row in requests}
-    # Expose recorded invoice refunds separately; do not add these again to requests for the same refund.
-    recorded_refunds = [{'order_id': row['order_id'], 'order_date': row['order_date'], 'customer_id': row['customer_id'],
-        'order_status': row['order_status'], 'currency': order_currencies[row['order_id']],
-        'recorded_refund': cash(row['refund_amount']), 'refund_status': row['refund_status'],
-        'request_status': request_statuses.get(row['order_id'])}
-        for row in orders if dec(row['refund_amount']) > 0]
-    credit_rows = [{**row, 'currency': currency(row['currency'], None), 'amount': cash(row['amount'])} for row in credits]
-
-    order_scope = 'Inclusive order_date filters; selected customer/order if supplied. Active issued invoices only; cancelled orders excluded.'
-    operation_scope = 'Inclusive order_date filters; selected customer/order if supplied. Includes cancelled orders; request and approval timestamps are separate dimensions.'
-    stock_scope = 'Current full-store inventory snapshot. Order, customer and date filters do not restrict inventory.'
-    amount_columns = ['invoice_count', 'subtotal', 'discount_applied', 'tax_amount', 'shipping_amount', 'charged_price',
-                      'refund_amount', 'net_billed_after_ledger_refunds', 'average_invoice_total']
-    sales_columns = ['currency', 'invoice_count', 'units_billed', 'billed_revenue', 'estimated_product_cost', 'estimated_margin_before_order_adjustments']
-    statuses = Counter('cancelled' if row['legacy_status'] == 'cancelled' or row['fulfillment_status'] == 'cancelled' else row['order_status'] for row in orders)
-    datasets = [
-        dataset('invoice_totals', 'Invoice totals by currency', 'one row per currency', totals, ['currency', *amount_columns], order_scope),
-        dataset('order_status', 'Order lifecycle', 'one row per lifecycle state', [{'order_status': key, 'order_count': statuses[key]} for key in ('draft', 'placed', 'cancelled')], ['order_status', 'order_count'], operation_scope),
-        dataset('monthly_sales', 'Monthly invoice totals', 'one row per currency and calendar month', periods, ['currency', 'period', *amount_columns], order_scope),
-        dataset('category_sales', 'Billed revenue by product category', 'one row per currency and product category', category_rows, ['category', 'product_count', *sales_columns], order_scope + ' Merchandise line revenue before order-level adjustments.'),
-        dataset('product_sales', 'Billed revenue by product', 'one row per currency and item code', product_rows, ['item_code', 'name', 'category', *sales_columns], order_scope + ' Merchandise line revenue before order-level adjustments.'),
-        dataset('customer_sales', 'Customer invoice totals', 'one row per currency and customer with matching invoices', customer_rows, ['currency', 'customer_id', 'customer_name', *amount_columns], order_scope),
-        dataset('inventory', 'Current inventory', 'one row per product', stock_rows, ['item_code', 'name', 'category', 'currency', 'available_quantity', 'current_unit_cost', 'selling_price', 'inventory_value_at_current_cost', 'inventory_value_at_selling_price'], stock_scope),
-        dataset('inventory_categories', 'Current inventory by category', 'one row per category', stock_category_rows, ['category', 'currency', 'product_count', 'in_stock_products', 'out_of_stock_products', 'available_units', 'inventory_value_at_current_cost', 'inventory_value_at_selling_price'], stock_scope),
-        dataset('order_observations', 'Individual invoice observations', 'one unaggregated row per active issued invoice', observations, ['order_id', 'order_date', 'customer_id', 'currency', 'fulfillment_status', 'line_count', 'units_billed', 'subtotal', 'discount_applied', 'tax_amount', 'shipping_amount', 'charged_price', 'refund_amount', 'net_billed_after_ledger_refunds', 'estimated_product_cost'], order_scope + ' Complete observations for distributions, scatter plots and ranges; no top-N sampling.'),
-        dataset('refund_requests', 'Refund requests and approvals', 'one row per refund request', refund_rows, ['order_id', 'customer_id', 'order_status', 'currency', 'amount', 'status', 'reason', 'requested_at', 'approved_at', 'approved_by_role', 'request_kind', 'disposition'], operation_scope),
-        dataset('refund_status', 'Refund request amounts by status', 'one row per currency and request status', refund_summary, ['currency', 'request_status', 'request_count', 'requested_amount'], operation_scope),
-        dataset('refund_approvals', 'Monthly local refund approvals', 'one row per currency, approval month and approving role', approvals, ['currency', 'period', 'approved_by_role', 'approved_count', 'approved_amount'], operation_scope),
-        dataset('recorded_refunds', 'Recorded invoice refunds', 'one row per order with a recorded refund', recorded_refunds, ['order_id', 'order_date', 'customer_id', 'order_status', 'currency', 'recorded_refund', 'refund_status', 'request_status'], operation_scope + ' Kept separate from requests; do not add requested and recorded amounts.'),
-        dataset('store_credit_activity', 'Local store credit activity', 'one row per local credit entry', credit_rows, ['id', 'customer_id', 'order_id', 'currency', 'amount', 'kind', 'created_at'], operation_scope + ' Activity linked to the selected orders, not account balances. Not subtracted from invoice face values.'),
-        dataset('cancelled_invoice_totals', 'Cancelled issued invoice history', 'one row per currency', cancelled_totals, ['currency', *amount_columns], operation_scope + ' Historical face values excluded from active invoice totals; not current sales.'),
-        dataset('invoice_line_observations', 'Individual billed merchandise observations', 'one unaggregated row per active invoice line', line_observations, ['order_id', 'order_date', 'customer_id', 'currency', 'item_code', 'name', 'category', 'units_billed', 'unit_price_billed', 'billed_revenue', 'estimated_product_cost'], order_scope + ' Merchandise grain for category/product/time combinations and distributions. Order-level amounts are intentionally not repeated on lines.'),
-    ]
-    if sections is not None:
-        by_name = {source['name']: source for source in datasets}
-        datasets = [by_name[name] for name in sections]
-    return {'report': 'store_overview',
-        'filters': {'customer_id': customer_id, 'order_id': order_id, 'date_from': date_from, 'date_to': date_to},
-        'scope': {'sales': order_scope, 'refunds_and_credit': operation_scope, 'inventory': stock_scope},
-        'summary': {'matched_orders': len(orders), 'invoice_count': len(sales), 'draft_count': statuses['draft'],
-                    'cancelled_count': statuses['cancelled'], 'refund_request_count': len(requests),
-                    'pending_refund_request_count': sum(row['status'] == 'pending' for row in requests),
-                    'approved_refund_request_count': sum(row['status'] == 'approved' for row in requests),
-                    'recorded_refund_order_count': len(recorded_refunds),
-                    'active_customers': len({row['customer_id'] for row in sales}),
-                    'inventory_products': len(inventory), 'inventory_categories': len(stock_categories),
-                    'in_stock_products': sum(row['availablequantity'] > 0 for row in inventory),
-                    'out_of_stock_products': sum(row['availablequantity'] == 0 for row in inventory),
-                    'invoice_totals_by_currency': totals},
-        'datasets': datasets,
-        'coverage': {'complete': True, 'truncated': False, 'top_n_applied': False,
-            **({'sections': sections} if sections is not None else {}),
-            'matched_order_date_from': orders[0]['order_date'] if orders else None,
-            'matched_order_date_to': orders[-1]['order_date'] if orders else None,
-            'dataset_row_counts': {row['name']: row['row_count'] for row in datasets}},
-        'notes': ['All matching records contribute; no implicit date filter or top-product/customer limit is applied.',
-            'Order totals are stored charged_price. Net billed subtracts only recorded refund_amount, not pending requests or local credit redemptions.',
-            'Currencies are normalized and reported separately. Never sum monetary values across currencies.',
-            'Product/category revenue is billed merchandise line_total before order discounts, tax, shipping and refunds; do not label it net invoice revenue.',
-            'Current inventory prices/costs are estimates in configured store currency, independent of historical invoice currencies.',
-            'Requests include cancelled orders. Request, approval and recorded-refund datasets describe stages of the same refund and must not be added together.',
-            'Date filters apply to order_date throughout this overview, including linked refund and credit activity. Use the dedicated refund report for approval-date filtering.',
-            'No payment processing, settlement, outstanding-balance or cash-collected information is available.']}
+        coverage = 'Current merchandise prices before discounts, tax and shipping. Price does not establish overall quality or compatibility.'
+        source = data.get('source')
+        if isinstance(source, dict):
+            prices('Reference product',[source],coverage='Reference for price comparison; this is not one of the cheaper alternatives.')
+        coverage += f" Showing {len(products)} of {data.get('matched_count',len(products))} qualifying alternatives."
+        prices('Cheaper alternatives', products, coverage=coverage, total=data.get('matched_count'),
+               truncated=bool(data.get('truncated')))
+        displayed = ([source] if isinstance(source, dict) else []) + products
+        def normal(value):
+            return ' '.join(re.findall(r'[^\W_]+',unicodedata.normalize('NFKC',str(value)).casefold()))
+        feature_names = {}
+        for product in displayed:
+            for key in product.get('features',{}):
+                feature_names.setdefault(normal(key),key)
+        feature_rows, checks = [], []
+        for product in displayed:
+            for feature_key, feature in sorted(feature_names.items()):
+                ambiguous = {normal(key) for key in product.get('ambiguous_features',[])}
+                recorded_key = next((key for key in product.get('features',{}) if normal(key)==feature_key),None)
+                value = ('Conflicting records' if feature_key in ambiguous else
+                         product.get('features',{}).get(recorded_key,'Not recorded'))
+                # Feature objects/lists are explanatory text; scalar units remain separate.
+                if isinstance(value,(dict,list)):
+                    value = evidence_text(value)
+                feature_rows.append([product.get('item_code'),product.get('name'),feature,value,
+                                     product.get('feature_units',{}).get(recorded_key)])
+            checks.append([product.get('item_code'),product.get('enough_stock'),product.get('within_budget'),
+                           ', '.join(product.get('matched_features',[])) or 'None specified',
+                           ', '.join(product.get('unknown_features',[])) or 'None',
+                           ', '.join(product.get('different_features',[])) or 'None'])
+        if feature_rows:
+            add('Recorded product features',['Item code','Product','Feature','Recorded value','Unit'],feature_rows,
+                coverage='Missing and conflicting records are not established specifications. Units are preserved without conversion.')
+        if checks:
+            add('Requested criteria',['Item code','Enough stock','Within merchandise budget','Matched features','Unrecorded requirements','Different requirements'],checks,
+                coverage='Budget and feature checks refer only to the requirements supplied for this comparison.')
+    elif name == 'billing_analysis':
+        report = data.get('report')
+        if report == 'store_overview':
+            return []  # Full dataset attachments have their own validated presentation.
+        if report == 'invoice_trend':
+            for source in data.get('datasets', []):
+                add(source['title'],source['columns'],source['rows'],
+                    coverage='Issued invoice observations grouped once per period and currency; missing periods are not assumed zero.',
+                    truncated=source.get('truncated',False))
+        elif report in ('pending_refunds','pending_above_threshold'):
+            records('Pending refund requests',data.get('requests',[]),
+                ('order_id','customer_id','amount','currency','status','reason','requested_at','required_approver'),
+                coverage='Customer requests awaiting staff approval. No refund is approved by displaying this list.',total=data.get('count'))
+        elif report == 'refund_reconciliation':
+            records('Refund reconciliation',data.get('mismatches',[]),('order_id','issue'),
+                coverage=data.get('scope'),total=data.get('count'))
+            if data.get('undated_records'):
+                records('Refund records without approval dates',data['undated_records'],('order_id','issue'),
+                    coverage='Separate undated history gaps; these are not attributed to the selected approval-date range.',total=data.get('undated_count'))
+        elif isinstance(data.get('totals'),dict):
+            counts = ('matched_orders','invoice_count','draft_count','refunded_invoice_count')
+            add('Invoice counts',['Measure','Count'],[[title(k),data[k]] for k in counts if k in data])
+            money = {**{k:data['totals'][k] for k in AMOUNTS if k in data['totals']},
+                     **{k:data[k] for k in ('average_invoice_total','estimated_product_cost',
+                        'estimated_merchandise_margin_before_refunds') if k in data}}
+            add('Billing amounts',['Measure','Amount','Currency'],[[title(k),v,data.get('currency')] for k,v in money.items()],
+                coverage='Issued invoice amounts only. Product cost and margin use current unit costs; these are not payment balances.')
+            for key,fields,flag in (
+                ('top_products',('item_code','name','units_billed','line_revenue','current_unit_cost','estimated_product_cost','available_quantity'),'products_truncated'),
+                ('top_customers',('customer_id','name','invoice_count',*AMOUNTS),'customers_truncated')):
+                if key in data:
+                    records(title(key),data[key],fields,
+                        coverage='Ranked preview for the requested scope. All matching issued invoices contribute to the summary totals. Amounts use '+str(data.get('currency','the recorded currency'))+'.',
+                        truncated=bool(data.get(flag)))
+    elif name == 'billing_anomalies':
+        add('Billing findings',['Order id','Rule','Severity','Evidence'],
+            [[r.get('order_id'),r.get('rule'),r.get('severity'),evidence_text(r.get('evidence'))]
+             for r in data.get('findings',[])],total=data.get('finding_count'),truncated=bool(data.get('findings_truncated')),
+            coverage='Review candidates for the selected scope, not proof of fraud or permission to change records.')
+        if data.get('optimization_suggestions'):
+            add('Review suggestions',['Suggestion','Basis'],
+                [[r.get('action'),r.get('basis')] for r in data['optimization_suggestions']],
+                coverage='Suggestions require review; amounts are not guaranteed savings.')
+    elif name in ('request_order','manage_draft') and isinstance(data.get('estimate'),dict):
+        add('Draft estimate',['Measure','Amount'],[[title(k),data['estimate'][k]]
+            for k in AMOUNTS if k in data['estimate']],coverage='Draft estimate only. The order is not placed by displaying this table.'
+            + (' Currency: '+str(data['currency'])+'.' if data.get('currency') else ' Currency is not included in this result; check the draft details.'))
+    elif name == 'process_refund':
+        if isinstance(data.get('items'),list):
+            records('Return items',data['items'],('item_code','quantity'),
+                    coverage='Items recorded in the tool result; an estimate is not an approved refund.')
+        if isinstance(data.get('orders'),list):
+            records('Return request review',data['orders'],
+                ('order_id','eligible','amount','currency','required_approver','submitted','reason'),coverage=data.get('note'),total=data.get('matched_count'))
+    return tables
