@@ -1,292 +1,115 @@
-"""SQLite parser/authorizer is the security boundary, not a keyword regex."""
-import math
-import re
-import sqlite3
-import time
-from collections import OrderedDict
+"""Trusted API/workbench scope carried over the private local stdio transport."""
+from contextvars import ContextVar
 from contextlib import closing
-from threading import RLock
-from config import settings
+from functools import wraps
+import inspect
+import sqlite3
 from database.connection import CASE_INSENSITIVE_COLUMNS, connect
-from database.product_search import normalize_product_filters, register_product_search
 
-TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
-          'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
-          'order_details', 'billing_audit', 'refund_requests', 'refund_details', 'order_service',
-          'customer_billing_details','invoice_revisions','store_credit_ledger',
-          'customer_addresses','order_delivery',
-          'product_details', 'product_attributes', 'product_relations', 'json_each'}
-FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnull '
-                'instr julianday length like lower ltrim max min nullif printf replace '
-                'round rtrim strftime substr substring sum time total trim typeof '
-                'unicode upper row_number rank dense_rank lag lead first_value last_value '
-                'json_extract json_type json_valid json_array_length current_date current_time current_timestamp '
-                'product_text product_matches product_like'.split())
-
-# Use the same whitespace characters as the invoice lifecycle migration.
-CANCELLED_FROM_SQL = (
-    "CASE WHEN o.order_status = 'cancelled' THEN CASE WHEN "
-    "TRIM(COALESCE(o.order_invoice, ''), CAST(X'090A0D20' AS TEXT)) = '' "
-    "THEN 'draft' ELSE 'placed' END END"
-)
-
-# Store schema text only. Each lookup still checks the current database file and
-# SQLite schema version; prices, customers and other business rows are never cached.
-_SCHEMA_CACHE_LIMIT = 12
-_schema_cache = OrderedDict()
-_schema_cache_lock = RLock()
+scope = ContextVar('tool_scope', default=None)
+ADMIN_TOOLS = {'execute_sql_query', 'download_invoice', 'process_refund', 'manage_draft'}
+CASHIER_TOOLS = {'execute_sql_query', 'download_invoice', 'process_refund'}
+CUSTOMER_TOOLS = {'execute_sql_query', 'request_order', 'place_order', 'apply_promotion',
+                  'download_invoice', 'manage_draft', 'manage_customer', 'process_refund',
+                  'compare_products', 'find_cheaper_alternatives'}
+SCOPE_FIELDS = ('execution_mode', 'execution_customer_id', 'execution_coupon_codes')
 
 
-def _database_identity(path):
-    stat = path.stat()
-    return (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns)
-
-
-# Repair bare SQL aliases only; SQLite's read-only authorizer remains the security boundary.
-def quote_reserved_aliases(query):
-    """Quote bare explicit aliases only; never change literals, comments or values.
-
-    This is syntax repair, not an authorization boundary. SQLite still parses the
-    result under the same read-only authorizer and execution deadline.
-    """
-    tokens = re.findall(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[^\w]", query)
-    reserved = {'GROUP','ORDER','LIMIT','OFFSET','SELECT','FROM','WHERE','HAVING',
-                'VALUES','INDEX','TABLE','JOIN','DISTINCT','UNION','CASE','WHEN','END'}
-    previous = None
-    repaired = []
-    for token in tokens:
-        if token.isspace() or token.startswith(('--','/*')):
-            repaired.append(token)
-            continue
-        upper = token.upper()
-        repaired.append('"'+token+'"' if previous == 'AS' and upper in reserved else token)
-        previous = upper
-    return ''.join(repaired)
-
-
-def schema_hint(mode='customer'):
-    """Return current, role-scoped schema metadata without reading business rows."""
-    path = settings.BILLING_DB.resolve()
-    identity = _database_identity(path)
-    conn = connect(readonly=True)
-    try:
-        # Read the version and columns from one snapshot if another process runs
-        # a migration. Replacements at the same path get a different file key.
-        conn.execute('BEGIN')
-        version = conn.execute('PRAGMA schema_version').fetchone()[0]
-        key = (identity, version, mode, tuple(sorted(TABLES)))
-        unchanged = identity == _database_identity(path)
-        if unchanged:
-            with _schema_cache_lock:
-                cached = _schema_cache.get(key)
-                if cached is not None:
-                    _schema_cache.move_to_end(key)
-                    return cached
-        tables = sorted(TABLES - {'json_each'} - ({'billing_audit'} if mode != 'admin' else set()))
-        if mode == 'customer':
-            tables = [table for table in tables if table != 'promotions']
-        elif mode == 'cashier':
-            tables = [table for table in tables if table != 'customer_addresses']
-        columns = {}
-        for table in tables:
-            names = [r['name'] for r in conn.execute(f'PRAGMA table_info("{table}")')]
-            if mode != 'admin' and table == 'items':
-                names = [n for n in names if n in {'sku','item_code','name','sellingprice','availablequantity'}]
-            if names:
-                columns[table] = names
-        lines = ['CURRENT SQL TABLE MAP (metadata only). Qualify columns with table aliases. '
-                 'Join the table that owns each requested column; do not guess column locations.']
-        lines.extend(f'{table}({", ".join(names)})' for table,names in columns.items())
-        joins = []
-        for table in columns:
-            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'):
-                if fk['table'] in columns and fk['from'] in columns[table] and fk['to'] in columns[fk['table']]:
-                    joins.append(f'{table}.{fk["from"]} = {fk["table"]}.{fk["to"]}')
-        lines.append('Declared join keys: ' + '; '.join(joins))
-        insensitive = [f'{table}.{name}' for table, names in columns.items()
-                       for name in names if name.casefold() in CASE_INSENSITIVE_COLUMNS.get(table, ())]
-        lines.append('Case-insensitive descriptive columns (COLLATE NOCASE): ' + ', '.join(insensitive)
-                     + '. Other columns retain their declared comparison rules.')
-        lines.append("Canonical status values: orders.order_status=draft/placed/cancelled; "
-                     "order_details.status=active/cancelled; refund_requests.status=pending/approved; "
-                     "order_service.fulfillment_status=unknown/placed/shipped/delivered/cancelled. "
-                     "Use canonical lowercase values for writes.")
-        if {'order_status', 'order_invoice'} <= set(columns.get('orders', ())):
-            lines.append("Cancellation history: cancelled covers both stages. A cancelled draft never had an "
-                         "issued invoice; a cancellation after placement retains its issued invoice. "
-                         "For cancellation lists or split counts, use orders AS o and project "
-                         f"{CANCELLED_FROM_SQL} AS cancelled_from. This is a derived alias. "
-                         "Use cancelled_from in tool results when present. Describe the stage explicitly. "
-                         "A cancelled draft is ineligible for an order refund because it was never placed or invoiced. "
-                         "Explain this lifecycle reason before mentioning missing refund requests. "
-                         "For a placed cancellation, check the current "
-                         "refund record before stating any refund outcome.")
-        lines.append('Aggregate each one-to-many side before combining totals. Missing columns are unavailable; do not invent them.')
-        if 'price_history' in columns:
-            lines.append("Prices use UTC timestamp intervals [effective_from,effective_to), with NULL end open. "
-                         "For current SQL use julianday(effective_from)<=julianday('now') AND "
-                         "(effective_to IS NULL OR julianday('now')<julianday(effective_to)+"
-                         "CASE WHEN length(trim(effective_to))=10 THEN 1 ELSE 0 END). "
-                         "Legacy date-only ends include that day. SQLite date functions round sub-millisecond values; "
-                         "product tools use exact timestamp prices. Draft pricing uses order_details.price_as_of; "
-                         "issued prices use invoice_lines.")
-        lines.append('Product search: product_matches(i.name, ?) or product_matches(d.category, ?) matches words/phrases regardless of case, spaces, underscores, hyphens and common plurals. Use only on product text; IDs, prices and other fields keep exact semantics.')
-        hint = '\n'.join(lines)
-        if unchanged and identity == _database_identity(path):
-            with _schema_cache_lock:
-                _schema_cache[key] = hint
-                _schema_cache.move_to_end(key)
-                while len(_schema_cache) > _SCHEMA_CACHE_LIMIT:
-                    _schema_cache.popitem(last=False)
-        return hint
-    finally:
-        conn.close()
-
-
-def authorize(action, arg1, arg2, db, trigger):
-    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_READ and arg1 in TABLES and db in ('main', None):
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_FUNCTION and (arg2 or '').lower() in FUNCTIONS:
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_PRAGMA and arg1 == 'table_info' and arg2 in TABLES:
-        return sqlite3.SQLITE_OK
-    return sqlite3.SQLITE_DENY
-
-
-def execute_sql_query(query: str | None = None, chart: dict | None = None, parameters: list | None = None,
-                      queries: list[dict] | None = None, report: str | None = None) -> dict:
-    """Answer flexible questions with one read-only SELECT/WITH or PRAGMA table_info(table).
-
-    Product discovery uses qualified SQL against items and optional product_details.
-    Search names/categories with product_matches(i.name, ?) or product_matches(d.category, ?).
-    It normalizes case, spaces, underscores, hyphens and common plurals; it matches whole words/phrases.
-    Simple name/category equality, IN and LIKE filters are normalized locally, without changing stored labels.
-    Keep item codes, SKUs, customer IDs and financial fields exact. Ambiguous products need clarification.
-    Count all matching products before displaying a page. Use stable ordering and LIMIT/OFFSET.
-    Include out-of-stock products unless explicitly filtered. Preserve scope on next-page requests.
-    Use effective price_history for current prices; overlapping prices are unknown, never guessed.
-
-    Join/filter/group permitted base tables instead of needing a tool per question.
-    Inspect columns with PRAGMA. No database views exist. External payment records are unavailable;
-    store_credit_ledger records local credit grants and redemptions only.
-    Invoice totals minus recorded refunds are not amounts due or proof of settlement.
-    Use ? placeholders with parameters for user-provided values; never interpolate names into SQL.
-    For requested admin visuals optionally pass chart={"type":"bar","title":"Revenue","x":"month","y":["revenue"]}.
-    Types: bar,grouped_bar,horizontal_bar,stacked_bar,normalized_bar,line,pie,
-    scatter,bubble,histogram,boxplot,heatmap,range,combo,timeline.
-    x/y and optional group, size, label or end must name returned columns.
-    Histogram: numeric x,y:[],bins 2-50. Heatmap: x,group,y:[measure]. Range: y:[low,high].
-    Other types accept the column counts in the chart contract. Optional x_type: categorical,numeric,temporal.
-    Standard bars/lines also accept group with one y, returning one row per x/group pair.
-    Distributions use complete observations; summaries aggregate duplicate coordinates in SQL.
-    Include a currency column for money and query ONE currency per chart; currency is metadata,
-    never an axis or a constant USD series. Order trends chronologically. No chart-count cap.
-    Chart queries allow up to 1000 rows; ordinary reads use SQL_MAX_ROWS. No charts from truncated results. A chart_error leaves query rows usable; correct SQL/spec if needed.
-    Admins may use queries instead of query/chart/parameters. Each entry is
-    {"query":"SELECT ...","parameters":[],"chart":{...},"title":"Optional dataset title"}.
-    Omit chart for table reads. Batch independent reads for a dashboard or multi-part analysis.
-    To export table results, set report to a descriptive title. Results keep query order and each reports its own errors.
-    """
-    if queries is None and report is None:
-        return _execute_read(query, chart, parameters)
-
-    from mcp_server.access import scope
-    if (scope.get() or {}).get('mode') != 'admin':
-        return {'ok': False, 'error': 'SQL batches and report exports require Admin mode.'}
-    if report is not None and (not isinstance(report, str) or not report.strip() or len(report) > 160):
-        return {'ok': False, 'error': 'Provide a report title of 1 to 160 characters.'}
-    if queries is None:
-        return _execute_read(query, chart, parameters, export=True)
-    if any(value is not None for value in (query, chart, parameters)) or not isinstance(queries, list) or not queries:
-        return {'ok': False, 'error': 'Provide either one query or a non-empty queries list.'}
-    for read in queries:
-        if (not isinstance(read, dict) or 'query' not in read
-                or set(read) - {'query', 'parameters', 'chart', 'title'}):
-            return {'ok': False, 'error': 'Each batch entry needs query and may include parameters, chart and title.'}
-        title = read.get('title')
-        if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 160):
-            return {'ok': False, 'error': 'Dataset titles must contain 1 to 160 characters.'}
-    with closing(connect(readonly=True)) as conn:
-        _prepare_connection(conn)
-        conn.execute('BEGIN')
-        results = [
-            _execute_read(read['query'], read.get('chart'), read.get('parameters'),
-                          export=report is not None, connection=conn)
-            for read in queries
-        ]
-    return {'ok': True, 'results': results, 'query_count': len(results)}
-
-
-def _prepare_connection(conn):
-    register_product_search(conn)
-    conn.execute('PRAGMA query_only=ON')
-    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1000000)
-    conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 20000)
-    conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 100)
-
-
-def _execute_read(query, chart, parameters, *, export=False, connection=None):
-    if not isinstance(query, str) or not query.strip() or len(query) > 20000:
-        return {'ok': False, 'error': 'Provide one SQL query of at most 20000 characters.'}
-    if parameters is not None and (not isinstance(parameters,list) or len(parameters)>100 or
-            any(value is not None and not isinstance(value,(str,int,float)) for value in parameters)):
-        return {'ok':False,'error':'Parameters must be a list of up to 100 text, numeric or null values.'}
-    if any((isinstance(value, int) and not -(2**63) <= value < 2**63) or
-           (isinstance(value, float) and not math.isfinite(value)) for value in parameters or []):
-        return {'ok':False,'error':'Numeric parameters must be finite and integers must fit the SQLite 64-bit range.'}
-    from mcp_server.access import scope, customer_query_connection
-    access = scope.get()
-    if chart is not None and (not access or access['mode'] != 'admin'):
-        return {'ok': False, 'error': 'Analytics charts require Admin mode.'}
-    conn = connection or (customer_query_connection(access['customer_id'], staff=access['mode'] == 'cashier')
-            if access and access['mode'] in ('customer', 'cashier') else connect(readonly=True))
-    try:
-        if connection is None:
-            _prepare_connection(conn)
-        deadline = time.monotonic() + 2
-        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
-        conn.set_authorizer(authorize)
-        original_query = query
-        query = normalize_product_filters(query)
-        repaired_aliases = False
+def scoped_tool(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        mode = kwargs.pop('execution_mode', 'customer')
+        # Read the verified customer account supplied by the application, not an ownership claim in chat.
+        customer = kwargs.pop('execution_customer_id', None)
+        coupon_codes = kwargs.pop('execution_coupon_codes', None)
+        allowed = ADMIN_TOOLS if mode == 'admin' else CASHIER_TOOLS if mode == 'cashier' else CUSTOMER_TOOLS if mode == 'customer' else set()
+        if fn.__name__ not in allowed:
+            return {'ok': False, 'error': 'This tool is not available in the current mode.'}
+        bound = inspect.signature(fn).bind(*args, **kwargs)
+        arguments = bound.arguments
+        if fn.__name__ == 'download_invoice':
+            if mode in ('admin', 'cashier') and arguments.get('action', 'generate') != 'generate':
+                return {'ok': False, 'error': 'Staff invoice access is read-only. The customer must confirm corrections in their own conversation.'}
+            requested_owner = arguments.get('customer_id')
+            if (mode == 'customer' and not customer) or (customer and requested_owner not in (None, customer)):
+                return {'ok': False, 'error': 'The invoice must belong to the verified customer account.'}
+            if customer:
+                arguments['customer_id'] = customer
+        if mode == 'customer' and fn.__name__ == 'manage_customer' and arguments.get('action', 'create') == 'create':
+            return {'ok': False, 'error': 'Create your account using the registration form, then sign in. Account credentials must never be sent in chat.'}
+        if mode == 'customer' and 'customer_id' in arguments:
+            if not customer or arguments['customer_id'] != customer:
+                return {'ok': False, 'error': 'Sign in to the matching customer account before accessing its records.'}
+        if mode == 'customer' and fn.__name__ == 'apply_promotion':
+            code = arguments.get('promo_code')
+            supplied = {value.strip().casefold() for value in coupon_codes or []
+                        if isinstance(value, str)} if isinstance(coupon_codes, list) else set()
+            if not isinstance(code, str) or code.strip().casefold() not in supplied:
+                return {'ok': False, 'error': 'Ask the customer to provide a coupon code. '
+                        'Only a code explicitly supplied by that customer can be checked or applied.'}
+        token = scope.set({'mode': mode, 'customer_id': customer})
         try:
-            cursor = conn.execute(query, parameters or [])
-        except sqlite3.OperationalError as exc:
-            repaired = quote_reserved_aliases(query) if chart is not None and 'syntax error' in str(exc).lower() else query
-            if repaired == query:
-                raise
-            cursor = conn.execute(repaired, parameters or [])
-            repaired_aliases = True
-        from mcp_server.charts import MAX_CHART_ROWS
-        from context.reports import MAX_REPORT_ROWS
-        row_limit = MAX_CHART_ROWS if chart is not None else MAX_REPORT_ROWS if export else settings.SQL_MAX_ROWS
-        rows = cursor.fetchmany(row_limit + 1)
-        if any(isinstance(value, float) and not math.isfinite(value) for row in rows for value in row):
-            return {'ok':False,'error':'The query produced a non-finite number. Narrow the calculation or correct its inputs.'}
-        result = {'ok': True, 'columns': [c[0] for c in cursor.description or []],
-                'rows': [list(row) for row in rows[:row_limit]],
-                'row_count': min(len(rows), row_limit),
-                'truncated': len(rows) > row_limit,
-                'coverage_note': 'row_count counts returned SQL rows only. SQL LIMIT and filters may exclude matches even when truncated is false. Count the full matching set separately before claiming completeness, absence or a store-wide total.'}
-        if repaired_aliases:
-            result['query_note'] = 'Quoted reserved SQL aliases locally. Use names such as series_label instead of group/order in future queries.'
-        if query != original_query:
-            result['product_search_note'] = 'Product name/category filters ignore case, separators and common plural endings. IDs and financial filters retain their original semantics.'
-        if chart is not None:
-            from mcp_server.charts import prepare_chart
-            try:
-                payload = prepare_chart(result['columns'],result['rows'],chart,result['truncated'])
-                result['chart'] = {key:value for key,value in payload.items() if key != 'data'}
-            except ValueError as exc:
-                result['chart_error'] = str(exc)
-        return result
-    except sqlite3.Error as exc:
-        result = {'ok': False, 'error': f'Query rejected or failed: {exc}'}
-        if any(term in str(exc).lower() for term in ('no such column', 'ambiguous column', 'no such table')):
-            result['schema_hint'] = schema_hint(access['mode'] if access else 'admin')
-        return result
+            return fn(*bound.args, **bound.kwargs)
+        finally:
+            # Restore the prior scope so one tool/request cannot leak its account identity into another.
+            scope.reset(token)
+    run.__signature__ = inspect.signature(fn).replace(parameters=[
+        *inspect.signature(fn).parameters.values(),
+        inspect.Parameter('execution_mode', inspect.Parameter.KEYWORD_ONLY, default='customer', annotation=str),
+        inspect.Parameter('execution_customer_id', inspect.Parameter.KEYWORD_ONLY, default=None, annotation=str | None),
+        inspect.Parameter('execution_coupon_codes', inspect.Parameter.KEYWORD_ONLY, default=None, annotation=list[str] | None)])
+    run.__annotations__ = {**fn.__annotations__, 'execution_mode': str, 'execution_customer_id': str | None,
+                           'execution_coupon_codes': list[str] | None}
+    return run
+
+
+def customer_query_connection(customer_id, staff=False):
+    """Materialize only public products and associated customer rows in an isolated DB.
+
+    User SQL never touches the source connection, preventing joins, CTEs and main.table
+    qualification from bypassing a row filter. Original column names and selected
+    descriptive-text collations are preserved; identifiers retain binary matching.
+    """
+    source, target = connect(readonly=True), sqlite3.connect(':memory:')
+    target.row_factory = sqlite3.Row
+    queries = {
+        'billing_config': "SELECT key,value FROM billing_config WHERE key IN ('currency','tax_rate','shipping_amount')",
+        'items': 'SELECT sku,item_code,name,sellingprice,availablequantity FROM items',
+        'product_details': 'SELECT * FROM product_details',
+        'product_attributes': 'SELECT * FROM product_attributes',
+        'product_relations': 'SELECT * FROM product_relations',
+        'price_history': 'SELECT * FROM price_history',
+        'customers': 'SELECT * FROM customers WHERE customer_id=?',
+        'orders': 'SELECT * FROM orders WHERE customer_id=?',
+        'customer_billing_details':'SELECT * FROM customer_billing_details WHERE customer_id=?',
+        'store_credit_ledger':'SELECT * FROM store_credit_ledger WHERE customer_id=?',
+    }
+    # Coupons are private codes supplied by a customer, not public products.
+    # Keep this table out of customer SQL entirely; row filters or LIMITs would
+    # still let a model enumerate codes in follow-up queries.
+    if staff:
+        queries['promotions'] = 'SELECT * FROM promotions'
+    else:
+        queries['customer_addresses'] = 'SELECT * FROM customer_addresses WHERE customer_id=? AND active=1'
+    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','refund_requests','refund_details','order_service','invoice_revisions','order_delivery'):
+        # Join each child table to orders so an alternate SQL join cannot evade the original customer
+        # restriction.
+        queries[table] = f'SELECT t.* FROM {table} t JOIN orders o ON o.order_id=t.order_id WHERE o.customer_id=?'
+    try:
+        source.execute('BEGIN')
+        for table, sql in queries.items():
+            if staff:
+                sql = sql.replace(' WHERE customer_id=?', '').replace(' WHERE o.customer_id=?', '')
+            cursor = source.execute(sql, (customer_id,) if '?' in sql else ())
+            columns = [c[0] for c in cursor.description]
+            nocase = CASE_INSENSITIVE_COLUMNS.get(table, ())
+            declarations = ['"'+c+'"' + (' COLLATE NOCASE' if c.casefold() in nocase else '') for c in columns]
+            target.execute('CREATE TABLE '+table+' ('+', '.join(declarations)+')')
+            target.executemany('INSERT INTO '+table+' VALUES ('+','.join('?' for _ in columns)+')', cursor.fetchall())
+        target.commit()
+        return target
+    except BaseException:
+        target.close()
+        raise
     finally:
-        if connection is None:
-            conn.close()
+        source.close()
