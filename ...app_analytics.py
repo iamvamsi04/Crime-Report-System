@@ -1,194 +1,184 @@
-# This module validates executed result shapes and evidence; it never routes a request by matching human
-# wording.
-"""Validate and present executed report results without classifying user wording.
-
-The model chooses the relevant tools and presentation from the conversation.
-These helpers operate only on structured tool arguments and verified results;
-they never turn a word in the user's message into a tool call or dashboard.
-"""
-from dataclasses import dataclass
+"""Native business tables from known, authorized tool result fields."""
 import re
+import unicodedata
 
-READ_TOOLS = frozenset({'execute_sql_query', 'compare_products', 'find_cheaper_alternatives'})
-CATEGORY_EXPRESSION = "COALESCE(NULLIF(TRIM(d.category),''),'Uncategorised')"
-INVENTORY_QUERY = (f'SELECT {CATEGORY_EXPRESSION} AS category, COUNT(*) AS products, '
-    'SUM(CASE WHEN i.availablequantity>0 THEN 1 ELSE 0 END) AS in_stock_products '
-    'FROM items i LEFT JOIN product_details d ON d.item_code=i.item_code '
-    f'GROUP BY {CATEGORY_EXPRESSION} ORDER BY category')
+from context.tables import table_artifact
 
 
-@dataclass(frozen=True)
-class ResponseContract:
-    """The shape of an executed result, not an interpretation of a question."""
-    kind: str = 'conversation'
-    domains: frozenset[str] = frozenset()
-
-    @property
-    def needs_evidence(self):
-        return self.kind != 'conversation'
-
-    @property
-    def report(self):
-        return self.kind == 'inventory_overview'
-
-    @property
-    def tool(self):
-        return 'execute_sql_query' if self.report else None
-
-    def prompt(self):
-        # Retained for callers using older policy builders. An observed report
-        # must never become instructions to execute a different request.
-        return ''
+AMOUNTS = ('subtotal','discount_applied','tax_amount','shipping_amount','charged_price',
+           'refund_amount','net_billed_after_ledger_refunds')
 
 
-# Legacy compatibility helpers.
-# def request_contract(*args, **kwargs):
-#     return ResponseContract()
-#
-# def chart_intent(*args, **kwargs):
-#     return None
-#
-# def table_intent(*args, **kwargs):
-#     return False
-#
-# def general_explanation(*args, **kwargs):
-#     return True
+def title(key):
+    return key.replace('_', ' ').capitalize()
 
 
-def result_contract(name, arguments, data):
-    """Recognize complete report shapes from the exact read that actually ran.
-
-    This can be used to format trustworthy report summaries locally. It grants
-    no authority to dispatch tools, expand scope, or replace
-    a model's interpretation of the user's current request.
-    """
-    if not isinstance(arguments, dict) or not isinstance(data, dict) or data.get('ok') is not True:
-        return ResponseContract()
-    if name == 'execute_sql_query' and arguments.get('chart') is None and inventory_rows(arguments, data) is not None:
-        return ResponseContract('inventory_overview', domains=frozenset({'products'}))
-    return ResponseContract()
+def evidence_text(value, depth=0):
+    """Readable evidence cells, without turning a tool payload into visible JSON."""
+    if depth > 3:
+        return 'Additional detail requires review'
+    if isinstance(value, dict):
+        return '; '.join(f'{title(str(key))}: {evidence_text(cell,depth+1)}'
+                         for key,cell in value.items())
+    if isinstance(value, list):
+        return '; '.join(evidence_text(cell,depth+1) for cell in value)
+    return 'Not recorded' if value is None else str(value)
 
 
-def sql_text(query):
-    """Remove data literals/comments before reading referenced SQL table names."""
-    return re.sub(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'", ' ', str(query)).casefold()
+def comparison_table(data):
+    """Put each product in one column and each comparable fact in one row."""
+    products = data.get('products')
+    if not isinstance(products, list) or not 2 <= len(products) <= 5 or any(
+            not isinstance(product, dict) for product in products):
+        raise ValueError('A comparison needs two to five distinct products.')
+    codes = [product.get('item_code') for product in products]
+    if any(not isinstance(code, str) or not code for code in codes) or len(set(codes)) != len(codes):
+        raise ValueError('Comparison products must have distinct recorded identities.')
+
+    names = [str(product.get('name') or f'Product {index}').strip()[:85]
+             for index, product in enumerate(products, 1)]
+    columns = ['Feature']
+    used = {'feature'}
+    for index, name in enumerate(names, 1):
+        heading = name
+        hidden_heading = name.casefold().replace('_', '').replace('-', '').replace(' ', '') in {'sku', 'itemcode'}
+        if not heading or hidden_heading or heading.casefold() == 'feature' or sum(
+                candidate.casefold() == name.casefold() for candidate in names) > 1:
+            heading = f'{name or "Product"} (Product {index})'
+        suffix = 1
+        while heading.casefold() in used:
+            heading = f'{name or "Product"} (Product {index}, {suffix})'
+            suffix += 1
+        columns.append(heading)
+        used.add(heading.casefold())
+
+    rows = []
+    if any(len(str(product.get('name') or '').strip()) > 85 for product in products):
+        rows.append(['Full product name', *[product.get('name') or 'Not recorded' for product in products]])
+    for label, field in (
+        ('Category', 'category'), ('Description', 'description'), ('Unit price', 'unit_price'),
+        ('Quantity', 'quantity'), ('Merchandise total', 'merchandise_total'),
+        ('Available units', 'available_quantity'), ('Enough stock', 'enough_stock'),
+        ('Within merchandise budget', 'within_budget'),
+    ):
+        rows.append([label, *[product.get(field) if product.get(field) is not None else 'Not recorded'
+                              for product in products]])
+    rows.append(['Currency', *[data.get('currency') or 'Not recorded' for _ in products]])
+
+    def normal(value):
+        return ' '.join(re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', str(value)).casefold()))
+
+    features = {}
+    for product in products:
+        for key in product.get('features', {}):
+            features.setdefault(normal(key), key)
+    labels = {row[0].casefold() for row in rows}
+    for feature_key, feature in sorted(features.items()):
+        label = title(str(feature))
+        if label.casefold() in labels:
+            label = 'Recorded ' + label
+        while label.casefold() in labels:
+            label += ' (recorded)'
+        labels.add(label.casefold())
+        values = []
+        for product in products:
+            recorded = product.get('features', {})
+            key = next((key for key in recorded if normal(key) == feature_key), None)
+            ambiguous = {normal(key) for key in product.get('ambiguous_features', [])}
+            if feature_key in ambiguous:
+                value = 'Conflicting records'
+            elif key is None or recorded[key] is None:
+                value = 'Not recorded'
+            else:
+                value = recorded[key]
+                unit = product.get('feature_units', {}).get(key)
+                if unit:
+                    value = f'{evidence_text(value)} {unit}'
+                elif isinstance(value, (dict, list)):
+                    value = evidence_text(value)
+            values.append(value)
+        rows.append([label, *values])
+    for label, field in (('Matched requirements', 'matched_features'),
+                         ('Unrecorded requirements', 'unknown_features'),
+                         ('Different requirements', 'different_features')):
+        rows.append([label, *[', '.join(product.get(field, [])) or 'None' for product in products]])
+    return table_artifact('Product comparison', columns, rows,
+        coverage='Current merchandise prices before discounts, tax and shipping. Stock and budget checks use '
+                 'the requested quantity. Missing or conflicting specifications stay explicit, and recorded '
+                 'units are preserved without conversion. Price does not establish overall quality or compatibility.')
 
 
-def _inventory_recipe(query, columns):
-    # Prove a small family of equivalent one-row-per-item queries. Arbitrary
-    # joins or CTEs cannot establish complete inventory from aliases alone.
-    tokens = re.findall(r"'(?:''|[^'])*'|--[^\n]*|/\*[\s\S]*?\*/|[^']+?", str(query))
-    clean = ''.join(token for token in tokens if not token.startswith(('--', '/*')))
-    clean = re.sub(r'\s+', '', clean).casefold().rstrip(';')
-    clean = re.sub(r'["`\[\]]', '', clean)
-    expression = r"coalesce\((?:nullif\((?:trim\(d\.category\)|d\.category),''\)|d\.category),'uncategorised'\)"
-    count = r'count\((?:\*|distincti\.item_code)\)'
-    projection = (rf'{count}asproduct_count' if columns == ['category', 'product_count'] else
-        rf'{count}asproducts,sum\(casewheni\.availablequantity>0then1else0end\)asin_stock_products')
-    pattern = (rf'select{expression}ascategory,{projection}'
-        r'fromitems(?:as)?ileft(?:outer)?joinproduct_details(?:as)?dond\.item_code=i\.item_code'
-        rf'groupby(?:category|{expression})orderbycategory(?:asc)?')
-    # Only a full SQL syntax match establishes complete inventory coverage; user wording is never inspected.
-    return re.fullmatch(pattern, clean) is not None
+def tool_tables(name, data, arguments=None):
+    """Display whitelisted records only. Never query, convert units or infer totals."""
+    if not isinstance(data, dict) or not data.get('ok'):
+        return []
+    if name == 'compare_products':
+        return [comparison_table(data)]
+    tables = []
 
+    def add(label, columns, rows, *, coverage=None, total=None, truncated=False):
+        tables.append(table_artifact(label, columns, rows, coverage=coverage,
+                                     total_rows=total, truncated=truncated))
 
-def category_rows(data):
-    """Validate displayed category rows independently of full-inventory coverage."""
-    if (not isinstance(data, dict) or data.get('ok') is not True
-            or type(data.get('truncated', False)) is not bool):
-        return None
-    columns = data.get('columns')
-    if (columns not in (['category', 'product_count'], ['category', 'products', 'in_stock_products'])
-            or not isinstance(data.get('rows'), list)):
-        return None
-    result, seen = [], set()
-    for row in data['rows']:
-        if not isinstance(row, list) or len(row) != len(columns):
-            return None
-        category, count = row[:2]
-        if (not isinstance(category, str) or not category.strip()
-                or len(category) > 2000 or category in seen):
-            return None
-        if type(count) is not int or count < 0:
-            return None
-        if len(row) == 3 and (type(row[2]) is not int or not 0 <= row[2] <= count):
-            return None
-        seen.add(category)
-        result.append(list(row))
-    return result
+    def records(label, rows, fields, *, coverage=None, total=None, truncated=False):
+        add(label, [title(field) for field in fields],
+            [[row.get(field) for field in fields] for row in rows],
+            coverage=coverage,total=total,truncated=truncated)
 
+    if name == 'find_cheaper_alternatives':
+        products = data.get('alternatives', [])
+        price_fields = ('item_code','name','unit_price','quantity','merchandise_total','available_quantity')
 
-def inventory_rows(arguments, data):
-    if data.get('truncated') or not _inventory_recipe(arguments.get('query', ''), data.get('columns')):
-        return None
-    result = category_rows(data)
-    if result is None:
-        return None
-    return sorted(result, key=lambda row: row[0].casefold())
+        def prices(label, rows, **kwargs):
+            add(label, ['Item code','Product','Currency','Unit price','Quantity','Merchandise total','Available units'],
+                [[p.get('item_code'),p.get('name'),data.get('currency'),
+                  *[p.get(field) for field in price_fields[2:]]] for p in rows], **kwargs)
 
-
-def _receipt_domains(name, arguments, data):
-    if not data.get('ok'):
-        return frozenset()
-    if name in ('compare_products', 'find_cheaper_alternatives'):
-        return frozenset({'products'})
-    if name != 'execute_sql_query':
-        return frozenset()
-    query = sql_text(arguments.get('query', ''))
-    if re.match(r'\s*pragma\b', query):
-        return frozenset()
-    tables = set(re.findall(r'\b(?:from|join)\s+["`\[]?(?:main\.)?([a-z_][a-z_0-9]*)', query))
-    owners = {
-        'products': {'items','product_details','product_attributes','product_relations','price_history'},
-        'orders': {'orders','order_details','order_service','order_requests','order_fulfilled'},
-        'invoices': {'orders','invoice_lines','invoice_revisions'},
-        'refunds': {'refund_requests','refund_details'},
-        'refund_requests': {'refund_requests'},
-        'finance': {'orders','invoice_lines'},
-        'customers': {'customers','customer_billing_details'},
-        'credit': {'store_credit_ledger'}, 'anomalies': {'billing_audit'},
-    }
-    result = {domain for domain, sources in owners.items() if sources & tables}
-    refund_fields = {'refund_amount', 'refund_status', 'refund_reason'}
-    columns = data.get('columns', [])
-    if 'orders' in tables and (re.search(r'\brefund_(?:amount|status|reason)\b', query) or
-            isinstance(columns, list) and any(isinstance(column, str) and column.casefold() in refund_fields for column in columns)):
-        result.add('refunds')
-    business_tables = set().union(*owners.values(), {'billing_config', 'promotions'})
-    if business_tables & tables:
-        result.add('records')
-    return frozenset(result)
-
-
-def evidence_for(contract, name, arguments, data):
-    if not data.get('ok'):
-        return False
-    if contract.report:
-        return result_contract(name, arguments, data) == contract
-    observed = _receipt_domains(name, arguments, data)
-    return bool(observed & contract.domains) if contract.domains else bool(observed)
-
-
-def evidence_satisfied(contract, receipts):
-    if contract.kind != 'data':
-        return any(evidence_for(contract, *receipt) for receipt in receipts)
-    observed = frozenset().union(*(_receipt_domains(*receipt) for receipt in receipts))
-    return contract.domains <= observed if contract.domains else bool(observed)
-
-
-def report_reply(contract, receipt):
-    """Stable presentation of verified reports; never reuse model-made numbers."""
-    name, arguments, data = receipt
-    if contract.kind == 'inventory_overview':
-        rows = inventory_rows(arguments, data)
-        total = sum(row[1] for row in rows)
-        if not rows:
-            return 'There are no products in the store. The category table is empty.'
-        stock = ''
-        if data['columns'] == ['category', 'products', 'in_stock_products']:
-            available = sum(row[2] for row in rows)
-            stock = f'{available} product' + ('s are' if available != 1 else ' is') + ' currently in stock. '
-        return (f'The store has {total} product' + ('s' if total != 1 else '')
-                + f' across {len(rows)} categor' + ('ies' if len(rows) != 1 else 'y') + '. '
-                + stock + 'The table lists every category. Product counts refer to distinct products, not stock units.')
-    return ''
+        coverage = 'Current merchandise prices before discounts, tax and shipping. Price does not establish overall quality or compatibility.'
+        source = data.get('source')
+        if isinstance(source, dict):
+            prices('Reference product',[source],coverage='Reference for price comparison; this is not one of the cheaper alternatives.')
+        coverage += f" Showing {len(products)} of {data.get('matched_count',len(products))} qualifying alternatives."
+        prices('Cheaper alternatives', products, coverage=coverage, total=data.get('matched_count'),
+               truncated=bool(data.get('truncated')))
+        displayed = ([source] if isinstance(source, dict) else []) + products
+        def normal(value):
+            return ' '.join(re.findall(r'[^\W_]+',unicodedata.normalize('NFKC',str(value)).casefold()))
+        feature_names = {}
+        for product in displayed:
+            for key in product.get('features',{}):
+                feature_names.setdefault(normal(key),key)
+        feature_rows, checks = [], []
+        for product in displayed:
+            for feature_key, feature in sorted(feature_names.items()):
+                ambiguous = {normal(key) for key in product.get('ambiguous_features',[])}
+                recorded_key = next((key for key in product.get('features',{}) if normal(key)==feature_key),None)
+                value = ('Conflicting records' if feature_key in ambiguous else
+                         product.get('features',{}).get(recorded_key,'Not recorded'))
+                # Feature objects/lists are explanatory text; scalar units remain separate.
+                if isinstance(value,(dict,list)):
+                    value = evidence_text(value)
+                feature_rows.append([product.get('item_code'),product.get('name'),feature,value,
+                                     product.get('feature_units',{}).get(recorded_key)])
+            checks.append([product.get('item_code'),product.get('enough_stock'),product.get('within_budget'),
+                           ', '.join(product.get('matched_features',[])) or 'None specified',
+                           ', '.join(product.get('unknown_features',[])) or 'None',
+                           ', '.join(product.get('different_features',[])) or 'None'])
+        if feature_rows:
+            add('Recorded product features',['Item code','Product','Feature','Recorded value','Unit'],feature_rows,
+                coverage='Missing and conflicting records are not established specifications. Units are preserved without conversion.')
+        if checks:
+            add('Requested criteria',['Item code','Enough stock','Within merchandise budget','Matched features','Unrecorded requirements','Different requirements'],checks,
+                coverage='Budget and feature checks refer only to the requirements supplied for this comparison.')
+    elif name in ('request_order','manage_draft') and isinstance(data.get('estimate'),dict):
+        add('Draft estimate',['Measure','Amount'],[[title(k),data['estimate'][k]]
+            for k in AMOUNTS if k in data['estimate']],coverage='Draft estimate only. The order is not placed by displaying this table.'
+            + (' Currency: '+str(data['currency'])+'.' if data.get('currency') else ' Currency is not included in this result; check the draft details.'))
+    elif name == 'process_refund':
+        if isinstance(data.get('items'),list):
+            records('Return items',data['items'],('item_code','quantity'),
+                    coverage='Items recorded in the tool result; an estimate is not an approved refund.')
+        if isinstance(data.get('orders'),list):
+            records('Return request review',data['orders'],
+                ('order_id','eligible','amount','currency','required_approver','submitted','reason'),coverage=data.get('note'),total=data.get('matched_count'))
+    return tables
