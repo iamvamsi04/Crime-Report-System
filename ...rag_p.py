@@ -41,15 +41,15 @@ horizontal_bar | Category in x and numeric measure in y. The renderer rotates th
 stacked_bar | Exclusive, additive, nonnegative parts. Use up to four y columns or one y plus group.
 normalized_bar | Stack with a positive total at each x. The renderer computes percentages.
 line | Ordered x and numeric y measures. Use x_type='temporal' for dates.
-pie | Exclusive, nonnegative parts of a positive whole. Return all categories so display grouping preserves totals. Label a requested subset. Include Other for top-N shares of the whole.
+pie | At least two positive, exclusive parts of a whole. Group by a nonconstant dimension. Return all categories or label the selected subset; use Other for top-N shares of the whole.
 scatter | Two materially different numeric measures per observation. Optional group or label.
 bubble | Numeric x/y and a useful positive size at the same grain. Use a different relationship from scatter in a general dashboard. Optional group or label.
 histogram | One raw numeric observation per row in x, y:[], optional bins from 2 to 50. The renderer bins the values.
 boxplot | Categorical x and one raw numeric y per observation, with repeated observations for a meaningful distribution. Optional group.
-heatmap | Two distinct dimensions in x and group and one numeric y. Return one row per x/group cell. Use temporal x for ordered dates or months.
+heatmap | Group observed rows by two distinct dimensions. Return one numeric y per x/group pair. Use temporal x for dates or months.
 range | One row per x with y:[lower,upper], same units and lower <= upper.
 combo | One row per x with y:[bar_measure,line_measure]. These measures use separate scales.
-timeline | Full recorded ISO date/time in x, event/task label in group, and y:[]. Use unique x/group pairs. Optional end may be null for a point or a recorded date/time at or after x for an interval.
+timeline | Recorded ISO date/time in x, event/task label in group, and y:[]. Optional end may be null or a real date/time at or after x. Use an event identifier to distinguish coincident events.
 
 Use distinct returned aliases, finite values and 1–1000 untruncated rows. Distributions need raw
 observations. Series support up to four same-unit y columns or one y with group. Aggregate to one
@@ -132,7 +132,7 @@ def temporal(value, periods=False):
     return parsed
 
 
-def prepare_chart(columns, rows, spec, truncated=False):
+def prepare_chart(columns, rows, spec, truncated=False, *, allow_single_slice=False):
     if not isinstance(spec,dict) or set(spec)-SPEC_FIELDS:
         raise ValueError('Chart accepts only type, title, x, y, group, size, end, x_type, bins and label.')
     spec = dict(spec)
@@ -297,10 +297,13 @@ def prepare_chart(columns, rows, spec, truncated=False):
                 if end<start:
                     raise ValueError('Timeline end must not precede its start.')
                 record[extras['end']] = end.isoformat()
-        key=(coordinate,record[extras['group']]) if kind in ('heatmap','timeline') or grouped_series else coordinate
+        if kind == 'timeline':
+            key = (coordinate, record[extras['group']], record.get(extras.get('end')))
+            if key in seen:
+                continue
+        else:
+            key = (coordinate, record[extras['group']]) if kind == 'heatmap' or grouped_series else coordinate
         if kind not in ('scatter','bubble','histogram','boxplot') and key in seen:
-            if kind == 'timeline':
-                raise ValueError('Timeline has duplicate start times for the same label. Use a distinct label per event or task.')
             raise ValueError('Group duplicate chart coordinates in SQL before charting. Normalize currency before grouping, including legacy NULL/blank values; use an outer CTE to group the resolved currency, not the raw source column. Do not sum averages or ratios to repair duplicates.')
         seen.add(key)
         if nonnegative and any(v<0 for v in values.values()):
@@ -320,8 +323,12 @@ def prepare_chart(columns, rows, spec, truncated=False):
             groups[record[x]] = groups.get(record[x], 0) + record[ys[0]]
         if any(not math.isfinite(total) or total <= 0 for total in groups.values()):
             raise ValueError('Percentage charts require a finite positive total for each x value.')
-    if kind == 'pie' and sum(r[ys[0]] for r in records)<=0:
-        raise ValueError(f'{kind} needs a positive total.')
+    if kind == 'pie':
+        positive = sum(row[ys[0]] > 0 for row in records)
+        if not positive:
+            raise ValueError('pie needs a positive total.')
+        if positive == 1 and not allow_single_slice:
+            raise ValueError('Pie has only one positive slice. Choose a real breakdown with at least two nonzero parts.')
     # Check aggregate y totals as well as individual values because finite inputs can still overflow when
     # summed.
     totals=[sum(r[y] for r in records) for y in ys]
@@ -363,4 +370,4 @@ def validate_saved_chart(chart):
             raise ValueError('Saved chart currency must be metadata, not a coordinate.')
         columns.append('currency')
         rows = [row + [chart['currency']] for row in rows]
-    return prepare_chart(columns, rows, {k:v for k,v in chart.items() if k in SPEC_FIELDS})
+    return prepare_chart(columns, rows, {k:v for k,v in chart.items() if k in SPEC_FIELDS}, allow_single_slice=True)
