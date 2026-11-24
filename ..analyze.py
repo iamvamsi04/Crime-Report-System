@@ -203,7 +203,8 @@ def _build_validated_chart(chart):
         closed = [row for row in rows if row.get('end_value') is not None]
         if closed:
             intervals = base(closed).mark_bar(color=PALETTE[0],cornerRadius=4,size=14,opacity=0.65).encode(
-                x=date_axis,x2='end_value:T',y=task_axis,tooltip=tip)
+                x=date_axis,x2='end_value:T',y=task_axis,
+                order=alt.Order('end_value:T', sort='descending'),tooltip=tip)
             starts = intervals + starts
         return finish(starts,max(300,min(900,len({r['category'] for r in rows})*30)))
     series_labels = [y.replace('_',' ').capitalize() for y in ys]
