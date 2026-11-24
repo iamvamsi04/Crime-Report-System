@@ -1,178 +1,342 @@
-from mcp_server.charts import CHART_GUIDE
+"""Validate declarative charts made only from executed query rows."""
+#mcp_server/charts.py
+import math
+import re
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
-TASK_POLICY = """
-SHARED TOOL REASONING AND DATA RULES
-These rules apply in all modes. Mode-specific instructions restrict which tools/actions are allowed.
-Do not expose a chain of thought, internal plan or SQL script in the final customer-facing answer.
-
-A. Understand the requested outcome
-Identify whether the user wants discovery, a recommendation, a comparison, a factual record lookup,
-a calculation, a chart, an account/order change or an after-sale action. Some messages need several.
-Determine scope: associated customer versus store, whole product range versus filtered matches, dates,
-currency, quantity and budget scope. Reuse established context, but explicit corrections override it.
-Separate necessary clarification from optional preferences. Do useful reads before asking when safe.
-Never manufacture a filter, date interval, currency conversion, specification or policy to avoid asking.
-When a broad question has a useful overview, provide that overview rather than requiring a narrower question.
-For broad admin analytics use execute_sql_query with complementary queries for the requested scope.
-Use full-scope aggregates and label any ranking limits. Do not invent filters to narrow a broad request.
-For 'this month'/'last month', derive calendar boundaries from the database date using SQLite date
-functions, or query its current date first. Label the actual interval. Tool date filters use inclusive order_date.
-A refund grouped by order_date is not an approval-date trend. New approved refunds have refund_requests.approved_at; legacy refunds may lack it. Pending requests are not recorded refunds.
-
-B. Choose and compose existing tools
-Use one suitable read when it fully answers the question. Combine several existing tools when needed.
-Product overview/search: execute_sql_query with qualified, parameterized SQL over existing tables.
-Use product_matches(i.name, ?) or product_matches(d.category, ?) for customer product words.
-It handles case, spaces, underscores, hyphens and common plurals; retain returned stored names.
-Do not apply product normalization to IDs, coupon codes, dates, currency or financial fields.
-Comparisons: compare_products. Cheaper alternatives: find_cheaper_alternatives.
-Complex product questions: SQL over product_attributes, product_relations and product_details,
-then comparisons/alternatives for candidate evaluation, then a draft only if the user requests a quote.
-Customer/order/invoice facts: scoped SQL followed by an appropriate supported action when authorized.
-Admin invoice/cost summaries and anomaly evidence: execute_sql_query with appropriate filters and checks.
-Admin graphs: execute_sql_query with chart metadata, using actual eligible rows and correct measures.
-Never assume the application needs another tool for each new wording of a question.
-Never fabricate a tool name, SQL write, mutation action, parameter or external service capability.
-Do not call every tool for every message. Reuse results within the turn and avoid duplicate reads.
-A multi-step read workflow does not authorize the writes it might eventually enable.
-
-C. Read schema safely and write correct SQL
-Use the declared schema and actual tool schemas. Inspect PRAGMA table_info(table) when a needed
-column is unknown. Do not guess synonyms such as price, stock, payment_status or created_at.
-Only read allowed BASE TABLES with SELECT/WITH or permitted PRAGMA; no database views exist.
-Use ? placeholders and the parameters list for user names, identifiers, dates, search terms and bounds.
-Never interpolate user text into SQL, table names, sort expressions or SQL fragments.
-Qualify every joined column, including SELECT, WHERE, GROUP BY and ORDER BY.
-Use explicit aliases: items i LEFT JOIN product_details d ON d.item_code=i.item_code;
-select i.item_code, i.name, i.sellingprice, i.availablequantity, d.category rather than bare item_code.
-LEFT JOIN optional metadata so missing product_details/order_details does not silently delete records.
-Preserve the intended unit of aggregation. COUNT(*) after a one-to-many join may count lines, not products.
-Use COUNT(DISTINCT i.item_code) for distinct products when joining several attribute rows.
-Select needed columns, not indiscriminate SELECT *. Avoid outputting unnecessary customer details.
-Use grouping/subqueries/CTEs to answer totals in the database, not summing a truncated displayed sample.
-
-D. Be explicit about coverage
-SQL row_count is returned row count, not the count of all matching products, customers or invoices.
-truncated=false only means the transport cap was not reached. A SQL LIMIT still excludes rows.
-Before claiming 'all', 'none', 'only', 'cheapest', 'highest' or a full total, establish the matching scope.
-For product discovery, query category totals and a matching COUNT using the SAME filters; evaluate ranking across the whole matching set before limiting display.
-A top-N query may be valid, but label it top-N. Do not call five examples the full product range.
-For a page state the range and total. If the result is empty beyond the final page, the product range is
-not necessarily empty; distinguish an exhausted page from zero matching products.
-Do not present truncated datasets as full distributions or combine chunks without preserving the scope.
-When a task cannot be completed within available tools/iterations, describe completed and missing parts
-accurately. Never manufacture the unqueried remainder.
-
-E. Product queries and follow-ups
-Use execute_sql_query(query=..., parameters=[...]) against items and optional product_details.
-Whole-store summary example:
-SELECT COALESCE(d.category,'Uncategorised') AS category, COUNT(*) AS products,
-SUM(CASE WHEN i.availablequantity>0 THEN 1 ELSE 0 END) AS in_stock_products
-FROM items i LEFT JOIN product_details d ON d.item_code=i.item_code
-GROUP BY COALESCE(d.category,'Uncategorised') ORDER BY category;
-Sum all returned category counts for the total only when that grouped result is complete.
-The application attaches category counts as a native table. Do not duplicate all its rows as prose.
-If truncated, obtain a separate COUNT(*) from items and paginate categories as necessary.
-For a nonempty product page, return COUNT(*) OVER() AS matching_products with the same filtered
-product rows and stable ORDER BY i.name, i.item_code LIMIT ? OFFSET ?. The window count is computed
-before LIMIT, so a separate count call is unnecessary. Use a one-row-per-product source before counting.
-If a requested page is empty, query a matching COUNT to distinguish no matches from an exhausted page.
-Show at most ten products per page. Keep filters and ordering in recent conversation context;
-advance the offset by the page size for 'next', and stop once the matching count is reached.
-After a summary, start the detailed list at offset zero. Changed filters restart at offset zero.
-Use bound values for search/category/price filters. Escape LIKE wildcards when literal text is intended.
-Default scope includes out-of-stock products. Only filter stock when explicitly requested.
-For current prices use the effective-price rules below before sorting, filtering or showing prices.
-A price bound is CURRENT UNIT merchandise price; translate quantity budgets appropriately.
-Ambiguous prices are unknown, not zero; exclude them from price-bounded results and explain exclusions.
-Use attributes, relationships and categories for semantic requirements, compatibility and bundles.
-
-F. Pricing, features and relationships
-Current price: compare UTC timestamps, effective_from<=now and effective_to IS NULL or now<effective_to.
-Count active price rows per item: exactly one supplies unit_price; zero falls back to sellingprice;
-more than one is ambiguous and requires staff correction. Never resolve overlap by LIMIT, MAX or MIN.
-Intervals include the start and exclude the end. Draft quotes use order_details.price_as_of; refresh requotes now. Issued invoices use invoice_lines.
-Read product_attributes text_value/number_value/unit. Structured attributes override same-name
-features_json keys case-insensitively. If a key is absent, primitive JSON features may supply it.
-Missing/null features are unknown, not false or zero. Respect numeric units, exact-match tool requirements
-and the distinction between a threshold request and an exact stored value. Use SQL for thresholds.
-Do not convert units or currencies without a verified conversion basis. Do not round away budget breaches.
-Product relations are directional substitute/compatible/accessory links; read the correct direction.
-A recorded relationship supports that recorded fact, not every imagined device/environment compatibility.
-Check candidate stock and current price before recommending or quoting. Do not reveal baseprice in customer mode.
-
-G. Financial definitions and avoiding duplicated totals
-Use orders.order_status as the order lifecycle: draft, placed or cancelled. Invoice numbers identify
-documents; fulfillment_status identifies shipping progress. Neither replaces order_status.
-For active sales require o.order_status='placed'. Historical cancelled invoices retain their numbers.
-Drafts and cancelled drafts are not billed sales; do not count a pro forma as placement.
-For active issued-order totals read orders o LEFT JOIN order_details d ON d.order_id=o.order_id
-LEFT JOIN order_service s ON s.order_id=o.order_id; exclude both COALESCE(d.status,'active')='cancelled'
-and COALESCE(s.fulfillment_status,'placed')='cancelled'. Cancelled invoices remain historical records;
-include them only when the requested measure explicitly covers cancellations. Keep requested filters.
-Currency is UPPER(TRIM(COALESCE(NULLIF(TRIM(d.currency),''),(SELECT value FROM billing_config WHERE key='currency'),'USD'))).
-Group or filter by currency; never sum money in unlike currencies.
-Sum subtotal, charged_price, tax_amount, shipping_amount, discount_applied and refund_amount at the
-ORDER level. Joining invoice_lines/order_requests/order_fulfilled before summing duplicates order totals.
-If line and order summaries are needed, aggregate each separately then join one-row-per-order results.
-Product units/revenue come from invoice_lines joined to eligible issued orders and items.
-Line_total is merchandise before order-level discount, tax, shipping and refund allocation.
-Do not silently assign an entire order refund/discount to every line or invent per-line allocations.
-Charged invoice total = subtotal minus applied discount plus tax plus shipping, as the tools calculate.
-Recorded refund-adjusted invoice amount = charged_price minus COALESCE(refund_amount,0), rounded
-for currency reporting. It is not cash collected or an outstanding amount due.
-Payments and credit notes are not stored. No paid/unpaid status, actual balance due, overdue debt,
-provider refund timing or payment reconciliation can be established here.
-Order due dates do not supply those missing payment facts. Refer payment reconciliation to store staff.
-Current baseprice supports admin estimated procurement cost, not historical cost or operating profit.
-State which margin/cost measure is being reported and its limitations. Never treat it as audited net profit.
-An anomaly is evidence for review, not proof of fraud or a license to automatically change/refund records.
-billing_audit is retained internal change history and is admin-only.
-
-H. Tool failures, recovery and accurate completion
-Read ok/error and every relevant warning before composing the answer.
-Correct an ambiguous-column error with qualified SQL. Correct a chart error using returned requirements.
-Do not repeat an unchanged invalid read or exhaust iterations on the same impossible operation.
-A failed read does not mean there are no rows. An inaccessible account does not mean it does not exist.
-A failed mutation does not authorize another mutation, alternative customer ID or weaker confirmation.
-For transport failures/timeouts after a possible write, inspect stored state before deciding whether
-it completed. Do not blindly replay request_order/place_order/refund or create a duplicate customer.
-Reuse established order IDs for safe draft retry when appropriate. The app's request-id retry is not
-a suggestion to invent new business actions. Never claim success until verified by a successful tool/state read.
-If only part of a multi-request task succeeded, identify that part and the unresolved part plainly.
-Do not expose raw exceptions, internal JSON, stack traces or secrets in the visible answer.
-
-I. Admin charts and visual analytics (ADMIN MODE ONLY)
-For graph/chart/plot/pictorial/dashboard requests, call execute_sql_query with its chart argument.
-Customer mode cannot create admin chart artifacts; do not attempt to bypass that restriction.
-Text-only questions need no chart. A chart is an attachment from successful tool output, not a URL
-or hand-drawn ASCII/Markdown picture. Never generate Python/JavaScript/Mermaid or raw Vega as a substitute.
-Choose a supported chart suited to the requested relationship and actual stored data.
-Simple comparison: bars. Time trend: line. Parts of a positive whole: pie with limited categories.
-Distribution: histogram/boxplot with raw observations. Relationship: scatter with numeric axes.
-Two-dimensional categories: heatmap. Minimum/maximum intervals: range. Rankings: sorted bars.
-Use the detailed chart contract below for all supported types, measures and field restrictions.
-Include returned aliases for x/y/group. Charts must contain at most 1000 complete rows.
-Return all requested suitable charts; there is no fixed chart-count limit.
-Include currency as a column named currency for monetary charts and filter to ONE currency per chart.
-When multiple currencies exist and none was requested, inspect them and ask or create clearly separate
-currency-specific charts. Different definitions/units may also require separate charts.
-Sort periods chronologically in SQL. Preserve raw observations for distributions; aggregate duplicate
-coordinates for summaries. A selected top-N plot is titled top-N, not all-store distribution.
-For a pie over more than twelve categories, use a suitable bar chart or an accurately labelled top-N
-plus a SQL-computed Other group, with the full denominator. Never silently discard categories.
-For 'show that as a chart', reuse the previous measure, filters, currency and date scope with fresh data.
-No rows means no data. Do not fabricate a zero series or invent observations to make a chart valid.
-chart_error means no chart was produced. Repair a suitable query/spec or explain and offer an alternative.
-When the tool confirms a chart artifact, finish with a brief plain-English explanation of scope,
-measure and useful findings; do not duplicate the entire plotted dataset in the reply.
-Chart attachments and PDFs are handled by the UI; do not insert imaginary download links.
-""" + CHART_GUIDE
+CHART_TYPES = ('bar','grouped_bar','horizontal_bar','stacked_bar','normalized_bar',
+               'line','pie','scatter','bubble','histogram','boxplot','heatmap',
+               'range','combo','timeline')
+MAX_CHART_ROWS = 1000
+SERIES_TYPES = {'bar','grouped_bar','horizontal_bar','stacked_bar','normalized_bar',
+                'line'}
+CHART_ALIASES = {'box_plot':'boxplot','heat_map':'heatmap', 'combination':'combo',
+                 'combination_chart':'combo','gantt':'timeline'}
 
 
-# Customers cannot use chart artifacts; omit their entire admin-only contract.
-# Build a customer-safe variant by removing the fixed admin-only section of this developer-authored policy and
-# appending its customer rules. The split acts on this constant, never on user wording.
-CUSTOMER_TASK_POLICY = TASK_POLICY.split("I. Admin charts and visual analytics", 1)[0] + (
-    "Customer mode cannot create charts or call admin analytics tools. "
-    "Explain that store-wide visual reports require Admin mode.\n")
+def canonical_chart_type(kind):
+    if not isinstance(kind, str):
+        return kind
+    kind = kind.strip().lower().replace(' ', '_').replace('-', '_').removesuffix('_chart')
+    return CHART_ALIASES.get(kind, kind)
+SPEC_FIELDS = {'type','title','x','y','group','size','end','x_type','bins','label'}
+CHART_GUIDE = """
+Chart contract for execute_sql_query:
+- Choose the clearest applicable type, with varied measures across a dashboard.
+- x names a returned column; y lists numeric columns. Series charts accept 1-4
+  measures of one unit; optional group requires one y and unique x/group pairs.
+  Grouped/stacked/normalized comparisons need multiple real series.
+  Stacked/normalized values must be nonnegative; normalized totals > 0.
+- x_type categorical(default), numeric or temporal for series/range/combo;
+  ISO dates/times, YYYY-MM and YYYY are accepted. Keep temporal data in order.
+- Scatter and bubble require numeric x and exactly one numeric y. Bubble also
+  requires a separate numeric size column with strictly positive values.
+  Select three distinct, meaningful measures at the same row grain for bubbles.
+  Filter missing/nonpositive sizes in SQL and disclose exclusions. Never replace
+  them with invented values. Use optional group for a small set of categories
+  and optional label for a returned product/order/observation name in hover.
+- histogram: raw numeric x, y:[], bins 2-50. boxplot: categorical x, one raw y,
+  optional group. Distributions require complete observations, not aggregates.
+- heatmap: use distinct x and group dimensions, one numeric y and one row per pair.
+  Use x_type='temporal' for date or month cells.
+- range: y:[lower,upper], lower<=upper. combo: y:[bar_measure,line_measure],
+  separately labelled axes.
+- timeline: x is a recorded ISO date/time and group is the event or task label.
+  Optional end column shows recorded intervals. A null end shows a point at the recorded start.
+- pie: use additive nonnegative parts of a positive whole. Return one row per category.
+  The chart groups small slices for display while keeping all source values.
+- 1-1000 rows with complete coordinates and measures. Timeline ends may be null. Include
+  normalized currency as returned metadata for money; never use USD as an axis or
+  series. Reject truncated results and keep currencies separate. No arbitrary code, URLs or raw Vega specs.
+- Match the chart to the relationship the user asked about. Give a specific title,
+  readable column aliases and comparable units. Use meaningful category sizes,
+  chronological order for dates and horizontal bars for long category labels.
+- Generate all requested applicable charts; explain unavailable data instead of
+  fabricating it. Claim a chart only after the tool attached it successfully.
+- If a requested type is unsupported, explain and offer a supported alternative;
+  never silently substitute another style or a whole dashboard.
+"""
+
+
+def numeric(value):
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ValueError('Chart measures must be finite numbers, without null values.')
+    if isinstance(value, int) and abs(value) > 2**53 - 1:
+        raise ValueError('Chart integers exceed exact browser precision. Scale the measure or return identifiers as text.')
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('Chart measures must be numeric.') from None
+    if not math.isfinite(number):
+        raise ValueError('Chart measures must be finite.')
+    if isinstance(value, str) and abs(number) > 2**53 - 1:
+        raise ValueError('Chart integers exceed exact browser precision. Scale the measure or return identifiers as text.')
+    if isinstance(value, str) and number == 0:
+        try:
+            underflow = Decimal(value) != 0
+        except InvalidOperation:
+            raise ValueError('Chart measures must be numeric.') from None
+        if underflow:
+            raise ValueError('Chart measure is below browser numeric precision. Scale the measure before charting.')
+    return number
+
+
+def label(value):
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ValueError('Chart category values must be non-null text or numbers.')
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError('Chart category numbers must be finite.')
+    try:
+        result = str(value)
+        result.encode('utf-8')
+    except (ValueError, UnicodeError):
+        raise ValueError('Chart category labels require valid Unicode text of at most 200 characters.') from None
+    if not result.strip() or len(result)>200:
+        raise ValueError('Chart category labels require 1-200 characters.')
+    return result
+
+
+def temporal(value, periods=False):
+    if periods and isinstance(value,str):
+        if re.fullmatch(r'\d{4}-\d{2}',value):
+            value += '-01'
+        elif re.fullmatch(r'\d{4}',value):
+            value += '-01-01'
+    if not isinstance(value,str) or not re.fullmatch(
+            r'\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?)?', value):
+        raise ValueError('Temporal coordinates require ISO date or date-time strings.')
+    try:
+        parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
+    except ValueError:
+        raise ValueError('Temporal coordinates require valid ISO dates or date-times.') from None
+    offset = re.search(r'[+-](\d{2}):(\d{2})$', value)
+    if offset and (int(offset[1]) > 23 or int(offset[2]) > 59):
+        raise ValueError('Temporal timezone offsets require valid hours and minutes.')
+    if parsed.microsecond % 1000:
+        raise ValueError('Temporal coordinates support millisecond precision. Group finer timestamps in SQL before charting.')
+    return parsed
+
+
+def prepare_chart(columns, rows, spec, truncated=False):
+    if not isinstance(spec,dict) or set(spec)-SPEC_FIELDS:
+        raise ValueError('Chart accepts only type, title, x, y, group, size, end, x_type, bins and label.')
+    spec = dict(spec)
+    spec['type'] = canonical_chart_type(spec.get('type'))
+    kind = spec['type']
+    if not isinstance(kind,str) or kind not in CHART_TYPES:
+        raise ValueError('Unsupported chart type. Choose one of: '+', '.join(CHART_TYPES)+'.')
+    if kind == 'timeline':
+        if spec.get('y') is None:
+            spec['y'] = []
+        if spec.get('end') is None:
+            spec.pop('end', None)
+    if isinstance(spec.get('y'), str):
+        spec['y'] = [spec['y']]
+    if spec.get('group') == spec.get('x') and spec.get('type') in SERIES_TYPES | {'boxplot'}:
+        # Grouping a category by itself adds no information and duplicates an axis.
+        spec.pop('group', None)
+    kind,x,ys=spec.get('type'),spec.get('x'),spec.get('y')
+    if (not isinstance(columns, (list, tuple)) or not columns or
+            not all(isinstance(c,str) and c.strip() for c in columns) or len(columns)!=len(set(columns))):
+        raise ValueError('Give every selected SQL column a unique text alias.')
+    try:
+        for column in columns:
+            column.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('SQL column aliases require valid Unicode text.') from None
+    if not isinstance(x,str) or x not in columns or not isinstance(ys,list):
+        raise ValueError('Chart x must name a returned column and y must be a list of columns.')
+    count = 0 if kind in ('histogram','timeline') else 2 if kind in ('range','combo') else None
+    single = kind in ('pie','scatter','bubble','boxplot','heatmap')
+    if (count is not None and len(ys)!=count) or (single and len(ys)!=1) or (count is None and not single and not 1<=len(ys)<=4):
+        raise ValueError(f'{kind} has the wrong number of y columns. Check the chart contract.')
+    if any(not isinstance(y,str) or y not in columns or y==x for y in ys) or len(ys)!=len(set(ys)):
+        raise ValueError('Chart y columns must exist, be distinct, and differ from x.')
+    allowed_extra = ({'group'} if kind in SERIES_TYPES or kind in ('boxplot','heatmap') else
+                     {'group','size','label'} if kind=='bubble' else {'group','label'} if kind=='scatter' else
+                     {'group','end'} if kind=='timeline' else
+                     {'bins'} if kind=='histogram' else set())
+    grouped_series = kind in SERIES_TYPES and 'group' in spec
+    if grouped_series and len(ys) != 1:
+        raise ValueError('A series group requires exactly one y measure.')
+    if set(spec).intersection({'group','size','end','bins','label'})-allowed_extra:
+        raise ValueError('This chart type does not support one of the supplied optional fields.')
+    required = {'group'} if kind in ('heatmap','timeline') else {'size'} if kind=='bubble' else set()
+    if not required<=set(spec):
+        if kind == 'bubble':
+            raise ValueError('Bubble charts need size set to a third, positive numeric SQL column, separate from x and y.')
+        raise ValueError(f'{kind} requires: '+', '.join(sorted(required))+'.')
+    extras={k:spec[k] for k in ('group','size','end','label') if k in spec}
+    if any(not isinstance(v,str) or v not in columns for v in extras.values()) or len(set([x,*ys,*extras.values()]))!=len([x,*ys,*extras.values()]):
+        raise ValueError('Chart coordinate columns must exist and be distinct.')
+    default_axis='numeric' if kind in ('scatter','bubble','histogram') else 'temporal' if kind=='timeline' else 'categorical'
+    axis=spec.get('x_type',default_axis)
+    if not isinstance(axis,str) or axis not in ('categorical','numeric','temporal'):
+        raise ValueError('x_type must be categorical, numeric or temporal.')
+    fixed = kind in ('scatter','bubble','histogram','pie','boxplot','timeline')
+    if fixed and axis!=default_axis:
+        raise ValueError(f'{kind} requires {default_axis} x coordinates.')
+    if kind == 'heatmap' and axis == 'numeric':
+        raise ValueError('Heatmap x coordinates must be categories or temporal periods. Use discrete bins for numeric values.')
+    bins=spec.get('bins',10)
+    if kind=='histogram' and (type(bins) is not int or not 2<=bins<=50):
+        raise ValueError('Histogram bins must be an integer from 2 to 50.')
+    if not isinstance(truncated, bool):
+        raise ValueError('Chart truncation metadata must be true or false.')
+    if truncated:
+        raise ValueError('Query results were truncated. Aggregate or narrow the query before charting; distributions require complete observations.')
+    if (not isinstance(rows, (list, tuple)) or not rows or len(rows)>MAX_CHART_ROWS or
+            any(not isinstance(r, (list, tuple)) or len(r)!=len(columns) for r in rows)):
+        raise ValueError('Charts require 1-1000 complete rows. Aggregate or narrow the query.')
+    title=spec.get('title','Query results')
+    if not isinstance(title,str) or not title.strip() or len(title)>160:
+        raise ValueError('Chart title must be text of at most 160 characters.')
+    try:
+        title.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('Chart title requires valid Unicode text.') from None
+    currency_columns = [c for c in columns if c.lower() == 'currency']
+    if len(currency_columns) > 1:
+        raise ValueError('Return one currency metadata column with a unique alias.')
+    raw_currencies=[r[columns.index(currency_columns[0])] for r in rows] if currency_columns else []
+    if any(not isinstance(c,str) or not re.fullmatch(r'[A-Za-z]{3}', c.strip()) for c in raw_currencies):
+        raise ValueError('Chart currency metadata must be a three-letter currency code.')
+    currencies={c.strip().upper() for c in raw_currencies}
+    if len(currencies)>1:
+        raise ValueError('Chart one currency at a time. Filter currency and return it as currency.')
+    if x.lower()=='currency' or any(y.lower()=='currency' for y in ys) or extras.get('size','').lower()=='currency':
+        raise ValueError('Currency is metadata, not a chart axis or measure. Select a meaningful category, date or numeric measure.')
+    if extras.get('label', '').lower() == 'currency':
+        raise ValueError('Choose an observation label other than the currency metadata column.')
+    if axis == 'categorical' and currencies and all(
+            isinstance(row[columns.index(x)], str) and row[columns.index(x)].strip().upper() in currencies
+            for row in rows):
+        raise ValueError('Currency is metadata, not a chart axis. Select a meaningful category instead of a constant currency label.')
+    currency_group = 'group' in extras and currencies and all(
+        isinstance(row[columns.index(extras['group'])], str) and
+        row[columns.index(extras['group'])].strip().upper() in currencies for row in rows)
+    if extras.get('group','').lower()=='currency' or currency_group:
+        if kind=='heatmap' or kind=='timeline':
+            raise ValueError('Currency is metadata, not a chart dimension. Return another meaningful group column.')
+        extras.pop('group')
+        spec.pop('group',None)
+        grouped_series=False
+    elif 'group' in extras and kind in SERIES_TYPES | {'scatter','bubble','boxplot'}:
+        if len({label(row[columns.index(extras['group'])]) for row in rows}) == 1:
+            # A single currency or constant label is metadata, not another plotted series.
+            extras.pop('group')
+            spec.pop('group',None)
+            grouped_series=False
+    records,seen=[],set()
+    stacked=kind in ('stacked_bar','normalized_bar')
+    normalized=kind == 'normalized_bar'
+    nonnegative=stacked or kind == 'pie'
+    time_zones=set()
+    positions = {column: i for i, column in enumerate(columns)}
+    for row in rows:
+        raw=row[positions[x]]
+        if axis == 'temporal':
+            start = temporal(raw, periods=kind != 'timeline')
+            time_zones.add(start.tzinfo is not None)
+            if start.tzinfo is not None:
+                try:
+                    start = start.astimezone(timezone.utc)
+                except (ValueError, OverflowError):
+                    raise ValueError('Temporal coordinates exceed the supported date range after timezone conversion.') from None
+            coordinate = start.isoformat()
+        else:
+            coordinate=numeric(raw) if axis=='numeric' else label(raw)
+        values={y:numeric(row[positions[y]]) for y in ys}
+        record={x:coordinate,**values}
+        if 'group' in extras:
+            record[extras['group']]=label(row[positions[extras['group']]])
+        if 'label' in extras:
+            record[extras['label']]=label(row[positions[extras['label']]])
+        if 'size' in extras:
+            record[extras['size']]=numeric(row[positions[extras['size']]])
+            if record[extras['size']]<=0:
+                raise ValueError('Bubble sizes must be positive numeric values. Select a meaningful positive size measure and filter invalid sizes in SQL.')
+        if 'end' in extras:
+            endpoint = row[positions[extras['end']]]
+            record[extras['end']] = None
+            if endpoint is not None:
+                end = temporal(endpoint)
+                time_zones.add(end.tzinfo is not None)
+                if end.tzinfo is not None:
+                    try:
+                        end = end.astimezone(timezone.utc)
+                    except (ValueError, OverflowError):
+                        raise ValueError('Timeline dates exceed the supported date range after timezone conversion.') from None
+                if len(time_zones)>1:
+                    raise ValueError('Temporal coordinates require consistently timezone-aware or timezone-free dates.')
+                if end<start:
+                    raise ValueError('Timeline end must not precede its start.')
+                record[extras['end']] = end.isoformat()
+        key=(coordinate,record[extras['group']]) if kind in ('heatmap','timeline') or grouped_series else coordinate
+        if kind not in ('scatter','bubble','histogram','boxplot') and key in seen:
+            if kind == 'timeline':
+                raise ValueError('Timeline has duplicate start times for the same label. Use a distinct label per event or task.')
+            raise ValueError('Group duplicate chart coordinates in SQL before charting. Normalize currency before grouping, including legacy NULL/blank values; use an outer CTE to group the resolved currency, not the raw source column. Do not sum averages or ratios to repair duplicates.')
+        seen.add(key)
+        if nonnegative and any(v<0 for v in values.values()):
+            raise ValueError(f'{kind} requires nonnegative values.')
+        if stacked and not math.isfinite(sum(values.values())):
+            raise ValueError('Stacked totals overflow. Scale or narrow the measures.')
+        if normalized and not grouped_series and sum(values.values())<=0:
+            raise ValueError('Percentage charts require a positive total for each x value.')
+        if kind=='range' and values[ys[0]]>values[ys[1]]:
+            raise ValueError('Range lower bound must not exceed upper bound.')
+        records.append(record)
+    if len(time_zones)>1:
+        raise ValueError('Temporal coordinates require consistently timezone-aware or timezone-free dates.')
+    if grouped_series and normalized:
+        groups = {}
+        for record in records:
+            groups[record[x]] = groups.get(record[x], 0) + record[ys[0]]
+        if any(not math.isfinite(total) or total <= 0 for total in groups.values()):
+            raise ValueError('Percentage charts require a finite positive total for each x value.')
+    if kind == 'pie' and sum(r[ys[0]] for r in records)<=0:
+        raise ValueError(f'{kind} needs a positive total.')
+    # Check aggregate y totals as well as individual values because finite inputs can still overflow when
+    # summed.
+    totals=[sum(r[y] for r in records) for y in ys]
+    if any(not math.isfinite(v) for v in totals):
+        raise ValueError('Chart totals overflow. Scale or narrow the measures.')
+    # Finite inputs can still produce an infinite browser scale.
+    domains = [[r[y] for r in records] for y in ys]
+    if axis == 'numeric':
+        domains.append([r[x] for r in records])
+    if kind == 'range':
+        domains.append([r[y] for r in records for y in ys])
+    if any(not math.isfinite(max(domain)-min(domain)) for domain in domains):
+        raise ValueError('Chart scale overflows. Scale or narrow the measures.')
+    return {'type':kind,'title':title,'x':x,'y':ys,'currency':next(iter(currencies),None),
+            'x_type':axis,**extras,**({'bins':bins} if kind=='histogram' else {}),'data':records}
+
+
+def chart_from_result(result):
+    if (not isinstance(result, dict) or not isinstance(result.get('chart'), dict) or
+            'columns' not in result or 'rows' not in result):
+        raise ValueError('Chart requires metadata and complete executed query columns and rows.')
+    metadata=result['chart']
+    return prepare_chart(result['columns'],result['rows'],
+                         {k:v for k,v in metadata.items() if k in SPEC_FIELDS},result.get('truncated',False))
+
+
+def validate_saved_chart(chart):
+    """Apply the same input contract to persisted artifacts before rendering."""
+    if (not isinstance(chart, dict) or set(chart) - (SPEC_FIELDS | {'data', 'currency'}) or
+            not isinstance(chart.get('data'), list) or not chart['data'] or
+            not all(isinstance(row, dict) for row in chart['data'])):
+        raise ValueError('Saved chart requires supported metadata and complete data records.')
+    columns = list(chart['data'][0])
+    if any(set(row) != set(columns) for row in chart['data']):
+        raise ValueError('Saved chart rows must contain the same coordinate and measure columns.')
+    rows = [[row[column] for column in columns] for row in chart['data']]
+    if chart.get('currency') is not None:
+        if any(isinstance(column, str) and column.lower() == 'currency' for column in columns):
+            raise ValueError('Saved chart currency must be metadata, not a coordinate.')
+        columns.append('currency')
+        rows = [row + [chart['currency']] for row in rows]
+    return prepare_chart(columns, rows, {k:v for k,v in chart.items() if k in SPEC_FIELDS})
