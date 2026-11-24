@@ -367,4 +367,3 @@ def validate_saved_chart(chart):
         columns.append('currency')
         rows = [row + [chart['currency']] for row in rows]
     return prepare_chart(columns, rows, {k:v for k,v in chart.items() if k in SPEC_FIELDS})
-
