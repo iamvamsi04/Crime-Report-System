@@ -1,838 +1,306 @@
-from __future__ import annotations
-
-import json
-import logging
+"""SQLite parser/authorizer is the security boundary, not a keyword regex."""
+#tools/database.py
+import math
 import re
-from pathlib import Path
-from typing import Any
+import sqlite3
+import time
+from collections import OrderedDict
+from contextlib import closing
+from threading import RLock
+from config import settings
+from database.connection import CASE_INSENSITIVE_COLUMNS, connect
+from database.product_search import normalize_product_filters, register_product_search
 
-import duckdb
+TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
+          'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
+          'order_details', 'billing_audit', 'refund_requests', 'refund_details', 'order_service',
+          'customer_billing_details','invoice_revisions','store_credit_ledger',
+          'customer_addresses','order_delivery',
+          'product_details', 'product_attributes', 'product_relations', 'json_each'}
+FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnull '
+                'instr julianday length like lower ltrim max min nullif printf replace '
+                'round rtrim strftime substr substring sum time total trim typeof '
+                'unicode upper row_number rank dense_rank lag lead first_value last_value '
+                'json_extract json_type json_valid json_array_length current_date current_time current_timestamp '
+                'product_text product_matches product_like'.split())
 
-from app.config import Settings
-from app.errors import AnalysisError, NotFoundError
-from app.models import AnalysisResult, QueryPlan
-from app.storage import Storage
-
-
-log = logging.getLogger(__name__)
-
-
-SQL_SYSTEM = """
-You are the SQL analysis engine for an intelligent document analysis system.
-
-Your job is to convert a user's natural-language question into ONE
-read-only DuckDB SQL query.
-
-The query will run against a DuckDB relation named:
-
-    dataset
-
-The relation contains the actual contents of a user-provided CSV file.
-
-You MUST answer the user's question by querying dataset.
-
-IMPORTANT RULES:
-
-1. Return ONLY valid JSON.
-2. The JSON must have exactly this general structure:
-
-   {
-     "sql": "SELECT ...",
-     "operation": "..."
-   }
-
-3. Generate exactly ONE SQL statement.
-4. The statement must be read-only.
-5. The query must use ONLY the relation `dataset`.
-6. Do NOT read files directly.
-7. Do NOT use:
-   - read_csv
-   - read_csv_auto
-   - read_parquet
-   - read_json
-   - read_xlsx
-   - glob
-   - httpfs
-   - http_get
-   - attach
-   - install
-   - load
-   - copy
-8. Do NOT create, replace, alter, drop, insert, update, delete, merge,
-   export, or write anything.
-9. SELECT and WITH queries are allowed.
-10. Use only columns that actually exist in the supplied schema.
-11. Do not invent columns.
-12. Preserve the meaning of the user's question.
-13. Perform arithmetic and aggregation in SQL rather than asking the
-    language model to calculate from raw rows.
-14. For totals, use SUM.
-15. For averages, use AVG.
-16. For minimum and maximum, use MIN and MAX.
-17. For counts, use COUNT.
-18. For rankings, use ORDER BY and LIMIT where appropriate.
-19. For percentage calculations, calculate the percentage in SQL.
-20. For year-over-year calculations, calculate the values and the change
-    in SQL.
-21. If the user asks for a comparison, return the comparison directly.
-22. If grouping is required, use GROUP BY.
-23. If filtering is required, use WHERE.
-24. If the question asks for the top N or bottom N, respect N.
-25. If the dataset contains dates, use DuckDB date functions where useful.
-26. Never assume a column exists if it is not present in the schema.
-27. String comparisons should be reasonably tolerant of capitalization.
-28. When filtering textual values, prefer LOWER(column) = LOWER('value')
-    when exact matching is intended.
-29. When the user asks for a calculation involving a percentage, protect
-    against division by zero with NULLIF.
-30. Do not put markdown fences around SQL.
-31. Do not explain the SQL outside the JSON response.
-
-The SQL should return a result that is directly useful for answering the
-user's question.
-"""
-
-
-FORBIDDEN_SQL_PATTERNS = (
-    r"\battach\b",
-    r"\bcopy\b",
-    r"\bcreate\b",
-    r"\breplace\b",
-    r"\balter\b",
-    r"\bdrop\b",
-    r"\binsert\b",
-    r"\bupdate\b",
-    r"\bdelete\b",
-    r"\bmerge\b",
-    r"\bexport\b",
-    r"\binstall\b",
-    r"\bload\b",
-    r"\bpragma\b",
-    r"\bvacuum\b",
-    r"\bcall\b",
-    r"\bread_csv\b",
-    r"\bread_csv_auto\b",
-    r"\bread_parquet\b",
-    r"\bread_json\b",
-    r"\bread_xlsx\b",
-    r"\bglob\b",
-    r"\bhttpfs\b",
-    r"\bhttp_get\b",
+# Use the same whitespace characters as the invoice lifecycle migration.
+CANCELLED_FROM_SQL = (
+    "CASE WHEN o.order_status = 'cancelled' THEN CASE WHEN "
+    "TRIM(COALESCE(o.order_invoice, ''), CAST(X'090A0D20' AS TEXT)) = '' "
+    "THEN 'draft' ELSE 'placed' END END"
 )
 
-ALLOWED_START_PATTERN = re.compile(
-    r"^\s*(select|with)\b",
-    re.IGNORECASE,
-)
-
-DATASET_PATTERN = re.compile(
-    r"\bdataset\b",
-    re.IGNORECASE,
-)
+# Store schema text only. Each lookup still checks the current database file and
+# SQLite schema version; prices, customers and other business rows are never cached.
+_SCHEMA_CACHE_LIMIT = 12
+_schema_cache = OrderedDict()
+_schema_cache_lock = RLock()
 
 
-def needs_analysis(plan: QueryPlan) -> bool:
+def _database_identity(path):
+    stat = path.stat()
+    return (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns)
+
+
+# Repair bare SQL aliases only; SQLite's read-only authorizer remains the security boundary.
+def quote_reserved_aliases(query):
+    """Quote bare explicit aliases only; never change literals, comments or values.
+
+    This is syntax repair, not an authorization boundary. SQLite still parses the
+    result under the same read-only authorizer and execution deadline.
     """
-    Return True when the query requires structured-data analysis.
-
-    `load_csv` alone means that structured data is involved, but a load
-    operation by itself is not an analysis request. A real analysis
-    operation must also be present.
-    """
-
-    analysis_operations = {
-        "sum",
-        "average",
-        "min",
-        "max",
-        "count",
-        "sort",
-        "rank",
-        "filter",
-        "groupby",
-        "percentage_change",
-        "yoy",
-        "compare",
-    }
-
-    return any(
-        operation.op in analysis_operations
-        for operation in plan.operations
-    )
-
-
-def run_analysis(
-    plan: QueryPlan,
-    question: str,
-    store: Storage,
-    gemini: Any,
-    settings: Settings,
-) -> AnalysisResult:
-    """
-    Execute LLM-generated read-only SQL against a structured document.
-
-    The LLM is responsible for understanding the question and generating
-    SQL. DuckDB is responsible for reading and calculating from the actual
-    CSV data.
-
-    No question-specific analytical logic is implemented in Python here.
-    """
-
-    document = _choose_document(
-        plan=plan,
-        store=store,
-    )
-
-    document_id = document["id"]
-    filename = document["filename"]
-    file_type = document["file_type"]
-
-    if file_type.lower() not in {
-        "csv",
-        "xlsx",
-        "xls",
-    }:
-        raise AnalysisError(
-            "Structured analysis requires a CSV or Excel document."
-        )
-
-    file_path = store.document_file(document_id)
-
-    if file_path is None:
-        raise NotFoundError(
-            f"Source file for document {filename!r} was not found."
-        )
-
-    file_path = Path(file_path)
-
-    if not file_path.exists():
-        raise NotFoundError(
-            f"Source file for document {filename!r} was not found."
-        )
-
-    profile = store.parse_csv_profile(
-        document.get("csv_profile")
-    )
-
-    schema = _build_schema_description(
-        profile=profile,
-        file_path=file_path,
-    )
-
-    plan_description = _build_plan_description(
-        plan=plan,
-    )
-
-    prompt = _build_sql_prompt(
-        question=question,
-        filename=filename,
-        schema=schema,
-        plan_description=plan_description,
-    )
-
-    generated = gemini.generate_json(
-        prompt,
-        system_instruction=SQL_SYSTEM,
-        temperature=0.0,
-    )
-
-    sql = generated.get("sql")
-
-    if not isinstance(sql, str) or not sql.strip():
-        raise AnalysisError(
-            "Gemini did not return a SQL query."
-        )
-
-    sql = _clean_sql(sql)
-
-    _validate_sql(sql)
-
-    operation = generated.get(
-        "operation",
-        "query",
-    )
-
-    if not isinstance(operation, str):
-        operation = "query"
-
-    log.info(
-        "executing_duckdb_analysis document=%s operation=%s",
-        filename,
-        operation,
-    )
-
-    try:
-        return _execute_query(
-            sql=sql,
-            operation=operation,
-            file_path=file_path,
-            file_type=file_type,
-            filename=filename,
-        )
-    except AnalysisError:
-        raise
-    except Exception as exc:
-        log.exception(
-            "duckdb_analysis_failed document=%s",
-            filename,
-        )
-        raise AnalysisError(
-            "The generated query could not be executed against the "
-            "document."
-        ) from exc
-
-
-def _choose_document(
-    plan: QueryPlan,
-    store: Storage,
-) -> dict[str, Any]:
-    """
-    Resolve the structured document to analyze.
-
-    Prefer an explicitly selected document. Otherwise use filename hints.
-    If exactly one structured document is available, use it.
-
-    The planner remains responsible for deciding which document is relevant;
-    this function only resolves that decision against storage.
-    """
-
-    documents = store.list_documents()
-
-    ready = [
-        document
-        for document in documents
-        if document.get("status") == "ready"
-    ]
-
-    structured = [
-        document
-        for document in ready
-        if str(document.get("file_type", "")).lower()
-        in {"csv", "xlsx", "xls"}
-    ]
-
-    if not structured:
-        raise NotFoundError(
-            "No ready CSV or Excel document is available for analysis."
-        )
-
-    if plan.document_ids:
-        for document_id in plan.document_ids:
-            for document in structured:
-                if document.get("id") == document_id:
-                    return document
-
-    if plan.document_hints:
-        lowered_hints = [
-            hint.lower()
-            for hint in plan.document_hints
-        ]
-
-        for document in structured:
-            filename = str(
-                document.get("filename", "")
-            ).lower()
-
-            if any(
-                hint in filename
-                for hint in lowered_hints
-            ):
-                return document
-
-    if len(structured) == 1:
-        return structured[0]
-
-    raise AnalysisError(
-        "More than one CSV or Excel document is available. "
-        "The question must identify which document should be analyzed."
-    )
-
-
-def _build_schema_description(
-    profile: dict[str, Any],
-    file_path: Path,
-) -> str:
-    """
-    Build a compact schema description for Gemini.
-
-    The model receives the actual columns and inferred types rather than
-    having to guess them.
-    """
-
-    columns = profile.get("columns")
-
-    if not isinstance(columns, list):
-        columns = []
-
-    dtypes = profile.get("dtypes")
-
-    if not isinstance(dtypes, dict):
-        dtypes = {}
-
-    row_count = profile.get("row_count")
-
-    if row_count is None:
-        row_count = "unknown"
-
-    lines: list[str] = [
-        f"File: {file_path.name}",
-        f"Rows: {row_count}",
-        "",
-        "Columns:",
-    ]
-
-    for column in columns:
-        if not isinstance(column, str):
+    tokens = re.findall(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[^\w]", query)
+    reserved = {'GROUP','ORDER','LIMIT','OFFSET','SELECT','FROM','WHERE','HAVING',
+                'VALUES','INDEX','TABLE','JOIN','DISTINCT','UNION','CASE','WHEN','END'}
+    previous = None
+    repaired = []
+    for token in tokens:
+        if token.isspace() or token.startswith(('--','/*')):
+            repaired.append(token)
             continue
-
-        dtype = dtypes.get(
-            column,
-            "unknown",
-        )
-
-        lines.append(
-            f"- {column}: {dtype}"
-        )
-
-    if not columns:
-        lines.append(
-            "No profile columns were available. "
-            "DuckDB schema inspection will be used."
-        )
-
-    return "\n".join(lines)
+        upper = token.upper()
+        repaired.append('"'+token+'"' if previous == 'AS' and upper in reserved else token)
+        previous = upper
+    return ''.join(repaired)
 
 
-def _build_plan_description(
-    plan: QueryPlan,
-) -> str:
-    """
-    Give Gemini the planner's interpretation without making Python
-    responsible for answering the question.
-
-    This is supporting context only. The SQL model still sees the original
-    user question and the actual dataset schema.
-    """
-
-    data = {
-        "intent": plan.intent.value,
-        "entities": plan.entities,
-        "metrics": plan.metrics,
-        "years": plan.years,
-        "filters": plan.filters,
-        "document_ids": plan.document_ids,
-        "document_hints": plan.document_hints,
-        "operations": [
-            operation.model_dump(
-                by_alias=True,
-            )
-            for operation in plan.operations
-        ],
-        "resolved_question": plan.resolved_question,
-        "is_follow_up": plan.is_follow_up,
-    }
-
-    return json.dumps(
-        data,
-        ensure_ascii=False,
-        default=str,
-    )
-
-
-def _build_sql_prompt(
-    question: str,
-    filename: str,
-    schema: str,
-    plan_description: str,
-) -> str:
-    return f"""
-User question:
-
-{question}
-
-Structured document selected for analysis:
-
-{filename}
-
-Actual dataset schema:
-
-{schema}
-
-Planner interpretation:
-
-{plan_description}
-
-Generate the single DuckDB SQL query needed to answer the user's question.
-
-Remember:
-
-- The only available relation is `dataset`.
-- Use only columns from the actual schema.
-- Query the data rather than guessing values.
-- Perform all required calculations in SQL.
-- Return one JSON object containing `sql` and `operation`.
-"""
-
-
-def _clean_sql(sql: str) -> str:
-    """
-    Normalize SQL returned by Gemini without changing its meaning.
-    """
-
-    value = sql.strip()
-
-    if value.startswith("```"):
-        value = re.sub(
-            r"^```(?:sql)?\s*",
-            "",
-            value,
-            flags=re.IGNORECASE,
-        )
-        value = re.sub(
-            r"\s*```$",
-            "",
-            value,
-        )
-
-    value = value.strip()
-
-    if value.endswith(";"):
-        value = value[:-1].rstrip()
-
-    return value
-
-
-def _validate_sql(sql: str) -> None:
-    """
-    Validate generated SQL before executing it.
-
-    The query must be a single SELECT/WITH statement and must operate on
-    the registered `dataset` relation.
-    """
-
-    if not sql:
-        raise AnalysisError(
-            "Gemini generated an empty SQL query."
-        )
-
-    if ";" in sql:
-        raise AnalysisError(
-            "Generated SQL contains multiple statements."
-        )
-
-    if "--" in sql or "/*" in sql or "*/" in sql:
-        raise AnalysisError(
-            "Generated SQL contains comments and was rejected."
-        )
-
-    if not ALLOWED_START_PATTERN.search(sql):
-        raise AnalysisError(
-            "Generated SQL must be a SELECT or WITH query."
-        )
-
-    for pattern in FORBIDDEN_SQL_PATTERNS:
-        if re.search(
-            pattern,
-            sql,
-            flags=re.IGNORECASE,
-        ):
-            raise AnalysisError(
-                "Generated SQL contains a forbidden operation."
-            )
-
-    if not DATASET_PATTERN.search(sql):
-        raise AnalysisError(
-            "Generated SQL does not reference the dataset."
-        )
-
-    _validate_dataset_references(sql)
-
-
-def _validate_dataset_references(sql: str) -> None:
-    """
-    Prevent generated SQL from directly accessing arbitrary relations.
-
-    We intentionally allow CTE names and aliases, but reject common
-    multi-table constructs that could bypass the registered dataset.
-    """
-
-    lowered = sql.lower()
-
-    if re.search(
-        r"\bfrom\s+(?!dataset\b)",
-        lowered,
-    ):
-        raise AnalysisError(
-            "Generated SQL attempted to read a relation other than dataset."
-        )
-
-    if re.search(
-        r"\bjoin\s+(?!dataset\b)",
-        lowered,
-    ):
-        raise AnalysisError(
-            "Generated SQL attempted to join a relation other than dataset."
-        )
-
-    if re.search(
-        r"\bunion\s+(?:all\s+)?select\b",
-        lowered,
-    ):
-        # UNION is allowed only when each branch remains based on dataset.
-        relation_names = re.findall(
-            r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            lowered,
-        )
-
-        invalid = [
-            name
-            for name in relation_names
-            if name != "dataset"
-        ]
-
-        if invalid:
-            raise AnalysisError(
-                "Generated SQL references an unauthorized relation."
-            )
-
-
-def _execute_query(
-    sql: str,
-    operation: str,
-    file_path: Path,
-    file_type: str,
-    filename: str,
-) -> AnalysisResult:
-    """
-    Register the actual file as `dataset` and execute the generated query.
-
-    DuckDB runs entirely in memory. The generated SQL never receives direct
-    filesystem access.
-    """
-
-    connection = duckdb.connect(
-        database=":memory:",
-    )
-
+def schema_hint(mode='customer'):
+    """Return current, role-scoped schema metadata without reading business rows."""
+    path = settings.BILLING_DB.resolve()
+    identity = _database_identity(path)
+    conn = connect(readonly=True)
     try:
-        _register_dataset(
-            connection=connection,
-            file_path=file_path,
-            file_type=file_type,
-        )
-
-        cursor = connection.execute(sql)
-
-        columns = [
-            description[0]
-            for description in cursor.description
-        ]
-
-        rows = cursor.fetchall()
-
-        table = [
-            {
-                column: _normalize_value(value),
-                for column, value in zip(
-                    columns,
-                    row,
-                )
-            }
-            for row in rows
-        ]
-
-        value = _extract_scalar_value(
-            table=table,
-        )
-
-        return AnalysisResult(
-            operation=operation,
-            value=value,
-            table=table,
-            inputs={
-                "question_file": filename,
-                "file_path": file_path.name,
-                "sql": sql,
-            },
-            formula=None,
-            source_file=filename,
-            rows_used=_count_dataset_rows(
-                connection,
-            ),
-            columns_used=columns,
-        )
-
-    except Exception as exc:
-        raise AnalysisError(
-            f"DuckDB could not execute the generated query: {exc}"
-        ) from exc
-
+        # Read the version and columns from one snapshot if another process runs
+        # a migration. Replacements at the same path get a different file key.
+        conn.execute('BEGIN')
+        version = conn.execute('PRAGMA schema_version').fetchone()[0]
+        key = (identity, version, mode, tuple(sorted(TABLES)))
+        unchanged = identity == _database_identity(path)
+        if unchanged:
+            with _schema_cache_lock:
+                cached = _schema_cache.get(key)
+                if cached is not None:
+                    _schema_cache.move_to_end(key)
+                    return cached
+        tables = sorted(TABLES - {'json_each'} - ({'billing_audit'} if mode != 'admin' else set()))
+        if mode == 'customer':
+            tables = [table for table in tables if table != 'promotions']
+        elif mode == 'cashier':
+            tables = [table for table in tables if table != 'customer_addresses']
+        columns = {}
+        for table in tables:
+            names = [r['name'] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+            if mode != 'admin' and table == 'items':
+                names = [n for n in names if n in {'sku','item_code','name','sellingprice','availablequantity'}]
+            if names:
+                columns[table] = names
+        lines = ['CURRENT SQL TABLE MAP (metadata only). Qualify columns with table aliases. '
+                 'Join the table that owns each requested column; do not guess column locations.']
+        lines.extend(f'{table}({", ".join(names)})' for table,names in columns.items())
+        joins = []
+        for table in columns:
+            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'):
+                if fk['table'] in columns and fk['from'] in columns[table] and fk['to'] in columns[fk['table']]:
+                    joins.append(f'{table}.{fk["from"]} = {fk["table"]}.{fk["to"]}')
+        lines.append('Declared join keys: ' + '; '.join(joins))
+        insensitive = [f'{table}.{name}' for table, names in columns.items()
+                       for name in names if name.casefold() in CASE_INSENSITIVE_COLUMNS.get(table, ())]
+        lines.append('Case-insensitive descriptive columns (COLLATE NOCASE): ' + ', '.join(insensitive)
+                     + '. Other columns retain their declared comparison rules.')
+        lines.append("Canonical status values: orders.order_status=draft/placed/cancelled; "
+                     "order_details.status=active/cancelled; refund_requests.status=pending/approved; "
+                     "order_service.fulfillment_status=unknown/placed/shipped/delivered/cancelled. "
+                     "Use canonical lowercase values for writes.")
+        if {'order_status', 'order_invoice'} <= set(columns.get('orders', ())):
+            lines.append("Cancellation history: cancelled covers both stages. A cancelled draft never had an "
+                         "issued invoice; a cancellation after placement retains its issued invoice. "
+                         "For cancellation lists or split counts, use orders AS o and project "
+                         f"{CANCELLED_FROM_SQL} AS cancelled_from. This is a derived alias. "
+                         "Use cancelled_from in tool results when present. Describe the stage explicitly. "
+                         "A cancelled draft is ineligible for an order refund because it was never placed or invoiced. "
+                         "Explain this lifecycle reason before mentioning missing refund requests. "
+                         "For a placed cancellation, check the current "
+                         "refund record before stating any refund outcome.")
+        lines.append('Aggregate each one-to-many side before combining totals. Missing columns are unavailable; do not invent them.')
+        if 'price_history' in columns:
+            lines.append("Prices use UTC timestamp intervals [effective_from,effective_to), with NULL end open. "
+                         "For current SQL use julianday(effective_from)<=julianday('now') AND "
+                         "(effective_to IS NULL OR julianday('now')<julianday(effective_to)+"
+                         "CASE WHEN length(trim(effective_to))=10 THEN 1 ELSE 0 END). "
+                         "Legacy date-only ends include that day. SQLite date functions round sub-millisecond values; "
+                         "product tools use exact timestamp prices. Draft pricing uses order_details.price_as_of; "
+                         "issued prices use invoice_lines.")
+        lines.append('Product search: product_matches(i.name, ?) or product_matches(d.category, ?) matches words/phrases regardless of case, spaces, underscores, hyphens and common plurals. Use only on product text; IDs, prices and other fields keep exact semantics.')
+        hint = '\n'.join(lines)
+        if unchanged and identity == _database_identity(path):
+            with _schema_cache_lock:
+                _schema_cache[key] = hint
+                _schema_cache.move_to_end(key)
+                while len(_schema_cache) > _SCHEMA_CACHE_LIMIT:
+                    _schema_cache.popitem(last=False)
+        return hint
     finally:
-        connection.close()
+        conn.close()
 
 
-def _register_dataset(
-    connection: duckdb.DuckDBPyConnection,
-    file_path: Path,
-    file_type: str,
-) -> None:
+def authorize(action, arg1, arg2, db, trigger):
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_READ and arg1 in TABLES and db in ('main', None):
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_FUNCTION and (arg2 or '').lower() in FUNCTIONS:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA and arg1 == 'table_info' and arg2 in TABLES:
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
+def execute_sql_query(query: str | None = None, chart: dict | None = None, parameters: list | None = None,
+                      queries: list[dict] | None = None, report: str | None = None,
+                      expected_chart_types: list[str] | None = None) -> dict:
+    """Answer flexible questions with one read-only SELECT/WITH or PRAGMA table_info(table).
+
+    Product discovery uses qualified SQL against items and optional product_details.
+    Search names/categories with product_matches(i.name, ?) or product_matches(d.category, ?).
+    It normalizes case, spaces, underscores, hyphens and common plurals; it matches whole words/phrases.
+    Simple name/category equality, IN and LIKE filters are normalized locally, without changing stored labels.
+    Keep item codes, SKUs, customer IDs and financial fields exact. Ambiguous products need clarification.
+    Count all matching products before displaying a page. Use stable ordering and LIMIT/OFFSET.
+    Include out-of-stock products unless explicitly filtered. Preserve scope on next-page requests.
+    Use effective price_history for current prices; overlapping prices are unknown, never guessed.
+
+    Join/filter/group permitted base tables instead of needing a tool per question.
+    Inspect columns with PRAGMA. No database views exist. External payment records are unavailable;
+    store_credit_ledger records local credit grants and redemptions only.
+    Invoice totals minus recorded refunds are not amounts due or proof of settlement.
+    Use ? placeholders with parameters for user-provided values; never interpolate names into SQL.
+    For requested admin visuals optionally pass chart={"type":"bar","title":"Revenue","x":"month","y":["revenue"]}.
+    Types: bar,grouped_bar,horizontal_bar,stacked_bar,normalized_bar,line,pie,
+    scatter,bubble,histogram,boxplot,heatmap,range,combo,timeline.
+    x/y and optional group, size, label or end must name returned columns.
+    Histogram: numeric x,y:[],bins 2-50. Heatmap: x,group,y:[measure] with unique pairs, temporal x allowed.
+    Timeline: x is a recorded event date, group is a label, optional end ends a recorded interval.
+    Pie: return all additive category values; small slices are grouped for display. Range: y:[low,high].
+    Other types accept the column counts in the chart contract. Optional x_type: categorical,numeric,temporal.
+    Standard bars/lines also accept group with one y, returning one row per x/group pair.
+    Distributions use complete observations; summaries aggregate duplicate coordinates in SQL.
+    Include a currency column for money and query ONE currency per chart; currency is metadata,
+    never an axis or a constant USD series. Order trends chronologically. No chart-count cap.
+    Chart queries allow up to 1000 rows; ordinary reads use SQL_MAX_ROWS. No charts from truncated results. A chart_error leaves query rows usable; correct SQL/spec if needed.
+    Admins may use queries instead of query/chart/parameters. Each entry is
+    {"query":"SELECT ...","parameters":[],"chart":{...},"title":"Optional dataset title"}.
+    Omit chart for table reads. Batch independent reads for a dashboard or multi-part analysis.
+    For a request covering specific chart types, use expected_chart_types to list all requested
+    types, including every supported type when the user requests full coverage. Each chart still
+    needs a model-authored query and specification. Check which types attached before answering.
+    To export table results, set report to a descriptive title. Results keep query order and each reports its own errors.
     """
-    Register the actual source file as the relation `dataset`.
+    if queries is None and report is None and expected_chart_types is None:
+        return _execute_read(query, chart, parameters)
 
-    CSV is the primary structured-data path.
-
-    Excel support is retained when the DuckDB Excel extension is already
-    available locally. We do not automatically INSTALL extensions because
-    corporate environments may block network access.
-    """
-
-    normalized_type = file_type.lower()
-
-    escaped_path = _duckdb_string_literal(
-        file_path,
-    )
-
-    if normalized_type == "csv":
-        connection.execute(
-            f"""
-            CREATE VIEW dataset AS
-            SELECT *
-            FROM read_csv_auto(
-                {escaped_path},
-                header = true,
-                sample_size = -1
-            )
-            """
-        )
-        return
-
-    if normalized_type in {"xlsx", "xls"}:
-        try:
-            connection.execute(
-                "LOAD excel"
-            )
-        except Exception as exc:
-            raise AnalysisError(
-                "Excel analysis requires DuckDB's Excel extension. "
-                "The extension is not available in this environment."
-            ) from exc
-
-        connection.execute(
-            f"""
-            CREATE VIEW dataset AS
-            SELECT *
-            FROM read_xlsx(
-                {escaped_path},
-                header = true
-            )
-            """
-        )
-        return
-
-    raise AnalysisError(
-        f"Unsupported structured document type: {file_type}"
-    )
+    from mcp_server.access import scope
+    if (scope.get() or {}).get('mode') != 'admin':
+        return {'ok': False, 'error': 'SQL batches, chart coverage and report exports require Admin mode.'}
+    coverage = {}
+    if expected_chart_types is not None:
+        from mcp_server.charts import CHART_TYPES
+        if (not isinstance(expected_chart_types, list) or not expected_chart_types
+                or any(kind not in CHART_TYPES for kind in expected_chart_types)):
+            return {'ok': False, 'error': 'Expected chart types must be a non-empty list of supported chart names.'}
+        coverage['expected_chart_types'] = list(dict.fromkeys(expected_chart_types))
+    if report is not None and (not isinstance(report, str) or not report.strip() or len(report) > 160):
+        return {'ok': False, 'error': 'Provide a report title of 1 to 160 characters.'}
+    if queries is None:
+        return {**_execute_read(query, chart, parameters, export=report is not None), **coverage}
+    if any(value is not None for value in (query, chart, parameters)) or not isinstance(queries, list) or not queries:
+        return {'ok': False, 'error': 'Provide either one query or a non-empty queries list.'}
+    with closing(connect(readonly=True)) as conn:
+        _prepare_connection(conn)
+        conn.execute('BEGIN')
+        results = []
+        for read in queries:
+            if (not isinstance(read, dict) or 'query' not in read
+                    or set(read) - {'query', 'parameters', 'chart', 'title'}):
+                results.append({'ok': False, 'error': 'Each entry needs query and may include parameters, chart and title.'})
+                continue
+            title = read.get('title')
+            if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 160):
+                results.append({'ok': False, 'error': 'Dataset titles must contain 1 to 160 characters.'})
+                continue
+            results.append(_execute_read(read['query'], read.get('chart'), read.get('parameters'),
+                                         export=report is not None, connection=conn))
+    return {'ok': True, 'results': results, 'query_count': len(results), **coverage}
 
 
-def _duckdb_string_literal(path: Path) -> str:
-    """
-    Safely represent a local filesystem path as a DuckDB SQL string literal.
-    """
-
-    value = str(
-        path.resolve()
-    )
-
-    return "'" + value.replace(
-        "'",
-        "''",
-    ) + "'"
+def _prepare_connection(conn):
+    register_product_search(conn)
+    conn.execute('PRAGMA query_only=ON')
+    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1000000)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 20000)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 100)
 
 
-def _extract_scalar_value(
-    table: list[dict[str, Any]],
-) -> Any:
-    """
-    Convert a one-cell/one-row result into a convenient scalar.
-
-    Larger result sets remain available through `table`.
-    """
-
-    if len(table) != 1:
-        return None
-
-    row = table[0]
-
-    if len(row) != 1:
-        return None
-
-    return next(
-        iter(row.values())
-    )
-
-
-def _count_dataset_rows(
-    connection: duckdb.DuckDBPyConnection,
-) -> int:
+def _execute_read(query, chart, parameters, *, export=False, connection=None):
+    if not isinstance(query, str) or not query.strip() or len(query) > 20000:
+        return {'ok': False, 'error': 'Provide one SQL query of at most 20000 characters.'}
+    if parameters is not None and (not isinstance(parameters,list) or len(parameters)>100 or
+            any(value is not None and not isinstance(value,(str,int,float)) for value in parameters)):
+        return {'ok':False,'error':'Parameters must be a list of up to 100 text, numeric or null values.'}
+    if any((isinstance(value, int) and not -(2**63) <= value < 2**63) or
+           (isinstance(value, float) and not math.isfinite(value)) for value in parameters or []):
+        return {'ok':False,'error':'Numeric parameters must be finite and integers must fit the SQLite 64-bit range.'}
+    from mcp_server.access import scope, customer_query_connection
+    access = scope.get()
+    if chart is not None and (not access or access['mode'] != 'admin'):
+        return {'ok': False, 'error': 'Analytics charts require Admin mode.'}
+    conn = connection or (customer_query_connection(access['customer_id'], staff=access['mode'] == 'cashier')
+            if access and access['mode'] in ('customer', 'cashier') else connect(readonly=True))
     try:
-        result = connection.execute(
-            "SELECT COUNT(*) FROM dataset"
-        ).fetchone()
-
-        if not result:
-            return 0
-
-        return int(
-            result[0]
-        )
-    except Exception:
-        return 0
-
-
-def _normalize_value(value: Any) -> Any:
-    """
-    Convert DuckDB values into JSON-friendly Python values.
-    """
-
-    if value is None:
-        return None
-
-    if hasattr(value, "isoformat"):
+        if connection is None:
+            _prepare_connection(conn)
+        deadline = time.monotonic() + 2
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        conn.set_authorizer(authorize)
+        original_query = query
+        query = normalize_product_filters(query)
+        repaired_aliases = False
         try:
-            return value.isoformat()
-        except Exception:
-            pass
-
-    if isinstance(
-        value,
-        (
-            str,
-            int,
-            float,
-            bool,
-        ),
-    ):
-        return value
-
-    if isinstance(
-        value,
-        (
-            list,
-            tuple,
-        ),
-    ):
-        return [
-            _normalize_value(item)
-            for item in value
-        ]
-
-    if isinstance(value, dict):
-        return {
-            str(key): _normalize_value(item)
-            for key, item in value.items()
-        }
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return str(value)
+            cursor = conn.execute(query, parameters or [])
+        except sqlite3.OperationalError as exc:
+            repaired = quote_reserved_aliases(query) if chart is not None and 'syntax error' in str(exc).lower() else query
+            if repaired == query:
+                raise
+            cursor = conn.execute(repaired, parameters or [])
+            repaired_aliases = True
+        from mcp_server.charts import MAX_CHART_ROWS
+        from context.reports import MAX_REPORT_ROWS
+        row_limit = MAX_CHART_ROWS if chart is not None else MAX_REPORT_ROWS if export else settings.SQL_MAX_ROWS
+        rows = cursor.fetchmany(row_limit + 1)
+        if any(isinstance(value, float) and not math.isfinite(value) for row in rows for value in row):
+            return {'ok':False,'error':'The query produced a non-finite number. Narrow the calculation or correct its inputs.'}
+        result = {'ok': True, 'columns': [c[0] for c in cursor.description or []],
+                'rows': [list(row) for row in rows[:row_limit]],
+                'row_count': min(len(rows), row_limit),
+                'truncated': len(rows) > row_limit,
+                'coverage_note': 'row_count counts returned SQL rows only. SQL LIMIT and filters may exclude matches even when truncated is false. Count the full matching set separately before claiming completeness, absence or a store-wide total.'}
+        if repaired_aliases:
+            result['query_note'] = 'Quoted reserved SQL aliases locally. Use names such as series_label instead of group/order in future queries.'
+        if query != original_query:
+            result['product_search_note'] = 'Product name/category filters ignore case, separators and common plural endings. IDs and financial filters retain their original semantics.'
+        if chart is not None:
+            from mcp_server.charts import prepare_chart
+            try:
+                payload = prepare_chart(result['columns'],result['rows'],chart,result['truncated'])
+                result['chart'] = {key:value for key,value in payload.items() if key != 'data'}
+            except ValueError as exc:
+                result['chart_error'] = str(exc)
+        return result
+    except sqlite3.Error as exc:
+        result = {'ok': False, 'error': f'Query rejected or failed: {exc}'}
+        if any(term in str(exc).lower() for term in ('no such column', 'ambiguous column', 'no such table')):
+            result['schema_hint'] = schema_hint(access['mode'] if access else 'admin')
+        return result
+    finally:
+        if connection is None:
+            conn.close()
