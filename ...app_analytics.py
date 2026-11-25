@@ -1,281 +1,265 @@
-"""Send chart plans to the independently configured SDK agent."""
-
 import asyncio
 import json
 import logging
+import os
+import re
 import sys
-from contextlib import contextmanager
-from contextvars import ContextVar
-from time import perf_counter
-from uuid import uuid4
+from collections.abc import Mapping
+from contextlib import ExitStack, redirect_stdout
 
+import llm_gateway_sdk
+from llm_gateway_sdk import runtime_config
+from autogen_agentchat.agents import AssistantAgent
+from autogen_core import CancellationToken
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
+
+from agent.prompts.chart_review_policy import CHART_REVIEW_POLICY
 from config import settings
-from mcp_server.charts import CHART_TYPES, canonical_chart_type
-from mcp_server.tools.database import preflight_chart_queries, schema_hint
+from mcp_server.charts import CHART_TYPES, SPEC_FIELDS, canonical_chart_type
 
 
 log = logging.getLogger("uvicorn.error.billing_performance")
-_context = ContextVar("chart_review_context", default=None)
+
+_SQL_IDENTIFIER_CHAR = r"[\w$\x80-\U0010ffff]"
+_SQL_PARAMETER_TOKENS = re.compile(
+    r"""--[^\n]*|/\*[\s\S]*?(?:\*/|\Z)|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]"""
+    rf"|(?P<parameter>\?[0-9]*|[:@$]{_SQL_IDENTIFIER_CHAR}+(?:::{_SQL_IDENTIFIER_CHAR}+)*"
+    rf"(?:\([^\s)]*\))?)|{_SQL_IDENTIFIER_CHAR}+"
+)
 
 
-@contextmanager
-def chart_review_context(*, conversation_id, request_id, mode):
-    token = _context.set({"conversation_id": conversation_id, "request_id": request_id, "mode": mode})
+def _placeholders(query):
+    return tuple(match["parameter"] for match in _SQL_PARAMETER_TOKENS.finditer(query)
+                 if match["parameter"] is not None)
+
+
+def _replacement_chart(original, proposed):
+    if not isinstance(proposed, dict) or set(proposed) - SPEC_FIELDS:
+        return False
+    kind = canonical_chart_type(proposed.get("type"))
+    return (
+        kind in CHART_TYPES
+        and kind == canonical_chart_type(original.get("type"))
+        and isinstance(proposed.get("x"), str)
+        and bool(proposed["x"].strip())
+        and isinstance(proposed.get("y"), list)
+        and all(isinstance(value, str) and value.strip() for value in proposed["y"])
+        and all(isinstance(proposed[key], str) and proposed[key].strip()
+                for key in ("group", "size", "end", "label", "x_type", "title") if key in proposed)
+        and ("bins" not in proposed or type(proposed["bins"]) is int)
+    )
+
+
+def _review_reason(reason):
+    reason = " ".join(reason[:2000].split())[:400] if isinstance(reason, str) else ""
+    return reason.encode("utf-8", "replace").decode("utf-8")
+
+
+def _apply_review(reads, selected_indexes, content):
+    if not isinstance(content, str) or len(content) > 400000:
+        return {}, None
+    lines = content.strip().splitlines()
+    if lines and lines[0] in ("```", "```json") and lines[-1] == "```":
+        content = "\n".join(lines[1:-1])
     try:
-        yield
-    finally:
-        _context.reset(token)
-
-
-class ChartReviewProcess:
-    """Keep one reviewer worker alive without sharing the billing model client."""
-
-    def __init__(self):
-        self._worker = None
-        self._booting = False
-        self._boot_deadline = 0.0
-        self._budget = 0.0
-        self._deadline = 0.0
-        self.pending = {}
-        self.allowed_chart_types = None
-
-    def begin_turn(self, started):
-        self.pending.clear()
-        self.allowed_chart_types = None
-        self._budget = 8.0
-        reply_reserve = min(4, settings.CHAT_TIMEOUT / 4)
-        self._deadline = started + settings.CHAT_TIMEOUT - reply_reserve
-
-    async def start(self):
-        if not settings.LLM_GATEWAY_ENABLED:
-            return
-        if self._worker is None or (self._worker.returncode is not None and not self._booting):
-            try:
-                self._worker = await asyncio.create_subprocess_exec(
-                    sys.executable, "-m", "agent.chart_sql_reviewer",
-                    cwd=str(settings.ROOT), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    limit=8 * 1024 * 1024,
-                )
-                self._booting = True
-                self._boot_deadline = perf_counter() + max(60, settings.CHAT_TIMEOUT)
-            except (OSError, NotImplementedError) as exc:
-                log.warning("Chart SQL reviewer could not start (%s).", type(exc).__name__)
-
-    async def close(self, *, force=False):
-        worker, self._worker = self._worker, None
-        self._booting = False
-        if worker is not None:
-            if not force and worker.returncode is None:
-                worker.stdin.close()
-                try:
-                    await asyncio.wait_for(worker.wait(), timeout=2)
-                    return
-                except TimeoutError:
-                    pass
-            if worker.returncode is None:
-                try:
-                    worker.kill()
-                except ProcessLookupError:
-                    pass
-            await worker.wait()
-
-    async def _exchange(self, request):
-        await self.start()
-        if self._worker is None:
-            return None
-        while self._booting:
-            line = await self._worker.stdout.readline()
-            if not line:
-                raise EOFError("The chart reviewer exited during startup.")
-            try:
-                status = json.loads(line)
-            except ValueError:
+        response = json.loads(content)
+    except (ValueError, RecursionError):
+        return {}, None
+    if not isinstance(response, dict) or set(response) - {"replacements", "findings", "allowed_chart_types"}:
+        return {}, None
+    scope = response.get("allowed_chart_types")
+    if isinstance(scope, list) and len(scope) <= len(CHART_TYPES):
+        scope = [canonical_chart_type(kind) for kind in scope]
+        scope = list(dict.fromkeys(scope)) if all(kind in CHART_TYPES for kind in scope) else None
+    else:
+        scope = None
+    feedback = {}
+    findings = response.get("findings")
+    if isinstance(findings, list):
+        for finding in findings[:len(selected_indexes)]:
+            if not isinstance(finding, dict) or set(finding) != {"index", "reason"}:
                 continue
-            if not isinstance(status, dict):
-                continue
-            if status.get("ready") is True:
-                self._booting = False
-            elif status.get("error"):
-                await self.close(force=True)
-                return None
-        self._worker.stdin.write(json.dumps(request, separators=(",", ":")).encode("ascii") + b"\n")
-        await self._worker.stdin.drain()
-        line = await self._worker.stdout.readline()
-        if not line:
-            raise EOFError("The chart reviewer exited before responding.")
-        result = json.loads(line)
-        if "error" in result:
-            log.warning("Chart SQL reviewer could not process this batch (%s).", result["error"])
-            return None
-        return result
+            index = finding["index"]
+            reason = _review_reason(finding["reason"])
+            if type(index) is int and index in selected_indexes and reason:
+                feedback.setdefault(str(index), reason)
 
-    async def review_arguments(self, arguments, *, user_request, chart_errors):
-        batched = arguments.get("queries") is not None
-        reads = arguments.get("queries") if batched else [arguments]
-        if not isinstance(reads, list):
-            return arguments
-        diagnostics = {}
-        chart_indexes = []
-        for index, read in enumerate(reads):
-            spec = read.get("chart") if isinstance(read, dict) else None
-            kind = canonical_chart_type(spec.get("type")) if isinstance(spec, dict) else None
-            if kind in CHART_TYPES and isinstance(read.get("query"), str):
-                if kind in chart_errors:
-                    diagnostics[len(chart_indexes)] = chart_errors[kind]
-                chart_indexes.append(index)
+    patches = {}
+    replacements = response.get("replacements")
+    for patch in replacements if isinstance(replacements, list) else []:
+        if not isinstance(patch, dict) or type(patch.get("index")) is not int:
+            continue
+        index = patch["index"]
+        if index in selected_indexes:
+            patches[index] = None if index in patches else patch
 
-        if not chart_indexes:
-            if any(isinstance(read, dict) and read.get("chart") is not None for read in reads):
-                log.warning("Chart SQL reviewer skipped. No supported chart query was supplied.")
-            return arguments
-        if not settings.LLM_GATEWAY_ENABLED:
-            log.warning("Chart SQL reviewer skipped. Configure LLM gateway credentials to enable it.")
-            return arguments
-        started = perf_counter()
-        timeout = min(self._budget, self._deadline - started)
-        if timeout <= 0:
-            log.info("Chart SQL reviewer skipped. The review deadline for this turn has passed.")
-            return arguments
+    for index, patch in patches.items():
+        if patch is None or set(patch) - {"index", "query", "chart", "reason"}:
+            continue
+        original = reads[index]
+        if scope is not None and canonical_chart_type(original["chart"].get("type")) not in scope:
+            continue
+        query = patch.get("query", original["query"])
+        chart = patch.get("chart", original["chart"])
+        if not isinstance(query, str) or not query.strip() or len(query) > 20000:
+            continue
+        if query != original["query"] and _placeholders(query) != _placeholders(original["query"]):
+            continue
+        if "chart" in patch and not _replacement_chart(original["chart"], chart):
+            continue
         try:
-            async with asyncio.timeout(timeout):
-                chart_reads = [reads[index] for index in chart_indexes]
-                diagnostics.update(preflight_chart_queries(chart_reads))
-                reviewed = await self._exchange({
-                    "reads": chart_reads, "schema": schema_hint("admin"),
-                    "user_request": user_request, "diagnostics": diagnostics,
-                    "context": _context.get() or {"mode": "admin"},
-                })
-        except asyncio.CancelledError:
-            await self.close(force=True)
-            raise
-        except TimeoutError:
-            if self._booting and perf_counter() < self._boot_deadline:
-                log.info("Chart SQL reviewer is still starting. Using the original SQL for this batch.")
-            else:
-                phase = "startup" if self._booting else "review"
-                await self.close(force=True)
-                log.warning("Chart SQL reviewer timed out during %s. Using the original SQL.", phase)
-            return arguments
-        except (OSError, EOFError, ValueError, TypeError, KeyError) as exc:
-            await self.close(force=True)
-            log.warning("Chart SQL reviewer failed (%s). Using the original SQL.", type(exc).__name__)
-            return arguments
-        finally:
-            elapsed = perf_counter() - started
-            self._budget -= elapsed
-            log.info("billing_chart_review seconds=%.3f candidates=%s", elapsed, len(chart_indexes))
+            query.encode("utf-8")
+            json.dumps(chart, ensure_ascii=False).encode("utf-8")
+        except UnicodeError:
+            continue
+        if query != original["query"] or chart != original["chart"]:
+            reads[index] = {**original, "query": query, "chart": chart}
+            feedback[str(index)] = (_review_reason(patch.get("reason")) or feedback.get(str(index))
+                                    or "Check the suggested correction against the chart request and schema.")
+    return feedback, scope
 
-        rows = reviewed.get("reads") if isinstance(reviewed, dict) else None
-        if not isinstance(rows, list) or len(rows) != len(chart_indexes):
-            return arguments
-        scope = reviewed.get("allowed_chart_types")
-        if self.allowed_chart_types is None and isinstance(scope, list) and all(kind in CHART_TYPES for kind in scope):
-            self.allowed_chart_types = set(scope)
-        reasons = reviewed.get("feedback")
-        updated_reads = list(reads)
-        originals, feedback = {}, {}
-        for slot, (index, edited) in enumerate(zip(chart_indexes, rows, strict=True)):
-            original = reads[index]
-            kind = canonical_chart_type(original["chart"].get("type"))
-            if self.allowed_chart_types is not None and kind not in self.allowed_chart_types:
+
+class ReviewerConfigurationError(RuntimeError):
+    """A startup configuration error safe to display in the server terminal."""
+
+
+class Test_Billing_Chart_Review(AssistantAgent):
+    """Review read-only chart plans with a model dedicated to this reviewer."""
+
+    def __init__(self, model_client, *, gateway_name="Test_Billing_Chart_Review",
+                 telemetry_enabled=False):
+        super().__init__("Test_Billing_Chart_Review", model_client=model_client,
+                         system_message=CHART_REVIEW_POLICY)
+        self.client = model_client
+        self.gateway_name = gateway_name
+        self.telemetry_enabled = telemetry_enabled
+
+    @classmethod
+    def from_gateway(cls):
+        """Start the SDK for this process and let it route the reviewer's requests."""
+        if not settings.LLM_GATEWAY_ENABLED:
+            raise ReviewerConfigurationError("Configure LLM gateway credentials.")
+        name = os.getenv("LLM_GATEWAY_CHART_REVIEWER_NAME", "").strip() or "Test_Billing_Chart_Review"
+        if name == settings.AGENT_NAME:
+            raise ReviewerConfigurationError("Set LLM_GATEWAY_CHART_REVIEWER_NAME to a different name from LLM_GATEWAY_AGENT_NAME.")
+        llm_gateway_sdk.init(agent_name=name, auto_detect_agent=False)
+        config = runtime_config.current_config()
+        if config is not None and name not in (config.get("agents") or {}):
+            raise ReviewerConfigurationError(f"Register {name!r} in Config Server for this gateway service.")
+
+        platform = (config or {}).get("platform") or {}
+        telemetry = _start_telemetry(platform)
+        client = AzureOpenAIChatCompletionClient(
+            azure_endpoint="https://llm-gateway.invalid",
+            azure_deployment="llm-gateway",
+            api_key=settings.AZURE_OPENAI_API_KEY or "routed-by-llm-gateway",
+            api_version=settings.AZURE_OPENAI_API_VERSION or "2024-06-01",
+            model=settings.AZURE_OPENAI_MODEL or "gpt-4o",
+            model_info={"vision": False, "function_calling": False, "json_output": False,
+                        "family": "unknown", "structured_output": False},
+            timeout=settings.CHAT_TIMEOUT,
+            max_retries=0,
+        )
+        return cls(client, gateway_name=name, telemetry_enabled=telemetry)
+
+    async def review(self, reads, *, schema, user_request="", cancellation_token=None,
+                     diagnostics: Mapping[int, str] | None = None, with_feedback=False):
+        """Return the reviewed reads and, when requested, the reasons for corrections."""
+        reads = list(reads)
+        candidates = {}
+        for index, read in enumerate(reads):
+            if (not isinstance(read, dict) or not isinstance(read.get("query"), str)
+                    or not isinstance(read.get("chart"), dict)
+                    or canonical_chart_type(read["chart"].get("type")) not in CHART_TYPES):
                 continue
-            reason = reasons.get(str(slot)) if isinstance(reasons, dict) else None
-            diagnostic = diagnostics.get(slot)
-            if isinstance(edited, dict) and (original != edited or reason or diagnostic):
-                originals[str(index)] = {"query": original["query"], "chart": original["chart"]}
-                updated_reads[index] = edited
-                if diagnostic or reason:
-                    feedback[str(index)] = " ".join(part for part in (diagnostic, reason) if isinstance(part, str))
-        if not originals:
-            return arguments
-        updated = {**arguments, "queries": updated_reads} if batched else updated_reads[0]
-        return {**updated, "chart_originals": originals, "chart_review_feedback": feedback}
+            candidate = {key: read[key] for key in ("query", "parameters", "chart") if key in read}
+            if diagnostics and index in diagnostics:
+                candidate["previous_error"] = diagnostics[index]
+            candidates[index] = {"index": index, **candidate}
+        feedback, scope = {}, None
+        if not candidates:
+            return {"reads": reads, "feedback": feedback, "allowed_chart_types": scope} if with_feedback else reads
 
-    async def feedback_for(self, arguments, **options):
-        for original, _, response in self.pending.values():
-            if original == arguments:
-                return response
-        suggested = dict(await self.review_arguments(arguments, **options))
-        reasons = suggested.pop("chart_review_feedback", {})
-        originals = suggested.get("chart_originals")
-        if not originals:
-            return None
-        reads = suggested.get("queries") or [suggested]
-        issues = []
-        for index, original in originals.items():
-            replacement = reads[int(index)]
-            issue = {"index": int(index), "reason": reasons.get(index) or "Adjust the query or chart fields as suggested."}
-            for key in ("query", "chart"):
-                if replacement[key] != original[key]:
-                    issue[f"suggested_{key}"] = replacement[key]
-            issues.append(issue)
-        review_id = uuid4().hex
-        response = {"id": review_id, "issues": issues}
-        if self.allowed_chart_types is not None:
-            response["requested_types"] = [kind for kind in CHART_TYPES if kind in self.allowed_chart_types]
-        self.pending[review_id] = (arguments, suggested, response)
-        return response
+        token = cancellation_token or CancellationToken()
+        try:
+            task = json.dumps({"request": user_request, "schema": schema,
+                               "chart_reads": list(candidates.values())},
+                              ensure_ascii=False, separators=(",", ":"))
+            print(f"Chart SQL reviewer called for {len(candidates)} chart queries.", file=sys.stderr, flush=True)
+            result = await self.run(task=task, cancellation_token=token)
+            feedback, scope = _apply_review(reads, candidates, result.messages[-1].content)
+        except Exception as exc:
+            log.warning("Chart SQL reviewer model call failed (%s). Using the original SQL.", type(exc).__name__)
+        finally:
+            await self.on_reset(token)
+        return {"reads": reads, "feedback": feedback, "allowed_chart_types": scope} if with_feedback else reads
 
-    def restrict_arguments(self, arguments):
-        allowed = self.allowed_chart_types
-        output = dict(arguments)
-        unresolved = output.pop("unresolved_chart_indexes", ())
-        if allowed is None and not unresolved:
-            return output
+    async def review_request(self, request, *, with_feedback=False):
+        """Apply the SDK context supplied by the local billing service."""
+        context = request.get("context") or {}
+        conversation_id = context.get("conversation_id")
+        mode = context.get("mode", "admin")
+        diagnostics = {int(index): reason for index, reason in (request.get("diagnostics") or {}).items()}
+        with ExitStack() as stack:
+            if conversation_id:
+                stack.enter_context(llm_gateway_sdk.user_context(chat_id=conversation_id, session_id=conversation_id,
+                                                 username=f"{mode}:{conversation_id}"))
+            if self.telemetry_enabled:
+                from opentelemetry import trace
 
-        def included(read):
-            spec = read.get("chart") if isinstance(read, dict) else None
-            return allowed is None or spec is None or (
-                isinstance(spec, dict) and canonical_chart_type(spec.get("type")) in allowed
-            )
+                tracer = trace.get_tracer(self.gateway_name)
+                stack.enter_context(tracer.start_as_current_span("chart_sql_review", attributes={
+                    "billing.conversation_id": conversation_id or "",
+                    "billing.request_id": context.get("request_id") or "",
+                    "billing.mode": mode,
+                }))
+            return await self.review(request["reads"], schema=request["schema"],
+                                     user_request=request.get("user_request", ""),
+                                     diagnostics=diagnostics, with_feedback=with_feedback)
 
-        if allowed is not None:
-            output.pop("expected_chart_types", None)
-            if allowed:
-                output["expected_chart_types"] = [kind for kind in CHART_TYPES if kind in allowed]
-        if output.get("queries") is None:
-            return output if not unresolved and included(output) else None
-        if not isinstance(output["queries"], list):
-            return output
-        retained = [(index, read) for index, read in enumerate(output["queries"])
-                    if index not in unresolved and included(read)]
-        if not retained:
-            return None
-        output["queries"] = [read for _, read in retained]
-        originals = output.pop("chart_originals", {})
-        remapped = {str(index): originals[str(source)] for index, (source, _) in enumerate(retained)
-                    if str(source) in originals}
-        if remapped:
-            output["chart_originals"] = remapped
-        return output
+    async def close(self):
+        await self.client.close()
 
-    def resolve_revision(self, review_id, arguments):
-        if not isinstance(review_id, str) or review_id not in self.pending:
-            return None
-        original, suggested, _ = self.pending.pop(review_id)
-        batched = original.get("queries") is not None
-        reads = list(suggested["queries"]) if batched else [suggested]
-        revised = arguments.get("queries")
-        if revised is None and len(reads) == 1:
-            revised = [arguments]
-        if not isinstance(revised, list) or len(revised) != len(reads):
-            revised = [None] * len(reads)
 
-        unresolved = []
-        for index, before in suggested["chart_originals"].items():
-            slot = int(index)
-            candidate = revised[slot]
-            saved = original["queries"][slot] if batched else original
-            changed = False
-            if isinstance(candidate, dict) and candidate.get("parameters", saved.get("parameters")) == saved.get("parameters"):
-                query = candidate.get("query", saved["query"])
-                chart = candidate.get("chart", saved["chart"])
-                if (isinstance(query, str) and query.strip() and len(query) <= 20000
-                        and isinstance(chart, dict) and canonical_chart_type(chart.get("type")) == canonical_chart_type(saved["chart"].get("type"))
-                        and (query != before["query"] or chart != before["chart"])):
-                    reads[slot] = {**reads[slot], "query": query, "chart": chart}
-                    changed = True
-            if not changed and all(reads[slot].get(key) == before[key] for key in ("query", "chart")):
-                unresolved.append(slot)
-        output = {**suggested, "queries": reads} if batched else reads[0]
-        return {**output, "unresolved_chart_indexes": unresolved}
+def _start_telemetry(platform):
+    endpoint = platform.get("collector_url") or settings.OTEL_ENDPOINT
+    if not endpoint or not runtime_config.telemetry_enabled():
+        return False
+    try:
+        import openlit
+    except ImportError:
+        log.warning("Chart SQL reviewer telemetry requires OpenLIT.")
+        return False
+    openlit.init(otlp_endpoint=endpoint, otlp_headers=llm_gateway_sdk.otlp_headers() or None,
+                 application_name=(os.getenv("AGENTIC_SERVICE_NAME") or os.getenv("LLM_GATEWAY_SERVICE_NAME")
+                                   or "Test_Billing_Chart_Review"))
+    return True
+
+
+async def _serve(output):
+    try:
+        reviewer = Test_Billing_Chart_Review.from_gateway()
+    except Exception as exc:
+        detail = str(exc) if isinstance(exc, ReviewerConfigurationError) else type(exc).__name__
+        print(f"Chart SQL reviewer startup failed. {detail}", file=sys.stderr, flush=True)
+        print(json.dumps({"error": type(exc).__name__}), file=output, flush=True)
+        return
+
+    print(f"Chart SQL reviewer ready (agent={reviewer.gateway_name}).", file=sys.stderr, flush=True)
+    print(json.dumps({"ready": True}), file=output, flush=True)
+    try:
+        while line := await asyncio.to_thread(sys.stdin.readline):
+            try:
+                request = json.loads(line)
+                response = await reviewer.review_request(request, with_feedback=True)
+            except Exception as exc:
+                response = {"error": type(exc).__name__}
+            print(json.dumps(response, separators=(",", ":")), file=output, flush=True)
+    finally:
+        await reviewer.close()
+
+
+if __name__ == "__main__":
+    protocol_output = sys.stdout
+    with redirect_stdout(sys.stderr):
+        asyncio.run(_serve(protocol_output))
