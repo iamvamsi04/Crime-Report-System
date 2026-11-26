@@ -1,459 +1,414 @@
-"""SQLite parser/authorizer is the security boundary, not a keyword regex."""
+"""Validate declarative charts made only from executed query rows."""
 import math
 import re
-import sqlite3
-import time
-from collections import OrderedDict
-from contextlib import closing
-from threading import RLock
-from config import settings
-from database.connection import CASE_INSENSITIVE_COLUMNS, connect
-from database.product_search import normalize_product_filters, register_product_search
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
-TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
-          'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
-          'order_details', 'billing_audit', 'refund_requests', 'refund_details', 'order_service',
-          'customer_billing_details','invoice_revisions','store_credit_ledger',
-          'customer_addresses','order_delivery',
-          'product_details', 'product_attributes', 'product_relations', 'json_each'}
-FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnull '
-                'instr julianday length like lower ltrim max min nullif printf replace '
-                'round rtrim strftime substr substring sum time total trim typeof '
-                'unicode upper row_number rank dense_rank lag lead first_value last_value '
-                'json_extract json_type json_valid json_array_length current_date current_time current_timestamp '
-                'product_text product_matches product_like'.split())
-
-# Use the same whitespace characters as the invoice lifecycle migration.
-CANCELLED_FROM_SQL = (
-    "CASE WHEN o.order_status = 'cancelled' THEN CASE WHEN "
-    "TRIM(COALESCE(o.order_invoice, ''), CAST(X'090A0D20' AS TEXT)) = '' "
-    "THEN 'draft' ELSE 'placed' END END"
-)
-
-# Store schema text only. Each lookup still checks the current database file and
-# SQLite schema version; prices, customers and other business rows are never cached.
-_SCHEMA_CACHE_LIMIT = 12
-_schema_cache = OrderedDict()
-_schema_cache_lock = RLock()
+CHART_TYPES = ('bar','grouped_bar','horizontal_bar','stacked_bar','normalized_bar',
+               'line','pie','scatter','bubble','histogram','boxplot','heatmap',
+               'range','combo','timeline')
+MAX_CHART_ROWS = 1000
+SERIES_TYPES = {'bar','grouped_bar','horizontal_bar','stacked_bar','normalized_bar',
+                'line'}
+CHART_ALIASES = {'box_plot':'boxplot','heat_map':'heatmap', 'combination':'combo',
+                 'combination_chart':'combo','gantt':'timeline'}
 
 
-def _database_identity(path):
-    stat = path.stat()
-    return (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns)
+def canonical_chart_type(kind):
+    if not isinstance(kind, str):
+        return kind
+    kind = kind.strip().lower().replace(' ', '_').replace('-', '_').removesuffix('_chart')
+    return CHART_ALIASES.get(kind, kind)
 
 
-# Repair bare SQL aliases only; SQLite's read-only authorizer remains the security boundary.
-def quote_reserved_aliases(query):
-    """Quote bare explicit aliases only; never change literals, comments or values.
-
-    This is syntax repair, not an authorization boundary. SQLite still parses the
-    result under the same read-only authorizer and execution deadline.
-    """
-    tokens = re.findall(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[^\w]", query)
-    reserved = {'GROUP','ORDER','LIMIT','OFFSET','SELECT','FROM','WHERE','HAVING',
-                'VALUES','INDEX','TABLE','JOIN','DISTINCT','UNION','CASE','WHEN','END'}
-    previous = None
-    repaired = []
-    for token in tokens:
-        if token.isspace() or token.startswith(('--','/*')):
-            repaired.append(token)
-            continue
-        upper = token.upper()
-        repaired.append('"'+token+'"' if previous == 'AS' and upper in reserved else token)
-        previous = upper
-    return ''.join(repaired)
+def normalize_chart_types(values):
+    if not isinstance(values, list) or not values:
+        raise ValueError('Expected chart types must be a non-empty list of supported chart names.')
+    canonical = [canonical_chart_type(value) for value in values]
+    if any(kind not in CHART_TYPES for kind in canonical):
+        raise ValueError('Expected chart types must be a non-empty list of supported chart names.')
+    return list(dict.fromkeys(canonical))
 
 
-def schema_hint(mode='customer'):
-    """Return current, role-scoped schema metadata without reading business rows."""
-    path = settings.BILLING_DB.resolve()
-    identity = _database_identity(path)
-    conn = connect(readonly=True)
+SPEC_FIELDS = {'type','title','x','y','group','size','end','x_type','bins','label'}
+COORDINATE_FIELDS = ('group', 'size', 'end', 'label')
+DEFAULT_AXES = {'scatter': 'numeric', 'bubble': 'numeric', 'histogram': 'numeric', 'timeline': 'temporal'}
+CHART_GUIDE = """
+Chart data contract for execute_sql_query
+
+Type | Select these data and fields
+bar | One label x and one numeric y per category.
+grouped_bar | 2–4 comparable y columns or one y plus group per x.
+horizontal_bar | Category in x and numeric measure in y. The renderer rotates the axes.
+stacked_bar | Exclusive, additive, nonnegative parts. Use up to four y columns or one y plus group.
+normalized_bar | Stack with a positive total at each x. The renderer computes percentages.
+line | Ordered x and numeric y measures. Use x_type='temporal' for dates.
+pie | At least two positive, exclusive parts of a whole. Group by a nonconstant dimension. Return all categories or label the selected subset; use Other for top-N shares of the whole.
+scatter | Two materially different numeric measures per observation. Optional group or label.
+bubble | Numeric x/y and nonnegative size (some positive) at the same grain. Prefer a distinct business measure for size; use a different relationship from scatter in a general dashboard. Optional group or label.
+histogram | One raw numeric observation per row in x, y:[], optional bins from 2 to 50. The renderer bins the values.
+boxplot | Categorical x and one raw numeric y per observation, with repeated observations for a meaningful distribution. Optional group.
+heatmap | Use x/group for two distinct dimensions and y:[measure] for one numeric value per pair. Use temporal x for dates or months.
+range | One row per x with y:[lower,upper], same units and lower <= upper.
+combo | One row per x with y:[bar_measure,line_measure]. These measures use separate scales.
+timeline | Recorded ISO date/time in x, event/task label in group, and y:[]. Optional end may be null or a real date/time at or after x. Use an event identifier to distinguish coincident events.
+
+Use distinct returned aliases, finite values and 1–1000 untruncated rows. Distributions need raw
+observations. Series support up to four same-unit y columns or one y with group. Aggregate to one
+row per x or x/group except for raw observations. Series/range/combo x_type is categorical by default
+and can be numeric or temporal. Temporal periods also accept YYYY-MM and YYYY except for timeline.
+Keep time zones consistent. Return one normalized currency per monetary chart as metadata.
+"""
+
+
+def numeric(value):
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ValueError('Chart measures must be finite numbers, without null values.')
+    if isinstance(value, int) and abs(value) > 2**53 - 1:
+        raise ValueError('Chart integers exceed exact browser precision. Scale the measure or return identifiers as text.')
     try:
-        # Read the version and columns from one snapshot if another process runs
-        # a migration. Replacements at the same path get a different file key.
-        conn.execute('BEGIN')
-        version = conn.execute('PRAGMA schema_version').fetchone()[0]
-        key = (identity, version, mode, tuple(sorted(TABLES)))
-        unchanged = identity == _database_identity(path)
-        if unchanged:
-            with _schema_cache_lock:
-                cached = _schema_cache.get(key)
-                if cached is not None:
-                    _schema_cache.move_to_end(key)
-                    return cached
-        tables = sorted(TABLES - {'json_each'} - ({'billing_audit'} if mode != 'admin' else set()))
-        if mode == 'customer':
-            tables = [table for table in tables if table != 'promotions']
-        elif mode == 'cashier':
-            tables = [table for table in tables if table != 'customer_addresses']
-        columns = {}
-        for table in tables:
-            names = [r['name'] for r in conn.execute(f'PRAGMA table_info("{table}")')]
-            if mode != 'admin' and table == 'items':
-                names = [n for n in names if n in {'sku','item_code','name','sellingprice','availablequantity'}]
-            if names:
-                columns[table] = names
-        lines = ['CURRENT SQL TABLE MAP (metadata only). Qualify columns with table aliases. '
-                 'Join the table that owns each requested column; do not guess column locations.']
-        lines.extend(f'{table}({", ".join(names)})' for table,names in columns.items())
-        joins = []
-        for table in columns:
-            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'):
-                if fk['table'] in columns and fk['from'] in columns[table] and fk['to'] in columns[fk['table']]:
-                    joins.append(f'{table}.{fk["from"]} = {fk["table"]}.{fk["to"]}')
-        lines.append('Declared join keys: ' + '; '.join(joins))
-        insensitive = [f'{table}.{name}' for table, names in columns.items()
-                       for name in names if name.casefold() in CASE_INSENSITIVE_COLUMNS.get(table, ())]
-        lines.append('Case-insensitive descriptive columns (COLLATE NOCASE): ' + ', '.join(insensitive)
-                     + '. Other columns retain their declared comparison rules.')
-        lines.append("Canonical status values: orders.order_status=draft/placed/cancelled; "
-                     "order_details.status=active/cancelled; refund_requests.status=pending/approved; "
-                     "order_service.fulfillment_status=unknown/placed/shipped/delivered/cancelled. "
-                     "Use canonical lowercase values for writes.")
-        if {'order_status', 'order_invoice'} <= set(columns.get('orders', ())):
-            lines.append("Cancellation history: cancelled covers both stages. A cancelled draft never had an "
-                         "issued invoice; a cancellation after placement retains its issued invoice. "
-                         "For cancellation lists or split counts, use orders AS o and project "
-                         f"{CANCELLED_FROM_SQL} AS cancelled_from. This is a derived alias. "
-                         "Use cancelled_from in tool results when present. Describe the stage explicitly. "
-                         "A cancelled draft is ineligible for an order refund because it was never placed or invoiced. "
-                         "Explain this lifecycle reason before mentioning missing refund requests. "
-                         "For a placed cancellation, check the current "
-                         "refund record before stating any refund outcome.")
-        lines.append('Aggregate each one-to-many side before combining totals. Missing columns are unavailable; do not invent them.')
-        if 'price_history' in columns:
-            lines.append("Prices use UTC timestamp intervals [effective_from,effective_to), with NULL end open. "
-                         "For current SQL use julianday(effective_from)<=julianday('now') AND "
-                         "(effective_to IS NULL OR julianday('now')<julianday(effective_to)+"
-                         "CASE WHEN length(trim(effective_to))=10 THEN 1 ELSE 0 END). "
-                         "Legacy date-only ends include that day. SQLite date functions round sub-millisecond values; "
-                         "product tools use exact timestamp prices. Draft pricing uses order_details.price_as_of; "
-                         "issued prices use invoice_lines.")
-        lines.append('Product search: product_matches(i.name, ?) or product_matches(d.category, ?) matches words/phrases regardless of case, spaces, underscores, hyphens and common plurals. Use only on product text; IDs, prices and other fields keep exact semantics.')
-        hint = '\n'.join(lines)
-        if unchanged and identity == _database_identity(path):
-            with _schema_cache_lock:
-                _schema_cache[key] = hint
-                _schema_cache.move_to_end(key)
-                while len(_schema_cache) > _SCHEMA_CACHE_LIMIT:
-                    _schema_cache.popitem(last=False)
-        return hint
-    finally:
-        conn.close()
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('Chart measures must be numeric.') from None
+    if not math.isfinite(number):
+        raise ValueError('Chart measures must be finite.')
+    if isinstance(value, str) and abs(number) > 2**53 - 1:
+        raise ValueError('Chart integers exceed exact browser precision. Scale the measure or return identifiers as text.')
+    if isinstance(value, str) and number == 0:
+        try:
+            underflow = Decimal(value) != 0
+        except InvalidOperation:
+            raise ValueError('Chart measures must be numeric.') from None
+        if underflow:
+            raise ValueError('Chart measure is below browser numeric precision. Scale the measure before charting.')
+    return number
 
 
-def authorize(action, arg1, arg2, db, trigger):
-    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_READ and arg1 in TABLES and db in ('main', None):
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_FUNCTION and (arg2 or '').lower() in FUNCTIONS:
-        return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_PRAGMA and arg1 == 'table_info' and arg2 in TABLES:
-        return sqlite3.SQLITE_OK
-    return sqlite3.SQLITE_DENY
-
-
-def _sql_error_details(exc, mode):
-    message = str(exc)
-    result = {'ok': False, 'error': f'Query rejected or failed: {message}'}
-    lower = message.lower()
-    if any(term in lower for term in ('no such column', 'ambiguous column', 'no such table')):
-        schema = schema_hint(mode)
-        result['schema_hint'] = schema
-        missing = re.fullmatch(r'(?:no such|ambiguous) column(?: name)?: (?:\w+\.)*(\w+)', message, re.I)
-        if missing:
-            column = missing[1].lower()
-            owners = [f'{table}.{name}'
-                      for table, fields in re.findall(r'^(\w+)\(([^\n]*)\)$', schema, re.M)
-                      for name in fields.split(', ') if name.lower() == column]
-            if owners:
-                result['repair_hint'] = ('Qualify the column and join its live source before referencing it. '
-                                         'Matching columns: ' + ', '.join(owners) + '.')
-    elif 'syntax error' in lower:
-        result['repair_hint'] = ('Use SQLite syntax with all FROM/JOIN clauses before WHERE, GROUP BY or ORDER BY. '
-                                 'Use direct joins and group observed rows when a generated grid is unnecessary.')
+def label(value):
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ValueError('Chart category values must be non-null text or numbers.')
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError('Chart category numbers must be finite.')
+    try:
+        result = str(value)
+        result.encode('utf-8')
+    except (ValueError, UnicodeError):
+        raise ValueError('Chart category labels require valid Unicode text of at most 200 characters.') from None
+    if not result.strip() or len(result)>200:
+        raise ValueError('Chart category labels require 1-200 characters.')
     return result
 
 
-def execute_sql_query(query: str | None = None, chart: dict | None = None, parameters: list | None = None,
-                      queries: list[dict] | None = None, report: str | None = None,
-                      expected_chart_types: list[str] | None = None,
-                      chart_originals: dict[str, dict] | None = None) -> dict:
-    """Answer flexible questions with one read-only SELECT/WITH or PRAGMA table_info(table).
-
-    Product discovery uses qualified SQL against items and optional product_details.
-    Search names/categories with product_matches(i.name, ?) or product_matches(d.category, ?).
-    It normalizes case, spaces, underscores, hyphens and common plurals; it matches whole words/phrases.
-    Simple name/category equality, IN and LIKE filters are normalized locally, without changing stored labels.
-    Keep item codes, SKUs, customer IDs and financial fields exact. Ambiguous products need clarification.
-    Count all matching products before displaying a page. Use stable ordering and LIMIT/OFFSET.
-    Include out-of-stock products unless explicitly filtered. Preserve scope on next-page requests.
-    Use effective price_history for current prices; overlapping prices are unknown, never guessed.
-
-    Join/filter/group permitted base tables instead of needing a tool per question.
-    Inspect columns with PRAGMA. No database views exist. External payment records are unavailable;
-    store_credit_ledger records local credit grants and redemptions only.
-    Invoice totals minus recorded refunds are not amounts due or proof of settlement.
-    Use ? placeholders with parameters for user-provided values; never interpolate names into SQL.
-    For requested admin visuals optionally pass chart={"type":"bar","title":"Revenue","x":"month","y":["revenue"]}.
-    Chart SQL must derive its observations and measures from live store tables. Do not make up rows.
-    Use the chart data contract for all 15 types. Match x/y and optional group, size, end or label
-    to distinct returned aliases. Use one currency per monetary chart and return it as metadata.
-    Chart queries allow up to 1000 complete rows. Ordinary reads use SQL_MAX_ROWS.
-    A chart_error leaves query rows usable. Correct the SQL or chart specification before retrying.
-    Admins may use queries instead of query/chart/parameters. Each entry is
-    {"query":"SELECT ...","parameters":[],"chart":{...},"title":"Optional dataset title"}.
-    Omit chart for table reads. Batch independent reads for a dashboard or multi-part analysis.
-    For a request covering specific chart types, use expected_chart_types to list all requested
-    types, including every supported type when the user requests full coverage. Each chart still
-    needs a model-authored query and specification. Check which types attached before answering.
-    To export table results, set report to a descriptive title. Results keep query order and each reports its own errors.
-    """
-    if queries is None and report is None and expected_chart_types is None and chart_originals is None:
-        return _execute_read(query, chart, parameters)
-
-    from mcp_server.access import scope
-    if (scope.get() or {}).get('mode') != 'admin':
-        return {'ok': False, 'error': 'SQL batches, chart coverage and report exports require Admin mode.'}
-    coverage = {}
-    if expected_chart_types is not None:
-        from mcp_server.charts import normalize_chart_types
+def _uses_horizontal_axes(rows, value_index, label_index):
+    """Recognize a numeric screen x and a text screen y in every SQL row."""
+    for row in rows:
+        value, category = row[value_index], row[label_index]
+        if type(value) not in (int, float) or not isinstance(category, str):
+            return False
         try:
-            coverage['expected_chart_types'] = normalize_chart_types(expected_chart_types)
-        except ValueError as exc:
-            return {'ok': False, 'error': str(exc)}
-    if report is not None and (not isinstance(report, str) or not report.strip() or len(report) > 160):
-        return {'ok': False, 'error': 'Provide a report title of 1 to 160 characters.'}
-    originals = chart_originals or {}
-    if queries is None:
-        result = _execute_reviewed_read(query, chart, parameters, originals.get('0'), export=report is not None)
-        return {**result, **coverage}
-    if any(value is not None for value in (query, chart, parameters)) or not isinstance(queries, list) or not queries:
-        return {'ok': False, 'error': 'Provide either one query or a non-empty queries list.'}
-    with closing(connect(readonly=True)) as conn:
-        _prepare_connection(conn)
-        conn.execute('BEGIN')
-        results = []
-        for index, read in enumerate(queries):
-            if (not isinstance(read, dict) or 'query' not in read
-                    or set(read) - {'query', 'parameters', 'chart', 'title'}):
-                results.append({'ok': False, 'error': 'Each entry needs query and may include parameters, chart and title.'})
-                continue
-            title = read.get('title')
-            if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 160):
-                results.append({'ok': False, 'error': 'Dataset titles must contain 1 to 160 characters.'})
-                continue
-            results.append(_execute_reviewed_read(read['query'], read.get('chart'), read.get('parameters'),
-                originals.get(str(index)), export=report is not None, connection=conn))
-    return {'ok': True, 'results': results, 'query_count': len(results), **coverage}
-
-
-def _execute_reviewed_read(query, chart, parameters, original, **options):
-    result = _execute_read(query, chart, parameters, **options)
-    if original and 'chart' not in result:
-        fallback = _execute_read(original.get('query'), original.get('chart'), parameters, **options)
-        if 'chart' in fallback:
-            return {**fallback, 'chart_review_fallback': True}
-    return result
-
-
-def _prepare_connection(conn):
-    register_product_search(conn)
-    conn.execute('PRAGMA query_only=ON')
-    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1000000)
-    conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 20000)
-    conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 100)
-
-
-def _read_argument_error(query, parameters):
-    if not isinstance(query, str) or not query.strip() or len(query) > 20000:
-        return 'Provide one SQL query of at most 20000 characters.'
-    if parameters is not None and (not isinstance(parameters, list) or len(parameters) > 100 or
-            any(value is not None and not isinstance(value, (str, int, float)) for value in parameters)):
-        return 'Parameters must be a list of up to 100 text, numeric or null values.'
-    if any((isinstance(value, int) and not -(2**63) <= value < 2**63) or
-           (isinstance(value, float) and not math.isfinite(value)) for value in parameters or []):
-        return 'Numeric parameters must be finite and integers must fit the SQLite 64-bit range.'
-    return None
-
-
-class UngroundedChartQuery(ValueError):
-    pass
-
-
-def _compile_chart_read(conn, query, parameters):
-    """Use the SQLite compiler and read-only authorizer without evaluating chart rows."""
-    reads_store_table = reads_store_column = counts_rows = False
-
-    def track_store_reads(action, arg1, arg2, db, trigger):
-        nonlocal reads_store_table, reads_store_column, counts_rows
-        decision = authorize(action, arg1, arg2, db, trigger)
-        if decision != sqlite3.SQLITE_OK:
-            return decision
-        if action == sqlite3.SQLITE_READ and arg1 not in ('billing_config', 'json_each'):
-            reads_store_table = True
-            reads_store_column |= bool(arg2)
-        if action == sqlite3.SQLITE_FUNCTION and arg2 == 'count':
-            counts_rows = True
-        return decision
-
-    conn.set_authorizer(track_store_reads)
-    try:
-        try:
-            plan = conn.execute('EXPLAIN QUERY PLAN ' + query, parameters or []).fetchall()
-        except sqlite3.OperationalError as exc:
-            repaired = quote_reserved_aliases(query) if 'syntax error' in str(exc).lower() else query
-            if repaired == query:
-                raise
-            reads_store_table = reads_store_column = counts_rows = False
-            query = repaired
-            plan = conn.execute('EXPLAIN QUERY PLAN ' + query, parameters or []).fetchall()
-    finally:
-        conn.set_authorizer(authorize)
-    if not reads_store_table or not (reads_store_column or counts_rows):
-        raise UngroundedChartQuery('Chart SQL must read live store records. Literal examples and generated values cannot be plotted.')
-
-    # A compound output containing both a store-backed branch and a literal-only
-    # branch is also synthetic. Literal scaffolding within joined CTEs can
-    # legitimately supply a dimension, so allow a compound with all literal arms.
-    children = {}
-    for node, parent, _, detail in plan:
-        children.setdefault(parent, []).append((node, detail))
-    def literal_arm(arm):
-        queue = list(children.get(arm, ()))
-        details = []
-        while queue:
-            node, detail = queue.pop()
-            details.append(detail)
-            queue.extend(children.get(node, ()))
-        ctes = {detail.split(' ', 1)[1] for detail in details
-                if detail.startswith(('CO-ROUTINE ', 'MATERIALIZE '))}
-        constant = False
-        for detail in details:
-            if detail.startswith('SCAN CONSTANT ROW') or re.fullmatch(r'SCAN \d+ CONSTANT ROWS?', detail):
-                constant = True
-            elif detail.startswith(('SCAN ', 'SEARCH ')) and detail.split(' ', 1)[1] not in ctes:
-                return False
-        return constant
-
-    for node, _, _, detail in plan:
-        if detail != 'COMPOUND QUERY' and not detail.startswith('MERGE ('):
+            float(category)
+        except ValueError:
             continue
-        constant_arms = [literal_arm(arm) for arm, _ in children.get(node, ())]
-        if any(constant_arms) and not all(constant_arms):
-            raise UngroundedChartQuery('Use live records for every compound chart branch. Remove literal rows from UNION queries.')
-    return query
+        return False
+    return True
 
 
-def _set_chart_identifier_mode(conn):
-    # SQLite otherwise accepts an unresolved double-quoted name as text.
-    option = getattr(sqlite3, 'SQLITE_DBCONFIG_DQS_DML', None)
-    if option is not None and hasattr(conn, 'setconfig'):
-        previous = conn.getconfig(option)
-        conn.setconfig(option, False)
-        return option, previous
-    return None
-
-
-def preflight_chart_queries(reads):
-    """Return SQL, grounding and chart-layout errors indexed by read."""
-    from mcp_server.charts import COORDINATE_FIELDS, normalize_chart_spec
-
-    diagnostics = {}
-    with closing(connect(readonly=True)) as conn:
-        _prepare_connection(conn)
-        _set_chart_identifier_mode(conn)
-        conn.execute('BEGIN')
-        for index, read in enumerate(reads):
-            query, parameters = read.get('query'), read.get('parameters')
-            problem = _read_argument_error(query, parameters)
-            if problem:
-                diagnostics[index] = problem
-                continue
-            try:
-                compiled = _compile_chart_read(conn, normalize_product_filters(query), parameters)
-            except UngroundedChartQuery as exc:
-                diagnostics[index] = str(exc)
-            except sqlite3.Error as exc:
-                details = _sql_error_details(exc, 'admin')
-                diagnostics[index] = ' '.join(details[key] for key in ('error', 'repair_hint') if key in details)
-            else:
-                if read.get('chart') is None:
-                    continue
-                try:
-                    spec = normalize_chart_spec(read['chart'])
-                except ValueError as exc:
-                    diagnostics[index] = str(exc)
-                    continue
-                try:
-                    statement = compiled.rstrip().removesuffix(';')
-                    cursor = conn.execute(f'SELECT * FROM (\n{statement}\n) LIMIT 0', parameters or [])
-                except sqlite3.Error:
-                    # The original statement compiled. The wrapper is only for alias diagnostics.
-                    continue
-                columns = {column[0] for column in cursor.description}
-                fields = [spec['x'], *spec['y'], *(spec[key] for key in COORDINATE_FIELDS if key in spec)]
-                missing = dict.fromkeys(field for field in fields if field not in columns)
-                if missing:
-                    diagnostics[index] = ('Chart fields missing from SELECT results: ' + ', '.join(missing)
-                                          + '. Return those aliases or change the chart fields.')
-    return diagnostics
-
-
-def _execute_read(query, chart, parameters, *, export=False, connection=None):
-    problem = _read_argument_error(query, parameters)
-    if problem:
-        return {'ok': False, 'error': problem}
-    from mcp_server.access import scope, customer_query_connection
-    access = scope.get()
-    if chart is not None and (not access or access['mode'] != 'admin'):
-        return {'ok': False, 'error': 'Analytics charts require Admin mode.'}
-    conn = connection or (customer_query_connection(access['customer_id'], staff=access['mode'] == 'cashier')
-            if access and access['mode'] in ('customer', 'cashier') else connect(readonly=True))
-    dqs = None
+def temporal(value, periods=False):
+    if periods and isinstance(value,str):
+        if re.fullmatch(r'\d{4}-\d{2}',value):
+            value += '-01'
+        elif re.fullmatch(r'\d{4}',value):
+            value += '-01-01'
+    if not isinstance(value,str) or not re.fullmatch(
+            r'\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?)?', value):
+        raise ValueError('Temporal coordinates require ISO date or date-time strings.')
     try:
-        if connection is None:
-            _prepare_connection(conn)
-        if chart is not None:
-            dqs = _set_chart_identifier_mode(conn)
-        deadline = time.monotonic() + 2
-        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
-        conn.set_authorizer(authorize)
-        original_query = query
-        query = normalize_product_filters(query)
-        compiled = _compile_chart_read(conn, query, parameters) if chart is not None else query
-        cursor = conn.execute(compiled, parameters or [])
-        from mcp_server.charts import MAX_CHART_ROWS
-        from context.reports import MAX_REPORT_ROWS
-        row_limit = MAX_CHART_ROWS if chart is not None else MAX_REPORT_ROWS if export else settings.SQL_MAX_ROWS
-        rows = cursor.fetchmany(row_limit + 1)
-        if any(isinstance(value, float) and not math.isfinite(value) for row in rows for value in row):
-            return {'ok':False,'error':'The query produced a non-finite number. Narrow the calculation or correct its inputs.'}
-        result = {'ok': True, 'columns': [c[0] for c in cursor.description or []],
-                'rows': [list(row) for row in rows[:row_limit]],
-                'row_count': min(len(rows), row_limit),
-                'truncated': len(rows) > row_limit,
-                'coverage_note': 'row_count counts returned SQL rows only. SQL LIMIT and filters may exclude matches even when truncated is false. Count the full matching set separately before claiming completeness, absence or a store-wide total.'}
-        if compiled != query:
-            result['query_note'] = 'Quoted reserved SQL aliases locally. Use names such as series_label instead of group/order in future queries.'
-        if query != original_query:
-            result['product_search_note'] = 'Product name/category filters ignore case, separators and common plural endings. IDs and financial filters retain their original semantics.'
-        if chart is not None:
-            from mcp_server.charts import prepare_chart
-            try:
-                payload = prepare_chart(result['columns'],result['rows'],chart,result['truncated'])
-                result['chart'] = {key:value for key,value in payload.items() if key != 'data'}
-            except ValueError as exc:
-                result['chart_error'] = str(exc)
-        return result
-    except UngroundedChartQuery as exc:
-        return {'ok': False, 'error': str(exc)}
-    except sqlite3.Error as exc:
-        return _sql_error_details(exc, access['mode'] if access else 'admin')
-    finally:
-        if connection is None:
-            conn.close()
-        elif dqs is not None:
-            conn.setconfig(*dqs)
+        parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
+    except ValueError:
+        raise ValueError('Temporal coordinates require valid ISO dates or date-times.') from None
+    offset = re.search(r'[+-](\d{2}):(\d{2})$', value)
+    if offset and (int(offset[1]) > 23 or int(offset[2]) > 59):
+        raise ValueError('Temporal timezone offsets require valid hours and minutes.')
+    if parsed.microsecond % 1000:
+        raise ValueError('Temporal coordinates support millisecond precision. Group finer timestamps in SQL before charting.')
+    return parsed
+
+
+def normalize_chart_spec(spec):
+    """Normalize unambiguous chart encodings and validate the layout without reading rows."""
+    if not isinstance(spec, dict):
+        raise ValueError('Chart specification must be an object.')
+    spec = dict(spec)
+    kind = canonical_chart_type(spec.get('type'))
+    if kind == 'heatmap' and 'z' in spec:
+        measure = spec.pop('z')
+        vertical = spec.get('y')
+        if isinstance(vertical, list) and len(vertical) == 1:
+            vertical = vertical[0]
+        group = spec.get('group', vertical)
+        if (not isinstance(measure, str) or not measure.strip()
+                or not isinstance(group, str) or not group.strip() or group == measure
+                or vertical not in (None, group, measure)):
+            raise ValueError('Heatmap uses x and group for dimensions and y:[measure] for color. '
+                             'When using z for color, y must name the vertical dimension or the same measure.')
+        spec.update(group=group, y=[measure])
+    if set(spec) - SPEC_FIELDS:
+        raise ValueError('Chart accepts only type, title, x, y, group, size, end, x_type, bins and label.')
+    if kind not in CHART_TYPES:
+        raise ValueError('Unsupported chart type. Choose one of: '+', '.join(CHART_TYPES)+'.')
+    spec['type'] = kind
+    if kind == 'timeline':
+        if spec.get('y') is None:
+            spec['y'] = []
+        if spec.get('end') is None:
+            spec.pop('end', None)
+    if isinstance(spec.get('y'), str):
+        spec['y'] = [spec['y']]
+    if spec.get('group') == spec.get('x') and spec.get('type') in SERIES_TYPES | {'boxplot'}:
+        # Grouping a category by itself adds no information and duplicates an axis.
+        spec.pop('group', None)
+    x, ys = spec.get('x'), spec.get('y')
+    if not isinstance(x, str) or not x.strip() or not isinstance(ys, list):
+        raise ValueError('Chart x must name a returned column and y must be a list of columns.')
+    count = 0 if kind in ('histogram','timeline') else 2 if kind in ('range','combo') else None
+    single = kind in ('pie','scatter','bubble','boxplot','heatmap')
+    if kind in ('stacked_bar', 'normalized_bar') and len(ys) > 4:
+        raise ValueError('A stack accepts at most four y columns. For more components, use one y column '
+                         'with distinct group labels, one row per x/group pair, and mutually exclusive additive parts.')
+    if (count is not None and len(ys)!=count) or (single and len(ys)!=1) or (count is None and not single and not 1<=len(ys)<=4):
+        raise ValueError(f'{kind} has the wrong number of y columns. Check the chart contract.')
+    if any(not isinstance(y,str) or not y.strip() or y==x for y in ys) or len(ys)!=len(set(ys)):
+        raise ValueError('Chart y columns must exist, be distinct, and differ from x.')
+    allowed_extra = ({'group'} if kind in SERIES_TYPES or kind in ('boxplot','heatmap') else
+                     {'group','size','label'} if kind=='bubble' else {'group','label'} if kind=='scatter' else
+                     {'group','end'} if kind=='timeline' else
+                     {'bins'} if kind=='histogram' else set())
+    grouped_series = kind in SERIES_TYPES and 'group' in spec
+    if grouped_series and len(ys) != 1:
+        raise ValueError('A series group requires exactly one y measure.')
+    if set(spec).intersection({'group','size','end','bins','label'})-allowed_extra:
+        raise ValueError('This chart type does not support one of the supplied optional fields.')
+    required = {'group'} if kind in ('heatmap','timeline') else {'size'} if kind=='bubble' else set()
+    if not required<=set(spec):
+        if kind == 'bubble':
+            raise ValueError('Bubble charts need size set to a positive numeric SQL column, preferably separate from x and y.')
+        raise ValueError(f'{kind} requires: '+', '.join(sorted(required))+'.')
+    extras = {key: spec[key] for key in COORDINATE_FIELDS if key in spec}
+    if kind == 'heatmap' and extras['group'] == x:
+        raise ValueError('Heatmap x and group must name distinct dimensions. Return one numeric y per x/group pair.')
+    if any(not isinstance(value, str) or not value.strip() for value in extras.values()):
+        raise ValueError('Chart coordinate, group, size, end and label fields must name returned SQL columns.')
+    coordinates = [x, *ys, *(value for key, value in extras.items() if key != 'size')]
+    if 'size' in extras and extras['size'] not in ys:
+        coordinates.append(extras['size'])
+    if len(set(coordinates)) != len(coordinates):
+        raise ValueError('Chart coordinate columns must be distinct. Use separate fields for dimensions and labels; '
+                         'bubble size may explicitly emphasize the y measure.')
+    default_axis = DEFAULT_AXES.get(kind, 'categorical')
+    axis=spec.get('x_type',default_axis)
+    if not isinstance(axis,str) or axis not in ('categorical','numeric','temporal'):
+        raise ValueError('x_type must be categorical, numeric or temporal.')
+    fixed = kind in ('scatter','bubble','histogram','pie','boxplot','timeline')
+    if fixed and axis!=default_axis:
+        raise ValueError(f'{kind} requires {default_axis} x coordinates.')
+    if kind == 'heatmap' and axis == 'numeric':
+        raise ValueError('Heatmap x coordinates must be categories or temporal periods. Use discrete bins for numeric values.')
+    bins=spec.get('bins',10)
+    if kind=='histogram' and (type(bins) is not int or not 2<=bins<=50):
+        raise ValueError('Histogram bins must be an integer from 2 to 50.')
+    return spec
+
+
+def prepare_chart(columns, rows, spec, truncated=False, *, allow_single_slice=False):
+    spec = normalize_chart_spec(spec)
+    kind, x, ys = spec['type'], spec.get('x'), spec.get('y')
+    may_swap_horizontal = kind == 'horizontal_bar' and 'group' not in spec
+    if (not isinstance(columns, (list, tuple)) or not columns or
+            not all(isinstance(c,str) and c.strip() for c in columns) or len(columns)!=len(set(columns))):
+        raise ValueError('Give every selected SQL column a unique text alias.')
+    try:
+        for column in columns:
+            column.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('SQL column aliases require valid Unicode text.') from None
+    if x not in columns:
+        raise ValueError('Chart x must name a returned column and y must be a list of columns.')
+    if any(y not in columns for y in ys):
+        raise ValueError('Chart y columns must exist, be distinct, and differ from x.')
+    extras = {key: spec[key] for key in COORDINATE_FIELDS if key in spec}
+    if any(value not in columns for value in extras.values()):
+        raise ValueError('Chart coordinate, group, size, end and label fields must name returned SQL columns.')
+    grouped_series = kind in SERIES_TYPES and 'group' in spec
+    axis = spec.get('x_type', DEFAULT_AXES.get(kind, 'categorical'))
+    bins = spec.get('bins', 10)
+    if not isinstance(truncated, bool):
+        raise ValueError('Chart truncation metadata must be true or false.')
+    if truncated:
+        raise ValueError('Query results were truncated. Aggregate or narrow the query before charting; distributions require complete observations.')
+    if (not isinstance(rows, (list, tuple)) or not rows or len(rows)>MAX_CHART_ROWS or
+            any(not isinstance(r, (list, tuple)) or len(r)!=len(columns) for r in rows)):
+        raise ValueError('Charts require 1-1000 complete rows. Aggregate or narrow the query.')
+    if (may_swap_horizontal and len(ys) == 1 and axis in ('categorical', 'numeric')
+            and _uses_horizontal_axes(rows, columns.index(x), columns.index(ys[0]))):
+        x, ys = ys[0], [x]
+        axis = 'categorical'
+    title=spec.get('title','Query results')
+    if not isinstance(title,str) or not title.strip() or len(title)>160:
+        raise ValueError('Chart title must be text of at most 160 characters.')
+    try:
+        title.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('Chart title requires valid Unicode text.') from None
+    currency_columns = [c for c in columns if c.lower() == 'currency']
+    if len(currency_columns) > 1:
+        raise ValueError('Return one currency metadata column with a unique alias.')
+    raw_currencies=[r[columns.index(currency_columns[0])] for r in rows] if currency_columns else []
+    if any(not isinstance(c,str) or not re.fullmatch(r'[A-Za-z]{3}', c.strip()) for c in raw_currencies):
+        raise ValueError('Chart currency metadata must be a three-letter currency code.')
+    currencies={c.strip().upper() for c in raw_currencies}
+    if len(currencies)>1:
+        raise ValueError('Chart one currency at a time. Filter currency and return it as currency.')
+    if x.lower()=='currency' or any(y.lower()=='currency' for y in ys) or extras.get('size','').lower()=='currency':
+        raise ValueError('Currency is metadata, not a chart axis or measure. Select a meaningful category, date or numeric measure.')
+    if extras.get('label', '').lower() == 'currency':
+        raise ValueError('Choose an observation label other than the currency metadata column.')
+    if axis == 'categorical' and currencies and all(
+            isinstance(row[columns.index(x)], str) and row[columns.index(x)].strip().upper() in currencies
+            for row in rows):
+        raise ValueError('Currency is metadata, not a chart axis. Select a meaningful category instead of a constant currency label.')
+    currency_group = 'group' in extras and currencies and all(
+        isinstance(row[columns.index(extras['group'])], str) and
+        row[columns.index(extras['group'])].strip().upper() in currencies for row in rows)
+    if extras.get('group','').lower()=='currency' or currency_group:
+        if kind=='heatmap' or kind=='timeline':
+            raise ValueError('Currency is metadata, not a chart dimension. Return another meaningful group column.')
+        extras.pop('group')
+        spec.pop('group',None)
+        grouped_series=False
+    elif 'group' in extras and kind in SERIES_TYPES | {'scatter','bubble','boxplot'}:
+        if len({label(row[columns.index(extras['group'])]) for row in rows}) == 1:
+            # A single currency or constant label is metadata, not another plotted series.
+            extras.pop('group')
+            spec.pop('group',None)
+            grouped_series=False
+    records,seen=[],set()
+    stacked=kind in ('stacked_bar','normalized_bar')
+    normalized=kind == 'normalized_bar'
+    nonnegative=stacked or kind == 'pie'
+    time_zones=set()
+    positions = {column: i for i, column in enumerate(columns)}
+    for row in rows:
+        raw=row[positions[x]]
+        if axis == 'temporal':
+            start = temporal(raw, periods=kind != 'timeline')
+            time_zones.add(start.tzinfo is not None)
+            if start.tzinfo is not None:
+                try:
+                    start = start.astimezone(timezone.utc)
+                except (ValueError, OverflowError):
+                    raise ValueError('Temporal coordinates exceed the supported date range after timezone conversion.') from None
+            coordinate = start.isoformat()
+        else:
+            coordinate=numeric(raw) if axis=='numeric' else label(raw)
+        values={y:numeric(row[positions[y]]) for y in ys}
+        record={x:coordinate,**values}
+        if 'group' in extras:
+            record[extras['group']]=label(row[positions[extras['group']]])
+        if 'label' in extras:
+            record[extras['label']]=label(row[positions[extras['label']]])
+        if 'size' in extras:
+            record[extras['size']]=numeric(row[positions[extras['size']]])
+            if record[extras['size']] < 0:
+                raise ValueError('Bubble sizes cannot be negative. Select a nonnegative size measure from SQL.')
+        if 'end' in extras:
+            endpoint = row[positions[extras['end']]]
+            record[extras['end']] = None
+            if endpoint is not None:
+                end = temporal(endpoint)
+                time_zones.add(end.tzinfo is not None)
+                if end.tzinfo is not None:
+                    try:
+                        end = end.astimezone(timezone.utc)
+                    except (ValueError, OverflowError):
+                        raise ValueError('Timeline dates exceed the supported date range after timezone conversion.') from None
+                if len(time_zones)>1:
+                    raise ValueError('Temporal coordinates require consistently timezone-aware or timezone-free dates.')
+                if end<start:
+                    raise ValueError('Timeline end must not precede its start.')
+                record[extras['end']] = end.isoformat()
+        if kind == 'timeline':
+            key = (coordinate, record[extras['group']], record.get(extras.get('end')))
+            if key in seen:
+                continue
+        else:
+            key = (coordinate, record[extras['group']]) if kind == 'heatmap' or grouped_series else coordinate
+        if kind not in ('scatter','bubble','histogram','boxplot') and key in seen:
+            raise ValueError('Group duplicate chart coordinates in SQL before charting. Normalize currency before grouping, including legacy NULL/blank values; use an outer CTE to group the resolved currency, not the raw source column. Do not sum averages or ratios to repair duplicates.')
+        seen.add(key)
+        if nonnegative and any(v<0 for v in values.values()):
+            raise ValueError(f'{kind} requires nonnegative values.')
+        if stacked and not math.isfinite(sum(values.values())):
+            raise ValueError('Stacked totals overflow. Scale or narrow the measures.')
+        if normalized and not grouped_series and sum(values.values())<=0:
+            raise ValueError('Percentage charts require a positive total for each x value.')
+        if kind=='range' and values[ys[0]]>values[ys[1]]:
+            raise ValueError('Range lower bound must not exceed upper bound.')
+        records.append(record)
+    if len(time_zones)>1:
+        raise ValueError('Temporal coordinates require consistently timezone-aware or timezone-free dates.')
+    if kind == 'bubble' and not any(record[extras['size']] > 0 for record in records):
+        raise ValueError('Bubble charts need at least one positive size. Select a meaningful size measure with variation.')
+    if grouped_series and normalized:
+        groups = {}
+        for record in records:
+            groups[record[x]] = groups.get(record[x], 0) + record[ys[0]]
+        if any(not math.isfinite(total) or total <= 0 for total in groups.values()):
+            raise ValueError('Percentage charts require a finite positive total for each x value.')
+    if kind == 'pie':
+        positive = sum(row[ys[0]] > 0 for row in records)
+        if not positive:
+            raise ValueError('pie needs a positive total.')
+        if positive == 1 and not allow_single_slice:
+            raise ValueError('Pie has only one positive slice. Choose a real breakdown with at least two nonzero parts.')
+    # Check aggregate y totals as well as individual values because finite inputs can still overflow when
+    # summed.
+    totals=[sum(r[y] for r in records) for y in ys]
+    if any(not math.isfinite(v) for v in totals):
+        raise ValueError('Chart totals overflow. Scale or narrow the measures.')
+    # Finite inputs can still produce an infinite browser scale.
+    domains = [[r[y] for r in records] for y in ys]
+    if axis == 'numeric':
+        domains.append([r[x] for r in records])
+    if kind == 'range':
+        domains.append([r[y] for r in records for y in ys])
+    if any(not math.isfinite(max(domain)-min(domain)) for domain in domains):
+        raise ValueError('Chart scale overflows. Scale or narrow the measures.')
+    return {'type':kind,'title':title,'x':x,'y':ys,'currency':next(iter(currencies),None),
+            'x_type':axis,**extras,**({'bins':bins} if kind=='histogram' else {}),'data':records}
+
+
+def chart_from_result(result):
+    if (not isinstance(result, dict) or not isinstance(result.get('chart'), dict) or
+            'columns' not in result or 'rows' not in result):
+        raise ValueError('Chart requires metadata and complete executed query columns and rows.')
+    metadata=result['chart']
+    return prepare_chart(result['columns'],result['rows'],
+                         {k:v for k,v in metadata.items() if k in SPEC_FIELDS},result.get('truncated',False))
+
+
+def validate_saved_chart(chart):
+    """Apply the same input contract to persisted artifacts before rendering."""
+    if (not isinstance(chart, dict) or set(chart) - (SPEC_FIELDS | {'data', 'currency'}) or
+            not isinstance(chart.get('data'), list) or not chart['data'] or
+            not all(isinstance(row, dict) for row in chart['data'])):
+        raise ValueError('Saved chart requires supported metadata and complete data records.')
+    columns = list(chart['data'][0])
+    if any(set(row) != set(columns) for row in chart['data']):
+        raise ValueError('Saved chart rows must contain the same coordinate and measure columns.')
+    rows = [[row[column] for column in columns] for row in chart['data']]
+    if chart.get('currency') is not None:
+        if any(isinstance(column, str) and column.lower() == 'currency' for column in columns):
+            raise ValueError('Saved chart currency must be metadata, not a coordinate.')
+        columns.append('currency')
+        rows = [row + [chart['currency']] for row in rows]
+    return prepare_chart(columns, rows, {k:v for k,v in chart.items() if k in SPEC_FIELDS}, allow_single_slice=True)
