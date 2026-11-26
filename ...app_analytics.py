@@ -1,414 +1,282 @@
-"""Validate declarative charts made only from executed query rows."""
-import math
+"""Render saved, query-backed charts with the existing Altair/Streamlit stack."""
+import logging
 import re
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from datetime import datetime
 
-CHART_TYPES = ('bar','grouped_bar','horizontal_bar','stacked_bar','normalized_bar',
-               'line','pie','scatter','bubble','histogram','boxplot','heatmap',
-               'range','combo','timeline')
-MAX_CHART_ROWS = 1000
-SERIES_TYPES = {'bar','grouped_bar','horizontal_bar','stacked_bar','normalized_bar',
-                'line'}
-CHART_ALIASES = {'box_plot':'boxplot','heat_map':'heatmap', 'combination':'combo',
-                 'combination_chart':'combo','gantt':'timeline'}
+import altair as alt
+import streamlit as st
+
+PALETTE = ['#2563eb', '#008578', '#c57812', '#8654bd', '#cc4e65', '#387fa1',
+           '#638331', '#bc5a2b', '#6155a6', '#a75083']
+MAX_PIE_SLICES = 12
 
 
-def canonical_chart_type(kind):
-    if not isinstance(kind, str):
-        return kind
-    kind = kind.strip().lower().replace(' ', '_').replace('-', '_').removesuffix('_chart')
-    return CHART_ALIASES.get(kind, kind)
+def build_chart(chart):
+    from mcp_server.charts import validate_saved_chart
+    return _build_validated_chart(validate_saved_chart(chart))
 
 
-def normalize_chart_types(values):
-    if not isinstance(values, list) or not values:
-        raise ValueError('Expected chart types must be a non-empty list of supported chart names.')
-    canonical = [canonical_chart_type(value) for value in values]
-    if any(kind not in CHART_TYPES for kind in canonical):
-        raise ValueError('Expected chart types must be a non-empty list of supported chart names.')
-    return list(dict.fromkeys(canonical))
+def _build_validated_chart(chart):
+    kind, x, ys = chart['type'], chart['x'], chart['y']
+    axis = chart.get('x_type', 'numeric' if kind in ('scatter','bubble','histogram') else 'temporal' if kind=='timeline' else 'categorical')
+    xtype = {'categorical':'O','numeric':'Q','temporal':'T'}[axis]
+    currency = chart.get('currency')
+    suffix = f' ({currency})' if currency else ''
+    def label_title(field):
+        return field.replace('_', ' ').capitalize()
+
+    def field_title(field):
+        counts = re.search(r'(?:^|[^a-z0-9])(?:counts?|qty|quantity|quantities|units|products|orders|invoices|customers|items|percent|percentage|ratio|share|rate)(?:[^a-z0-9]|$)|quantity$', field, re.I)
+        return label_title(field) + (suffix if not counts else '')
+
+    def value_format(field):
+        return ',.2f' if currency and field_title(field).endswith(suffix) else ',.6~g'
+
+    measure = field_title(ys[0]) if len(ys)==1 else 'Products' if all(
+        field.endswith('products') for field in ys) else 'Value' + (
+        suffix if any(field_title(field).endswith(suffix) for field in ys) and suffix else '')
+    rows = []
+    for i, record in enumerate(chart['data']):
+        row = {'x_value':record[x], 'position':i}
+        if axis == 'temporal' and datetime.fromisoformat(row['x_value']).tzinfo is None:
+            row['x_value'] += 'Z'
+        row.update({f'v{j}':record[y] for j,y in enumerate(ys)})
+        for source,target in [('group','category'),('size','bubble_size'),('end','end_value'),('label','point_label')]:
+            if source in chart:
+                row[target] = record[chart[source]]
+                if source == 'end' and row[target] is not None and datetime.fromisoformat(row[target]).tzinfo is None:
+                    row[target] += 'Z'
+        rows.append(row)
+
+    def base(data=None):
+        return alt.Chart(alt.Data(values=rows if data is None else data))
+
+    coordinates = {row['x_value'] for row in rows}
+    time_bar_width = max(2., min(42., 460. / len(coordinates)))
+
+    def color(field='series:N', title='Measure', cardinality=None):
+        scale = alt.Scale(scheme='tableau20') if cardinality and cardinality > len(PALETTE) else alt.Scale(range=PALETTE)
+        return alt.Color(field, title=label_title(title), scale=scale,
+                         legend=alt.Legend(orient='bottom', columns=3, labelLimit=135, rowPadding=6))
+
+    def finish(result, height=340):
+        return (result.properties(height=height, description=chart['title'])
+                .configure_view(strokeWidth=0)
+                .configure_axis(domain=False, tickSize=0, labelPadding=7, labelFontSize=12,
+                                titleFontSize=12, titlePadding=12, gridColor='#94a3b8',
+                                gridOpacity=0.25, gridDash=[2, 3], labelLimit=180)
+                .configure_legend(labelFontSize=12, titleFontSize=12, symbolSize=96))
+
+    order = alt.SortField(field='position', order='ascending')
+    axis_options = {}
+    time_format = '%Y-%m-%d %H:%M:%S.%L'
+    if xtype == 'O':
+        dense = len(coordinates) > 8 or max(map(len, coordinates)) > 18
+        axis_options = {'sort': order, 'axis': alt.Axis(
+            labelAngle=-30 if dense and kind != 'horizontal_bar' else 0, labelOverlap='greedy',
+            labelLimit=240 if kind == 'horizontal_bar' else 160)}
+    elif xtype == 'T' and kind != 'timeline':
+        dates = [datetime.fromisoformat(row['x_value'].replace('Z', '+00:00')) for row in rows]
+        months = {day.year*12+day.month for day in dates}
+        if all(day.day == 1 and not (day.hour or day.minute or day.second or day.microsecond) for day in dates):
+            span = max(months)-min(months)
+            yearly = len({day.month for day in dates}) == 1 and span >= 12
+            time_format = '%Y' if yearly else '%b %Y'
+            axis_options = {'axis': alt.Axis(format=time_format,
+                tickCount={'interval':'year' if yearly else 'month', 'step':max(1, span//120 if yearly else (span+11)//12)},
+                labelOverlap='greedy')}
+        elif all(not (day.hour or day.minute or day.second or day.microsecond) for day in dates):
+            time_format = '%d %b %Y'
+            axis_options = {'axis':alt.Axis(format=time_format,labelOverlap='greedy')}
+        else:
+            axis_options = {'axis':alt.Axis(format=time_format,labelOverlap='greedy')}
+    if xtype == 'T':
+        axis_options['scale'] = alt.Scale(type='utc')
+    xc = alt.X('x_value:'+xtype, title=field_title(x) if xtype=='Q' else label_title(x),
+               **axis_options)
+    multiple_series = len(ys)>1 or 'group' in chart
+    discrete_bars = kind in ('bar','grouped_bar','horizontal_bar') and multiple_series and xtype != 'O'
+    temporal_heatmap = kind == 'heatmap' and xtype == 'T'
+    # Continuous-axis offsets overlap grouped bars, and heatmap periods need
+    # distinct, equal-width cells. Format labels without changing the positions.
+    if discrete_bars or temporal_heatmap:
+        discrete_axis = alt.Axis(labelAngle=-30 if len(coordinates)>8 and kind!='horizontal_bar' else 0, labelOverlap='greedy',
+            **({'labelExpr':f"utcFormat(toDate(datum.value), '{time_format}')"} if xtype=='T' else {}))
+        discrete_order = sorted(coordinates, key=datetime.fromisoformat) if temporal_heatmap else order
+        xc = alt.X('x_value:O',title=label_title(x),sort=discrete_order,axis=discrete_axis)
+    tip = [alt.Tooltip('point_label:N', title=label_title(chart['label']))] if 'label' in chart else []
+    tip.append(alt.Tooltip('x_value:'+xtype,
+                           title=field_title(x) if xtype=='Q' else label_title(x),
+                           **({'format':value_format(x)} if xtype=='Q' else
+                              {'format':time_format} if xtype=='T' and kind!='timeline' else {})))
+    tip += [alt.Tooltip(f'v{i}:Q', title=field_title(y), format=value_format(y)) for i,y in enumerate(ys)]
+    if 'group' in chart:
+        tip.append(alt.Tooltip('category:N',title=label_title(chart['group'])))
+
+    if kind == 'pie':
+        total = sum(row['v0'] for row in rows)
+        positive = [row for row in rows if row['v0'] > 0]
+        if len(positive) > MAX_PIE_SLICES:
+            ranked = sorted(positive, key=lambda row: row['v0'], reverse=True)
+            other = 'Other'
+            number = 2
+            while other in coordinates:
+                other = f'Other ({number})'
+                number += 1
+            keep = MAX_PIE_SLICES - 1
+            positive = ranked[:keep] + [{'x_value': other, 'v0': sum(row['v0'] for row in ranked[keep:])}]
+        segments = [{**row, 'position': index, 'share': row['v0'] / total}
+                    for index, row in enumerate(positive)]
+        spacing = 0.013 if min(row['share'] for row in segments) >= 0.015 else 0
+        c = base(segments).mark_arc(outerRadius=145, padAngle=spacing).encode(
+            theta=alt.Theta('v0:Q'), color=color('x_value:N',x,len(segments)), order='position:O',
+            tooltip=tip+[alt.Tooltip('share:Q',title='Share of query total',format='.1%')])
+        return finish(c)
+    if kind in ('scatter','bubble'):
+        scale = alt.Scale(zero=False, padding=18)
+        axes = {'x': alt.X('x_value:Q', title=field_title(x), scale=scale),
+                'y': alt.Y('v0:Q', title=measure, scale=scale)}
+        c = base().mark_circle(opacity=0.55 if len(rows)>80 else 0.78,
+                               stroke='white',strokeWidth=0.65,
+                               **({'size': 45 if len(rows)>80 else 80} if kind=='scatter' else {})).encode(
+            **axes, tooltip=tip)
+        if 'group' in chart:
+            c = c.encode(color=color('category:N',chart['group'],len({row['category'] for row in rows})))
+        else:
+            c = c.encode(color=alt.value(PALETTE[0]))
+        if kind=='bubble':
+            # Vega expresses circle size as area. Preserve proportional area and
+            # draw smaller bubbles above larger ones where points overlap.
+            max_area = max(300, min(1500, round(6400 / len(rows)**0.5)))
+            size = chart['size']
+            if size != ys[0]:
+                tip = tip + [alt.Tooltip('bubble_size:Q', title=field_title(size), format=value_format(size))]
+            c = c.encode(size=alt.Size('bubble_size:Q',title=field_title(size),
+                                      scale=alt.Scale(type='linear',zero=True,range=[0,max_area]),
+                                      legend=alt.Legend(orient='bottom',tickCount=4)),
+                         order=alt.Order('bubble_size:Q',sort='descending'), tooltip=tip)
+            if any(row['bubble_size'] == 0 for row in rows):
+                zero_points = (base().transform_filter(alt.datum.bubble_size == 0)
+                               .mark_point(filled=False, shape='circle', size=48, strokeWidth=1.25)
+                               .encode(**axes, color=c.encoding.color, tooltip=tip))
+                c = c.transform_filter(alt.datum.bubble_size > 0) + zero_points
+        return finish(c, 380)
+    if kind=='histogram':
+        return finish(base().mark_bar(color=PALETTE[0],binSpacing=2).encode(
+            x=alt.X('x_value:Q',bin=alt.Bin(maxbins=chart.get('bins',10)),title=field_title(x)),
+            y=alt.Y('count():Q',title='Observations'),
+            tooltip=[alt.Tooltip('x_value:Q',bin=True,title=x),alt.Tooltip('count():Q',title='Observations')]))
+    if kind=='boxplot':
+        c = base().mark_boxplot(extent=1.5,size=28).encode(x=xc,y=alt.Y('v0:Q',title=measure))
+        if 'group' in chart:
+            c = c.encode(color=color('category:N',chart['group']),xOffset='category:N')
+        else:
+            c = c.encode(color=alt.value(PALETTE[0]))
+        return finish(c)
+    if kind=='heatmap':
+        values = [row['v0'] for row in rows]
+        heat = alt.Scale(scheme='redblue', domainMid=0) if min(values)<0<max(values) else alt.Scale(scheme='blues')
+        categories = list(dict.fromkeys(row['category'] for row in rows))
+        crowded = len(coordinates) > 30 or len(categories) > 24
+        cells = base().mark_rect(
+            **({} if crowded else {'cornerRadius': 2, 'stroke': 'white', 'strokeWidth': 0.65}))
+        return finish(cells.encode(
+            x=xc, y=alt.Y('category:N', title=label_title(chart['group']), sort=categories,
+                          axis=alt.Axis(labelLimit=220)),
+            color=alt.Color('v0:Q', title=measure, scale=heat,
+                            legend=alt.Legend(orient='bottom', gradientLength=180,
+                                              gradientThickness=10, tickCount=4,
+                                              format=value_format(ys[0]))), tooltip=tip),
+            max(260, min(720, len(categories) * 30)))
+    if kind=='range':
+        c = base().mark_rule(strokeWidth=7,color=PALETTE[0]).encode(
+            x=xc,y=alt.Y('v0:Q',title='Range'+suffix,scale=alt.Scale(zero=False)),y2='v1:Q',tooltip=tip)
+        endpoints = base().mark_tick(color=PALETTE[0],size=18,thickness=2).encode(x=xc,y='v0:Q')
+        return finish(c + endpoints + endpoints.encode(y='v1:Q'))
+    if kind=='combo':
+        bars = base().mark_bar(color=PALETTE[0],opacity=0.7,
+                              **({'size':time_bar_width} if xtype=='T' else {})).encode(
+            x=xc,y=alt.Y('v0:Q',title=field_title(ys[0]),
+                        axis=alt.Axis(titleColor=PALETTE[0],labelColor=PALETTE[0])),tooltip=tip)
+        line = base().mark_line(color=PALETTE[1],point=True,strokeWidth=3).encode(
+            x=xc,y=alt.Y('v1:Q',title=field_title(ys[1]),axis=alt.Axis(orient='right',grid=False,
+                titleColor=PALETTE[1],labelColor=PALETTE[1])),tooltip=tip)
+        return finish(alt.layer(bars,line).resolve_scale(y='independent'))
+    if kind=='timeline':
+        if 'end' in chart:
+            tip.append(alt.Tooltip('end_value:T',title=label_title(chart['end'])))
+        date_axis = alt.X('x_value:T',title='Recorded dates' if 'end' in chart else label_title(x),
+                          scale=alt.Scale(type='utc'))
+        task_axis = alt.Y('category:N',title=label_title(chart['group']),sort=order)
+        starts = base().mark_circle(size=65,color=PALETTE[0]).encode(
+            x=date_axis,y=task_axis,tooltip=tip)
+        closed = [row for row in rows if row.get('end_value') is not None]
+        if closed:
+            intervals = base(closed).mark_bar(color=PALETTE[0],cornerRadius=4,size=14,opacity=0.65).encode(
+                x=date_axis,x2='end_value:T',y=task_axis,
+                order=alt.Order('end_value:T', sort='descending'),tooltip=tip)
+            starts = intervals + starts
+        return finish(starts,max(300,min(900,len({r['category'] for r in rows})*30)))
+    series_labels = [y.replace('_',' ').capitalize() for y in ys]
+    if len(set(series_labels)) != len(series_labels):
+        series_labels = list(ys)
+    long = [{'x_value':r['x_value'],'value':r[f'v{j}'],'series':r.get('category',series_labels[j]),'position':r['position']}
+            for r in rows for j,y in enumerate(ys)]
+    b = base(long)
+    if kind in ('bar','grouped_bar','horizontal_bar','stacked_bar','normalized_bar'):
+        groups = len(ys) if len(ys)>1 else len({row.get('category') for row in rows}) if 'group' in chart else 1
+        c = b.mark_bar(cornerRadiusEnd=3, **({'size':max(2.,time_bar_width/max(1,groups))}
+            if xtype=='T' else {}))
+    elif kind == 'line':
+        c = b.mark_line(point=True,strokeWidth=2.5)
+    else:
+        raise ValueError('Unsupported chart type.')
+    stack = 'normalize' if kind.startswith('normalized') else 'zero' if kind.startswith('stacked') else None
+    title = 'Share' if stack=='normalize' else measure
+    series_title = chart.get('group','Measure')
+    series = {row['series'] for row in long}
+    series_tip = [tip[0]]
+    if multiple_series:
+        series_tip.append(alt.Tooltip('series:N',title=label_title(series_title)))
+    series_tip.append(alt.Tooltip('value:Q',title=measure,format=value_format(ys[0])))
+    c = c.encode(color=color('series:N',series_title,len(series)),tooltip=series_tip)
+    if len(ys) == 1 and 'group' not in chart:
+        c = c.encode(color=alt.value(PALETTE[0]))
+    value_axis = alt.Axis(format='%') if stack=='normalize' else alt.Axis()
+    if kind=='horizontal_bar':
+        c = c.encode(y=alt.Y('x_value:'+('O' if discrete_bars else xtype),title=x.replace('_',' ').capitalize(),sort=order,
+                            **({'axis':discrete_axis} if discrete_bars else
+                               {key:value for key,value in axis_options.items() if key!='sort'})),
+                     x=alt.X('value:Q',title=title,stack=None,axis=value_axis))
+        if len(ys)>1 or 'group' in chart:
+            c = c.encode(yOffset='series:N')
+        return finish(c,max(320,min(900,len({r['x_value'] for r in rows})*30)))
+    c = c.encode(x=xc,y=alt.Y('value:Q',title=title,stack=stack,axis=value_axis))
+    if kind in ('bar','grouped_bar') and (len(ys)>1 or 'group' in chart):
+        c = c.encode(xOffset='series:N')
+    return finish(c)
 
 
-SPEC_FIELDS = {'type','title','x','y','group','size','end','x_type','bins','label'}
-COORDINATE_FIELDS = ('group', 'size', 'end', 'label')
-DEFAULT_AXES = {'scatter': 'numeric', 'bubble': 'numeric', 'histogram': 'numeric', 'timeline': 'temporal'}
-CHART_GUIDE = """
-Chart data contract for execute_sql_query
-
-Type | Select these data and fields
-bar | One label x and one numeric y per category.
-grouped_bar | 2–4 comparable y columns or one y plus group per x.
-horizontal_bar | Category in x and numeric measure in y. The renderer rotates the axes.
-stacked_bar | Exclusive, additive, nonnegative parts. Use up to four y columns or one y plus group.
-normalized_bar | Stack with a positive total at each x. The renderer computes percentages.
-line | Ordered x and numeric y measures. Use x_type='temporal' for dates.
-pie | At least two positive, exclusive parts of a whole. Group by a nonconstant dimension. Return all categories or label the selected subset; use Other for top-N shares of the whole.
-scatter | Two materially different numeric measures per observation. Optional group or label.
-bubble | Numeric x/y and nonnegative size (some positive) at the same grain. Prefer a distinct business measure for size; use a different relationship from scatter in a general dashboard. Optional group or label.
-histogram | One raw numeric observation per row in x, y:[], optional bins from 2 to 50. The renderer bins the values.
-boxplot | Categorical x and one raw numeric y per observation, with repeated observations for a meaningful distribution. Optional group.
-heatmap | Use x/group for two distinct dimensions and y:[measure] for one numeric value per pair. Use temporal x for dates or months.
-range | One row per x with y:[lower,upper], same units and lower <= upper.
-combo | One row per x with y:[bar_measure,line_measure]. These measures use separate scales.
-timeline | Recorded ISO date/time in x, event/task label in group, and y:[]. Optional end may be null or a real date/time at or after x. Use an event identifier to distinguish coincident events.
-
-Use distinct returned aliases, finite values and 1–1000 untruncated rows. Distributions need raw
-observations. Series support up to four same-unit y columns or one y with group. Aggregate to one
-row per x or x/group except for raw observations. Series/range/combo x_type is categorical by default
-and can be numeric or temporal. Temporal periods also accept YYYY-MM and YYYY except for timeline.
-Keep time zones consistent. Return one normalized currency per monetary chart as metadata.
-"""
-
-
-def numeric(value):
-    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        raise ValueError('Chart measures must be finite numbers, without null values.')
-    if isinstance(value, int) and abs(value) > 2**53 - 1:
-        raise ValueError('Chart integers exceed exact browser precision. Scale the measure or return identifiers as text.')
+def render_chart(chart):
     try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError('Chart measures must be numeric.') from None
-    if not math.isfinite(number):
-        raise ValueError('Chart measures must be finite.')
-    if isinstance(value, str) and abs(number) > 2**53 - 1:
-        raise ValueError('Chart integers exceed exact browser precision. Scale the measure or return identifiers as text.')
-    if isinstance(value, str) and number == 0:
-        try:
-            underflow = Decimal(value) != 0
-        except InvalidOperation:
-            raise ValueError('Chart measures must be numeric.') from None
-        if underflow:
-            raise ValueError('Chart measure is below browser numeric precision. Scale the measure before charting.')
-    return number
-
-
-def label(value):
-    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        raise ValueError('Chart category values must be non-null text or numbers.')
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError('Chart category numbers must be finite.')
-    try:
-        result = str(value)
-        result.encode('utf-8')
-    except (ValueError, UnicodeError):
-        raise ValueError('Chart category labels require valid Unicode text of at most 200 characters.') from None
-    if not result.strip() or len(result)>200:
-        raise ValueError('Chart category labels require 1-200 characters.')
-    return result
-
-
-def _uses_horizontal_axes(rows, value_index, label_index):
-    """Recognize a numeric screen x and a text screen y in every SQL row."""
-    for row in rows:
-        value, category = row[value_index], row[label_index]
-        if type(value) not in (int, float) or not isinstance(category, str):
-            return False
-        try:
-            float(category)
-        except ValueError:
-            continue
+        from mcp_server.charts import validate_saved_chart
+        chart = validate_saved_chart(chart)
+        result=_build_validated_chart(chart)
+        st.subheader(chart['title'])
+        st.altair_chart(result,use_container_width=True)
+        count = len(chart['data'])
+        caption = f'{count:,} query row' + ('' if count == 1 else 's')
+        if chart.get('currency'):
+            caption += f" · {chart['currency']}"
+        if chart['type'] == 'pie' and sum(row[chart['y'][0]] > 0 for row in chart['data']) > MAX_PIE_SLICES:
+            caption += '. Smaller slices are grouped. View chart data for every category.'
+        if chart['type'] == 'timeline' and 'end' in chart and any(row[chart['end']] is None for row in chart['data']):
+            caption += '. Events without a recorded end are shown as points.'
+        st.caption(caption)
+        with st.expander('View chart data'):
+            st.dataframe(chart['data'],hide_index=True,use_container_width=True)
+    except Exception:
+        logging.getLogger(__name__).exception('Unable to render saved chart')
+        st.warning('This saved chart cannot be displayed. Ask the agent to generate it again with a supported type and valid data.')
         return False
     return True
-
-
-def temporal(value, periods=False):
-    if periods and isinstance(value,str):
-        if re.fullmatch(r'\d{4}-\d{2}',value):
-            value += '-01'
-        elif re.fullmatch(r'\d{4}',value):
-            value += '-01-01'
-    if not isinstance(value,str) or not re.fullmatch(
-            r'\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?)?', value):
-        raise ValueError('Temporal coordinates require ISO date or date-time strings.')
-    try:
-        parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
-    except ValueError:
-        raise ValueError('Temporal coordinates require valid ISO dates or date-times.') from None
-    offset = re.search(r'[+-](\d{2}):(\d{2})$', value)
-    if offset and (int(offset[1]) > 23 or int(offset[2]) > 59):
-        raise ValueError('Temporal timezone offsets require valid hours and minutes.')
-    if parsed.microsecond % 1000:
-        raise ValueError('Temporal coordinates support millisecond precision. Group finer timestamps in SQL before charting.')
-    return parsed
-
-
-def normalize_chart_spec(spec):
-    """Normalize unambiguous chart encodings and validate the layout without reading rows."""
-    if not isinstance(spec, dict):
-        raise ValueError('Chart specification must be an object.')
-    spec = dict(spec)
-    kind = canonical_chart_type(spec.get('type'))
-    if kind == 'heatmap' and 'z' in spec:
-        measure = spec.pop('z')
-        vertical = spec.get('y')
-        if isinstance(vertical, list) and len(vertical) == 1:
-            vertical = vertical[0]
-        group = spec.get('group', vertical)
-        if (not isinstance(measure, str) or not measure.strip()
-                or not isinstance(group, str) or not group.strip() or group == measure
-                or vertical not in (None, group, measure)):
-            raise ValueError('Heatmap uses x and group for dimensions and y:[measure] for color. '
-                             'When using z for color, y must name the vertical dimension or the same measure.')
-        spec.update(group=group, y=[measure])
-    if set(spec) - SPEC_FIELDS:
-        raise ValueError('Chart accepts only type, title, x, y, group, size, end, x_type, bins and label.')
-    if kind not in CHART_TYPES:
-        raise ValueError('Unsupported chart type. Choose one of: '+', '.join(CHART_TYPES)+'.')
-    spec['type'] = kind
-    if kind == 'timeline':
-        if spec.get('y') is None:
-            spec['y'] = []
-        if spec.get('end') is None:
-            spec.pop('end', None)
-    if isinstance(spec.get('y'), str):
-        spec['y'] = [spec['y']]
-    if spec.get('group') == spec.get('x') and spec.get('type') in SERIES_TYPES | {'boxplot'}:
-        # Grouping a category by itself adds no information and duplicates an axis.
-        spec.pop('group', None)
-    x, ys = spec.get('x'), spec.get('y')
-    if not isinstance(x, str) or not x.strip() or not isinstance(ys, list):
-        raise ValueError('Chart x must name a returned column and y must be a list of columns.')
-    count = 0 if kind in ('histogram','timeline') else 2 if kind in ('range','combo') else None
-    single = kind in ('pie','scatter','bubble','boxplot','heatmap')
-    if kind in ('stacked_bar', 'normalized_bar') and len(ys) > 4:
-        raise ValueError('A stack accepts at most four y columns. For more components, use one y column '
-                         'with distinct group labels, one row per x/group pair, and mutually exclusive additive parts.')
-    if (count is not None and len(ys)!=count) or (single and len(ys)!=1) or (count is None and not single and not 1<=len(ys)<=4):
-        raise ValueError(f'{kind} has the wrong number of y columns. Check the chart contract.')
-    if any(not isinstance(y,str) or not y.strip() or y==x for y in ys) or len(ys)!=len(set(ys)):
-        raise ValueError('Chart y columns must exist, be distinct, and differ from x.')
-    allowed_extra = ({'group'} if kind in SERIES_TYPES or kind in ('boxplot','heatmap') else
-                     {'group','size','label'} if kind=='bubble' else {'group','label'} if kind=='scatter' else
-                     {'group','end'} if kind=='timeline' else
-                     {'bins'} if kind=='histogram' else set())
-    grouped_series = kind in SERIES_TYPES and 'group' in spec
-    if grouped_series and len(ys) != 1:
-        raise ValueError('A series group requires exactly one y measure.')
-    if set(spec).intersection({'group','size','end','bins','label'})-allowed_extra:
-        raise ValueError('This chart type does not support one of the supplied optional fields.')
-    required = {'group'} if kind in ('heatmap','timeline') else {'size'} if kind=='bubble' else set()
-    if not required<=set(spec):
-        if kind == 'bubble':
-            raise ValueError('Bubble charts need size set to a positive numeric SQL column, preferably separate from x and y.')
-        raise ValueError(f'{kind} requires: '+', '.join(sorted(required))+'.')
-    extras = {key: spec[key] for key in COORDINATE_FIELDS if key in spec}
-    if kind == 'heatmap' and extras['group'] == x:
-        raise ValueError('Heatmap x and group must name distinct dimensions. Return one numeric y per x/group pair.')
-    if any(not isinstance(value, str) or not value.strip() for value in extras.values()):
-        raise ValueError('Chart coordinate, group, size, end and label fields must name returned SQL columns.')
-    coordinates = [x, *ys, *(value for key, value in extras.items() if key != 'size')]
-    if 'size' in extras and extras['size'] not in ys:
-        coordinates.append(extras['size'])
-    if len(set(coordinates)) != len(coordinates):
-        raise ValueError('Chart coordinate columns must be distinct. Use separate fields for dimensions and labels; '
-                         'bubble size may explicitly emphasize the y measure.')
-    default_axis = DEFAULT_AXES.get(kind, 'categorical')
-    axis=spec.get('x_type',default_axis)
-    if not isinstance(axis,str) or axis not in ('categorical','numeric','temporal'):
-        raise ValueError('x_type must be categorical, numeric or temporal.')
-    fixed = kind in ('scatter','bubble','histogram','pie','boxplot','timeline')
-    if fixed and axis!=default_axis:
-        raise ValueError(f'{kind} requires {default_axis} x coordinates.')
-    if kind == 'heatmap' and axis == 'numeric':
-        raise ValueError('Heatmap x coordinates must be categories or temporal periods. Use discrete bins for numeric values.')
-    bins=spec.get('bins',10)
-    if kind=='histogram' and (type(bins) is not int or not 2<=bins<=50):
-        raise ValueError('Histogram bins must be an integer from 2 to 50.')
-    return spec
-
-
-def prepare_chart(columns, rows, spec, truncated=False, *, allow_single_slice=False):
-    spec = normalize_chart_spec(spec)
-    kind, x, ys = spec['type'], spec.get('x'), spec.get('y')
-    may_swap_horizontal = kind == 'horizontal_bar' and 'group' not in spec
-    if (not isinstance(columns, (list, tuple)) or not columns or
-            not all(isinstance(c,str) and c.strip() for c in columns) or len(columns)!=len(set(columns))):
-        raise ValueError('Give every selected SQL column a unique text alias.')
-    try:
-        for column in columns:
-            column.encode('utf-8')
-    except UnicodeError:
-        raise ValueError('SQL column aliases require valid Unicode text.') from None
-    if x not in columns:
-        raise ValueError('Chart x must name a returned column and y must be a list of columns.')
-    if any(y not in columns for y in ys):
-        raise ValueError('Chart y columns must exist, be distinct, and differ from x.')
-    extras = {key: spec[key] for key in COORDINATE_FIELDS if key in spec}
-    if any(value not in columns for value in extras.values()):
-        raise ValueError('Chart coordinate, group, size, end and label fields must name returned SQL columns.')
-    grouped_series = kind in SERIES_TYPES and 'group' in spec
-    axis = spec.get('x_type', DEFAULT_AXES.get(kind, 'categorical'))
-    bins = spec.get('bins', 10)
-    if not isinstance(truncated, bool):
-        raise ValueError('Chart truncation metadata must be true or false.')
-    if truncated:
-        raise ValueError('Query results were truncated. Aggregate or narrow the query before charting; distributions require complete observations.')
-    if (not isinstance(rows, (list, tuple)) or not rows or len(rows)>MAX_CHART_ROWS or
-            any(not isinstance(r, (list, tuple)) or len(r)!=len(columns) for r in rows)):
-        raise ValueError('Charts require 1-1000 complete rows. Aggregate or narrow the query.')
-    if (may_swap_horizontal and len(ys) == 1 and axis in ('categorical', 'numeric')
-            and _uses_horizontal_axes(rows, columns.index(x), columns.index(ys[0]))):
-        x, ys = ys[0], [x]
-        axis = 'categorical'
-    title=spec.get('title','Query results')
-    if not isinstance(title,str) or not title.strip() or len(title)>160:
-        raise ValueError('Chart title must be text of at most 160 characters.')
-    try:
-        title.encode('utf-8')
-    except UnicodeError:
-        raise ValueError('Chart title requires valid Unicode text.') from None
-    currency_columns = [c for c in columns if c.lower() == 'currency']
-    if len(currency_columns) > 1:
-        raise ValueError('Return one currency metadata column with a unique alias.')
-    raw_currencies=[r[columns.index(currency_columns[0])] for r in rows] if currency_columns else []
-    if any(not isinstance(c,str) or not re.fullmatch(r'[A-Za-z]{3}', c.strip()) for c in raw_currencies):
-        raise ValueError('Chart currency metadata must be a three-letter currency code.')
-    currencies={c.strip().upper() for c in raw_currencies}
-    if len(currencies)>1:
-        raise ValueError('Chart one currency at a time. Filter currency and return it as currency.')
-    if x.lower()=='currency' or any(y.lower()=='currency' for y in ys) or extras.get('size','').lower()=='currency':
-        raise ValueError('Currency is metadata, not a chart axis or measure. Select a meaningful category, date or numeric measure.')
-    if extras.get('label', '').lower() == 'currency':
-        raise ValueError('Choose an observation label other than the currency metadata column.')
-    if axis == 'categorical' and currencies and all(
-            isinstance(row[columns.index(x)], str) and row[columns.index(x)].strip().upper() in currencies
-            for row in rows):
-        raise ValueError('Currency is metadata, not a chart axis. Select a meaningful category instead of a constant currency label.')
-    currency_group = 'group' in extras and currencies and all(
-        isinstance(row[columns.index(extras['group'])], str) and
-        row[columns.index(extras['group'])].strip().upper() in currencies for row in rows)
-    if extras.get('group','').lower()=='currency' or currency_group:
-        if kind=='heatmap' or kind=='timeline':
-            raise ValueError('Currency is metadata, not a chart dimension. Return another meaningful group column.')
-        extras.pop('group')
-        spec.pop('group',None)
-        grouped_series=False
-    elif 'group' in extras and kind in SERIES_TYPES | {'scatter','bubble','boxplot'}:
-        if len({label(row[columns.index(extras['group'])]) for row in rows}) == 1:
-            # A single currency or constant label is metadata, not another plotted series.
-            extras.pop('group')
-            spec.pop('group',None)
-            grouped_series=False
-    records,seen=[],set()
-    stacked=kind in ('stacked_bar','normalized_bar')
-    normalized=kind == 'normalized_bar'
-    nonnegative=stacked or kind == 'pie'
-    time_zones=set()
-    positions = {column: i for i, column in enumerate(columns)}
-    for row in rows:
-        raw=row[positions[x]]
-        if axis == 'temporal':
-            start = temporal(raw, periods=kind != 'timeline')
-            time_zones.add(start.tzinfo is not None)
-            if start.tzinfo is not None:
-                try:
-                    start = start.astimezone(timezone.utc)
-                except (ValueError, OverflowError):
-                    raise ValueError('Temporal coordinates exceed the supported date range after timezone conversion.') from None
-            coordinate = start.isoformat()
-        else:
-            coordinate=numeric(raw) if axis=='numeric' else label(raw)
-        values={y:numeric(row[positions[y]]) for y in ys}
-        record={x:coordinate,**values}
-        if 'group' in extras:
-            record[extras['group']]=label(row[positions[extras['group']]])
-        if 'label' in extras:
-            record[extras['label']]=label(row[positions[extras['label']]])
-        if 'size' in extras:
-            record[extras['size']]=numeric(row[positions[extras['size']]])
-            if record[extras['size']] < 0:
-                raise ValueError('Bubble sizes cannot be negative. Select a nonnegative size measure from SQL.')
-        if 'end' in extras:
-            endpoint = row[positions[extras['end']]]
-            record[extras['end']] = None
-            if endpoint is not None:
-                end = temporal(endpoint)
-                time_zones.add(end.tzinfo is not None)
-                if end.tzinfo is not None:
-                    try:
-                        end = end.astimezone(timezone.utc)
-                    except (ValueError, OverflowError):
-                        raise ValueError('Timeline dates exceed the supported date range after timezone conversion.') from None
-                if len(time_zones)>1:
-                    raise ValueError('Temporal coordinates require consistently timezone-aware or timezone-free dates.')
-                if end<start:
-                    raise ValueError('Timeline end must not precede its start.')
-                record[extras['end']] = end.isoformat()
-        if kind == 'timeline':
-            key = (coordinate, record[extras['group']], record.get(extras.get('end')))
-            if key in seen:
-                continue
-        else:
-            key = (coordinate, record[extras['group']]) if kind == 'heatmap' or grouped_series else coordinate
-        if kind not in ('scatter','bubble','histogram','boxplot') and key in seen:
-            raise ValueError('Group duplicate chart coordinates in SQL before charting. Normalize currency before grouping, including legacy NULL/blank values; use an outer CTE to group the resolved currency, not the raw source column. Do not sum averages or ratios to repair duplicates.')
-        seen.add(key)
-        if nonnegative and any(v<0 for v in values.values()):
-            raise ValueError(f'{kind} requires nonnegative values.')
-        if stacked and not math.isfinite(sum(values.values())):
-            raise ValueError('Stacked totals overflow. Scale or narrow the measures.')
-        if normalized and not grouped_series and sum(values.values())<=0:
-            raise ValueError('Percentage charts require a positive total for each x value.')
-        if kind=='range' and values[ys[0]]>values[ys[1]]:
-            raise ValueError('Range lower bound must not exceed upper bound.')
-        records.append(record)
-    if len(time_zones)>1:
-        raise ValueError('Temporal coordinates require consistently timezone-aware or timezone-free dates.')
-    if kind == 'bubble' and not any(record[extras['size']] > 0 for record in records):
-        raise ValueError('Bubble charts need at least one positive size. Select a meaningful size measure with variation.')
-    if grouped_series and normalized:
-        groups = {}
-        for record in records:
-            groups[record[x]] = groups.get(record[x], 0) + record[ys[0]]
-        if any(not math.isfinite(total) or total <= 0 for total in groups.values()):
-            raise ValueError('Percentage charts require a finite positive total for each x value.')
-    if kind == 'pie':
-        positive = sum(row[ys[0]] > 0 for row in records)
-        if not positive:
-            raise ValueError('pie needs a positive total.')
-        if positive == 1 and not allow_single_slice:
-            raise ValueError('Pie has only one positive slice. Choose a real breakdown with at least two nonzero parts.')
-    # Check aggregate y totals as well as individual values because finite inputs can still overflow when
-    # summed.
-    totals=[sum(r[y] for r in records) for y in ys]
-    if any(not math.isfinite(v) for v in totals):
-        raise ValueError('Chart totals overflow. Scale or narrow the measures.')
-    # Finite inputs can still produce an infinite browser scale.
-    domains = [[r[y] for r in records] for y in ys]
-    if axis == 'numeric':
-        domains.append([r[x] for r in records])
-    if kind == 'range':
-        domains.append([r[y] for r in records for y in ys])
-    if any(not math.isfinite(max(domain)-min(domain)) for domain in domains):
-        raise ValueError('Chart scale overflows. Scale or narrow the measures.')
-    return {'type':kind,'title':title,'x':x,'y':ys,'currency':next(iter(currencies),None),
-            'x_type':axis,**extras,**({'bins':bins} if kind=='histogram' else {}),'data':records}
-
-
-def chart_from_result(result):
-    if (not isinstance(result, dict) or not isinstance(result.get('chart'), dict) or
-            'columns' not in result or 'rows' not in result):
-        raise ValueError('Chart requires metadata and complete executed query columns and rows.')
-    metadata=result['chart']
-    return prepare_chart(result['columns'],result['rows'],
-                         {k:v for k,v in metadata.items() if k in SPEC_FIELDS},result.get('truncated',False))
-
-
-def validate_saved_chart(chart):
-    """Apply the same input contract to persisted artifacts before rendering."""
-    if (not isinstance(chart, dict) or set(chart) - (SPEC_FIELDS | {'data', 'currency'}) or
-            not isinstance(chart.get('data'), list) or not chart['data'] or
-            not all(isinstance(row, dict) for row in chart['data'])):
-        raise ValueError('Saved chart requires supported metadata and complete data records.')
-    columns = list(chart['data'][0])
-    if any(set(row) != set(columns) for row in chart['data']):
-        raise ValueError('Saved chart rows must contain the same coordinate and measure columns.')
-    rows = [[row[column] for column in columns] for row in chart['data']]
-    if chart.get('currency') is not None:
-        if any(isinstance(column, str) and column.lower() == 'currency' for column in columns):
-            raise ValueError('Saved chart currency must be metadata, not a coordinate.')
-        columns.append('currency')
-        rows = [row + [chart['currency']] for row in rows]
-    return prepare_chart(columns, rows, {k:v for k,v in chart.items() if k in SPEC_FIELDS}, allow_single_slice=True)
